@@ -1,0 +1,39 @@
+control :
+  debug : True
+  verbosity : 0
+  output : cube.out
+
+system :
+  systemtype : full
+  file :
+    fileformat : cube
+    name : ../../examples/cubefiles/fukui_negative_defect.cube
+    units : bohr
+  dimension : 2
+  axis : 2
+  properties:
+    - name : fukui-positive
+      label : FP
+      file :
+        fileformat : cube
+        name : ../../examples/cubefiles/fukui_positive_defect.cube
+        units : bohr
+    - name : fukui-negative
+      label : FN
+      file :
+        fileformat : cube
+        name : ../../examples/cubefiles/fukui_negative_defect.cube
+        units : bohr
+
+contactspace:
+  mode : ionic
+  proberadius : 0.
+  radii : muff
+  spread : 0.5
+  griddensity : 100
+
+symmetryfunctions :
+  functions:
+    - type : cube
+      cutoff : cos
+      radius : 5.

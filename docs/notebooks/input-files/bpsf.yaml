@@ -1,0 +1,37 @@
+control:
+  debug : True
+  verbosity : 0
+  output : test.out
+
+system:
+  type : ions
+  file:
+    fileformat : xyz+
+    name : ../../examples/bp/MoS2_defect.xyz
+    units : alat
+  dimension : 2
+  axis : 2
+
+contactspace:
+  mode : ionic
+  radii : muff
+  alpha : 1.12
+  spread : 1.0
+  cutoff : 10
+
+symmetryfunctions:
+  functions:
+    - type: bp
+      cutoff : cos
+      radius: 5.
+      order: 5
+      etas: [0.03, 0.3, 3.]
+      rss: [0. , 2.5, 5. ]
+      lambdas: [-1.0, 1.0]
+      kappas: [ 0.5, 1.0, 1.5, 2.0, 2.5, 3.0 ]
+      zetas: [ 1, 2, 4, 8, 16, 32 ]
+    - type: bp
+      cutoff : cos
+      radius: 8.
+      order: [ 0, 4]
+      kappas: [ 0.5, 1.0, 1.5, 2.0, 2.5, 3.0 ]

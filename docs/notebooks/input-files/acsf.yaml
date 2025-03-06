@@ -1,0 +1,37 @@
+control:
+  debug : True
+  verbosity : 0
+  output : test.out
+
+system:
+  type : ions
+  file:
+    fileformat : xyz+
+    name : ../../examples/bp/MoS2_defect.xyz
+    units : alat
+  dimension : 2
+  axis : 2
+
+contactspace:
+  mode : ionic
+  radii : muff
+  alpha : 1.12
+  spread : 1.0
+  cutoff : 10
+
+symmetryfunctions:
+  functions:
+    - type: ac
+      cutoff : cos
+      radius: 5.
+      order: 200
+      compositional: False
+      structural: True
+      radial: True
+    - type: ac
+      cutoff : cos
+      radius: 5.
+      order: 80
+      compositional: False
+      structural: True
+      radial: False
