@@ -51,6 +51,9 @@ The following people contributed to this project:
     Md Sharif Khan
     Denis Mulumba
 
+## Funding Support
+This project was partially supported by the NSF CAREER award number 2306929. We also acknowledge the NSF CyberTraining award number 2321102 and, in particular, the 2024 Q-MS Hackathon that have enabled the development of a significant part of the software in the beta release of this package. Jalen Lu and Zayah Cortright acknowledge Dr Warner and the Snake River Local Section Project SEED Site funded by the American Chemical Society. We also acknowledge the Deaprtment of Energy's FAIR program and in particular the reviewers of the 2023 applications for considering the ideas in this work to be standard and not innovative. 
+
 ## Contact
 For any questions or inquiries, please contact the maintainer:
     Oliviero Andreussi: olivieroandreuss@boisestate.edu
