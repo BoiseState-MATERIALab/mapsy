@@ -42,6 +42,15 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 ## License
 This project is licensed under the terms of the license found in the LICENSE file.
 
+## Authors
+The following people contributed to this project:
+    Oliviero Andreussi
+    Thiago da Silva
+    Jalen Lu
+    Zayah Cortright
+    Md Sharif Khan
+    Denis Mulumba
+
 ## Contact
 For any questions or inquiries, please contact the maintainer:
     Oliviero Andreussi: olivieroandreuss@boisestate.edu
