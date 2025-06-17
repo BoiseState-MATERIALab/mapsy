@@ -52,7 +52,7 @@ class BaseParser(ABC):
             exit(-1)
 
     def _check_units(self, units: str = "bohr") -> None:
-        allowed_units = ["bohr", "angstrom", "alat"]
+        allowed_units = ["bohr", "angstrom","alat"]
         if units not in allowed_units:
             raise ValueError("Wrong units option for file parser")
         self.units = units
