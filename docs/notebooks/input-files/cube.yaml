@@ -7,7 +7,7 @@ system :
   systemtype : full
   file :
     fileformat : cube
-    name : ../../examples/cubefiles/fukui_negative_defect.cube
+    name : ./data-files/data_negative.cube
     units : bohr
   dimension : 2
   axis : 2
@@ -16,13 +16,13 @@ system :
       label : FP
       file :
         fileformat : cube
-        name : ../../examples/cubefiles/fukui_positive_defect.cube
+        name : ./data-files/data_positive.cube
         units : bohr
     - name : fukui-negative
       label : FN
       file :
         fileformat : cube
-        name : ../../examples/cubefiles/fukui_negative_defect.cube
+        name : ./data-files/data_negative.cube
         units : bohr
 
 contactspace:
