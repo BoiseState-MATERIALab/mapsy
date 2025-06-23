@@ -15,6 +15,7 @@ from sklearn.cluster import SpectralClustering
 from sklearn.metrics import silhouette_score, davies_bouldin_score
 import scipy.spatial.distance as distance
 from itertools import combinations
+from copy import deepcopy
 
 from mapsy.utils import full2chunk, chunk2full, multiproc
 from mapsy.io import Input, SystemParser, ContactSpaceGenerator
@@ -60,7 +61,7 @@ class Maps(ABC):
             self.contactspace: ContactSpace = contactspace
         # Initialize system and symmetry functions
         self.system: System = system
-        self.symmetryfunctions: list[SymmetryFunction] = symmetryfunctions
+        self.symmetryfunctions: list[SymmetryFunction] = deepcopy(symmetryfunctions)
         self.hasatomicsf = any([1 for sf in self.symmetryfunctions if sf.atomic])
         self.nsfs = self.len()
         # Call setup for each symmetry function to initialize with the system
