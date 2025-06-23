@@ -1,7 +1,9 @@
 # MapSy
 ## Mapping the Contact Space Around Atomistic Substrates Using Local Symmetry Information
 
-MapSy is a tool designed to automatically identify inequivalent positions in the space surrounding a substrate and generate local-symmetry-invariant features for machine-learning tasks.
+MapSy is a tool designed to automatically identify inequivalent positions in the space surrounding a substrate and generate local-symmetry-invariant features for machine-learning tasks. Please cite: 
+
+T. da Silva, J. Lu, Z. Cortright, D. Mulumba, Md.S. Khan, and O. Andreussi, "Automating the Analysis of Substrate Reactivity through Environment Interaction Mapping", *J. Chem. Inf. Model.* **65**, 11, 5395–5410 (2025), [https://doi.org/10.1021/acs/jcim.5c00474](https://pubs.acs.org/doi/full/10.1021/acs.jcim.5c00474)
 
 ## Goal Applications
 
