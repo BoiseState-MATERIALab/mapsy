@@ -7,7 +7,7 @@ system:
   type : ions
   file:
     fileformat : xyz+
-    name : ../../examples/bp/MoS2_defect.xyz
+    name : ./data-files/MoS2_defect.xyz
     units : alat
   dimension : 2
   axis : 2
