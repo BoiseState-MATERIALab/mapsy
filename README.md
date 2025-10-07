@@ -1,7 +1,7 @@
 # MapSy
 ## Mapping the Contact Space Around Atomistic Substrates Using Local Symmetry Information
 
-MapSy is a tool designed to automatically identify inequivalent positions in the space surrounding a substrate and generate local-symmetry-invariant features for machine-learning tasks. Please cite: 
+MapSy is a tool designed to automatically identify inequivalent positions in the space surrounding a substrate and generate local-symmetry-invariant features for machine-learning tasks. Please cite:
 
 T. da Silva, J. Lu, Z. Cortright, D. Mulumba, Md.S. Khan, and O. Andreussi, "Automating the Analysis of Substrate Reactivity through Environment Interaction Mapping", *J. Chem. Inf. Model.* **65**, 11, 5395–5410 (2025), [https://doi.org/10.1021/acs/jcim.5c00474](https://pubs.acs.org/doi/full/10.1021/acs.jcim.5c00474)
 
@@ -27,9 +27,11 @@ T. da Silva, J. Lu, Z. Cortright, D. Mulumba, Md.S. Khan, and O. Andreussi, "Aut
 
 To install the project, you need to have Python 3.8 or higher. You can install the required dependencies using the following command:
 
-```sh 
-pip install -r requirements.txt
-```
+### From source
+pip install .
+
+### Dev mode
+pip install -e .[tester,linter,mypy,formatter,doc]
 
 ## Usage
 To use MapSy, you can run the provided Jupyter notebooks in the docs and examples directories. For example, to run the examples/Pt/planar_maps_ideal.ipynb notebook, use the following command:
@@ -54,7 +56,7 @@ The following people contributed to this project:
 * Denis Mulumba
 
 ## Funding Support
-This project was partially supported by the NSF CAREER award number 2306929. We also acknowledge the NSF CyberTraining award number 2321102 and, in particular, the 2024 Q-MS Hackathon that have enabled the development of a significant part of the software in the beta release of this package. Jalen Lu and Zayah Cortright acknowledge Dr Warner and the Snake River Local Section Project SEED Site funded by the American Chemical Society. We also acknowledge the Deaprtment of Energy's FAIR program and in particular the reviewers of the 2023 applications for considering the ideas in this work to be standard and not innovative. 
+This project was partially supported by the NSF CAREER award number 2306929. We also acknowledge the NSF CyberTraining award number 2321102 and, in particular, the 2024 Q-MS Hackathon that have enabled the development of a significant part of the software in the beta release of this package. Jalen Lu and Zayah Cortright acknowledge Dr Warner and the Snake River Local Section Project SEED Site funded by the American Chemical Society. We also acknowledge the Deaprtment of Energy's FAIR program and in particular the reviewers of the 2023 applications for considering the ideas in this work to be standard and not innovative.
 
 ## Contact
 For any questions or inquiries, please contact the maintainer:
