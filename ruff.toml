@@ -1,0 +1,6 @@
+line-length = 100
+target-version = "py39"
+
+[lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "C4", "T20"]
+ignore = ["E501"]  # handled by formatter
