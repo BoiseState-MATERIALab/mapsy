@@ -3,7 +3,9 @@ from __future__ import annotations
 import numpy as np
 import numpy.typing as npt
 
-from mapsy.data import Grid, ScalarField, VolumetricField
+from .grid import Grid
+from .scalar import ScalarField
+from .volumetric import VolumetricField
 
 
 class GradientField(VolumetricField):

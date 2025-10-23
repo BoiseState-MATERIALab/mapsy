@@ -5,7 +5,8 @@ import numpy as np
 import numpy.typing as npt
 from ase import Atoms
 
-from mapsy.data import Grid, ScalarField
+from .grid import Grid
+from .scalar import ScalarField
 
 
 @dataclass

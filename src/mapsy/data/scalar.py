@@ -6,7 +6,8 @@ import numpy as np
 import numpy.typing as npt
 from ase import Atoms
 
-from mapsy.data import Grid, VolumetricField
+from .grid import Grid
+from .volumetric import VolumetricField
 
 
 class ScalarField(VolumetricField):

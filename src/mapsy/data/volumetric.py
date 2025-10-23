@@ -4,7 +4,7 @@ from typing import Any, TypeAlias, TypeVar, cast
 import numpy as np
 import numpy.typing as npt
 
-from mapsy.data import Grid
+from .grid import Grid
 
 Vec3i: TypeAlias = npt.NDArray[np.int64]
 T = TypeVar("T", bound="VolumetricField")
