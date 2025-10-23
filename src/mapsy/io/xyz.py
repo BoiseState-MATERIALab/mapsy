@@ -1,14 +1,17 @@
 # Read XYZ+ files (+: cell information in the second line)
+import logging
+
 import numpy as np
 import numpy.typing as npt
-import sys
 
 #
 from ase import Atoms
 from ase.units import Bohr
 
+from mapsy.data import Grid, ScalarField
 from mapsy.io.base import BaseParser
-from mapsy.data import Grid
+
+logger = logging.getLogger(__name__)
 
 
 class XYZParser(BaseParser):
@@ -35,20 +38,19 @@ class XYZParser(BaseParser):
         try:
             # -- Parse the header of the cube file
             self.natoms = int(self.contents[0].split()[0])
-            origin = None
+            origin: None | npt.NDArray[np.float64] = None
             if len(self.contents[0].split()) == 4:
                 # assume the remaining numbers in the first line to be
                 # the origin of the cell
-                print("Reading cell origin information from first line")
-                origin: npt.NDArray[np.float64] = np.array(
-                    list(map(float, self.contents[0].split()[1:])), dtype=np.float64
-                )
+                logger.info("Reading cell origin information from first line")
+                origin = np.array(list(map(float, self.contents[0].split()[1:])), dtype=np.float64)
+            a: float = 1.0
             if len(self.contents[1].split()) == 1:
-                print("Assuming a cubic cell of size alat")
-                a: float = float(self.contents[1].split()[0])
+                logger.info("Assuming a cubic cell of size alat")
+                a = float(self.contents[1].split()[0])
                 cell = np.eye(3) * a
             elif len(self.contents[1].split()) == 3:
-                print("Assuming an orthorombic cell with sides a, b, c")
+                logger.info("Assuming an orthorombic cell with sides a, b, c")
                 a, b, c = map(float, self.contents[1].split()[:])
                 cell = np.diag([a, b, c])
                 if self.units == "bohr":
@@ -57,22 +59,18 @@ class XYZParser(BaseParser):
                     cell[1, 1] *= a
                     cell[2, 2] *= a
             elif len(self.contents[1].split()) == 9:
-                print("Reading a full 3x3 cell matrix")
-                cell = np.array(self.contents[1].split(), dtype=np.float64).reshape(
-                    3, 3
-                )
+                logger.info("Reading a full 3x3 cell matrix")
+                cell = np.array(self.contents[1].split(), dtype=np.float64).reshape(3, 3)
                 if self.units == "bohr":
                     cell *= Bohr
                 elif self.units == "alat":
-                    a: float = cell[0, 0]
+                    a = cell[0, 0]
                     cell *= a
                     cell[0, 0] = a
 
         except Exception as e:
-            print("Error parsing xyz+ header:")
-            print(e)
-            print("Exiting with code -2.")
-            sys.exit(-2)
+            logger.exception(f"Error parsing xyz+ header for {self.fname}")
+            raise ValueError("Invalid xyz+ header") from e
 
         return Grid(cell=cell, origin=origin)
 
@@ -91,7 +89,7 @@ class XYZParser(BaseParser):
         -------
         atoms: Atoms = ASE atoms read from file
         """
-        print(f"Reading {self.natoms} atoms")
+        logger.info(f"Reading {self.natoms} atoms")
         # -- Create an ASE Atoms object
         atoms: list[str] = self.contents[2 : 2 + self.natoms]
         elements: list[str] = [line.split()[0] for line in atoms]
@@ -104,7 +102,7 @@ class XYZParser(BaseParser):
             positions = positions * grid.cell[0, 0]
         return Atoms(symbols=elements, positions=positions, cell=grid.cell, pbc=True)
 
-    def _read_data(self, grid: Grid, name: str = "data", label: str = "DAT") -> None:
+    def _read_data(self, grid: Grid, name: str = "data", label: str = "DAT") -> ScalarField | None:
         """
         _read_data(xyz_file)
 

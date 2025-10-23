@@ -1,9 +1,11 @@
+import warnings
+
 import numpy as np
 import scipy.special as sp
 
-from mapsy.data import ScalarField, GradientField, HessianField
+from mapsy.data import GradientField, HessianField, ScalarField
 from mapsy.utils.constants import FPI, SQRTPI
-from mapsy.utils.functions.functions import FieldFunction, FUNC_TOL
+from mapsy.utils.functions.functions import FUNC_TOL, FieldFunction
 
 
 class ERFC(FieldFunction):
@@ -29,8 +31,13 @@ class ERFC(FieldFunction):
         charge = self._charge()
         analytic = self._erfc_volume()
 
-        if np.abs((integral - analytic) / analytic > 1e-4):
-            print("\nWARNING: wrong integral of erfc function\n")
+        rel_err = abs((integral - analytic) / analytic)
+        if rel_err > 1e-4:
+            warnings.warn(
+                f"ERFC integral check failed (rel err={rel_err:.2e}).",
+                category=RuntimeWarning,
+                stacklevel=2,
+            )
 
         scale = charge / analytic * 0.5
 
@@ -144,8 +151,13 @@ class ERFC(FieldFunction):
         charge = self._charge()
         analytic = self._erfc_volume()
 
-        if np.abs((integral - analytic) / analytic > 1e-4):
-            print("\nWARNING: wrong integral of erfc function\n")
+        rel_err = abs((integral - analytic) / analytic)
+        if rel_err > 1e-4:
+            warnings.warn(
+                f"ERFC integral check failed (rel err={rel_err:.2e}).",
+                category=RuntimeWarning,
+                stacklevel=2,
+            )
 
         scale = charge / analytic / SQRTPI / self.spread
 
@@ -153,7 +165,7 @@ class ERFC(FieldFunction):
 
     def _charge(self) -> float:
         """docstring"""
-        charge = self.volume
+        charge: float = float(self.volume)
         if self.kind == 1:
             raise ValueError("wrongly set as a gaussian")
         elif self.kind == 2:
@@ -169,25 +181,22 @@ class ERFC(FieldFunction):
     def _erfc_volume(self) -> float:
         """docstring"""
 
-        spread = self.spread
-        width = self.width
+        spread: float = float(self.spread)
+        width: float = float(self.width)
 
         if any(attr < FUNC_TOL for attr in (spread, width)):
             raise ValueError("wrong parameters for erfc function")
 
-        t = spread / width
-        invt = width / spread
-        f1 = (1 + sp.erf(invt)) * 0.5
-        f2 = np.exp(-(invt**2)) * 0.5 / SQRTPI
+        t: float = spread / width
+        invt: float = width / spread
+        f1: float = (1 + sp.erf(invt)) * 0.5
+        f2: float = np.exp(-(invt**2)) * 0.5 / SQRTPI
 
+        volume: float = 0.0
         if self.dim == 0:
-
-            volume = (
-                FPI / 3 * width**3 * ((1.0 + 1.5 * t**2) * f1 + (1.0 + t**2) * t * f2)
-            )
+            volume = FPI / 3 * width**3 * ((1.0 + 1.5 * t**2) * f1 + (1.0 + t**2) * t * f2)
 
         elif self.dim == 1:
-
             volume = (
                 np.pi
                 * width**2
@@ -196,10 +205,7 @@ class ERFC(FieldFunction):
             )
 
         elif self.dim == 2:
-
-            volume = (
-                2.0 * width * self.grid.volume / self.grid.cell[self.axis, self.axis]
-            )
+            volume = 2.0 * width * self.grid.volume / self.grid.cell[self.axis, self.axis]
 
         else:
             raise ValueError("unexpected system dimensions")

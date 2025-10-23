@@ -1,6 +1,8 @@
-from mapsy.data import Grid, System, ScalarField, GradientField
-from mapsy.utils.functions import ERFC
+from ase.atoms import Atoms
+
 from mapsy.boundaries import Boundary
+from mapsy.data import Grid, System
+from mapsy.utils.functions import ERFC
 
 
 class SystemBoundary(Boundary):
@@ -15,7 +17,6 @@ class SystemBoundary(Boundary):
         system: System,
         label: str = "",
     ) -> None:
-
         super().__init__(
             mode,
             grid,
@@ -24,7 +25,10 @@ class SystemBoundary(Boundary):
 
         self.system = system
 
-        com = self.system.atoms.get_center_of_mass()
+        atoms = self.system.atoms
+        if not isinstance(atoms, Atoms) or len(atoms) == 0:
+            raise ValueError("System has no atoms defined.")
+        com = atoms.get_center_of_mass()
 
         self.simple = ERFC(
             grid=self.grid,
@@ -48,3 +52,7 @@ class SystemBoundary(Boundary):
 
         self.switch[:] = self.simple.density
         self.gradient[:] = self.simple.gradient
+
+    def _build_solvent_aware_boundary(self) -> None:
+        # TODO: real implementation
+        return None

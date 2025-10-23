@@ -1,5 +1,3 @@
-from mapsy.utils.constants import BOHR_RADIUS_ANGS
-
 elements = [
     "H",
     "He",
@@ -571,7 +569,7 @@ muff = [
 ]
 
 
-def get_vdw_radii(atomic_number, radius_mode: str) -> float:
+def get_vdw_radii(atomic_number: int, radius_mode: str) -> float:
     """docstring"""
 
     index = atomic_number - 1

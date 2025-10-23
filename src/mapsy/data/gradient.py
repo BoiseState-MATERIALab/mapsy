@@ -1,42 +1,41 @@
-# Refactored from Stephen Weitzner cube_vizkit
-from typing import Optional
-import numpy.typing as npt
-import numpy as np
-import matplotlib as mpl
-import matplotlib.pyplot as plt
+from __future__ import annotations
 
-from mapsy.data import Grid, VolumetricField, ScalarField
+import numpy as np
+import numpy.typing as npt
+
+from mapsy.data import Grid, ScalarField, VolumetricField
 
 
 class GradientField(VolumetricField):
     """ """
 
-    def __new__(
-        cls,
-        grid: Grid,
-        rank: Optional[int] = 3,
-        label: Optional[str] = None,
-        name: Optional[str] = None,
-        data: Optional[npt.NDArray] = None,
-    ):
+    _modulus: ScalarField
 
+    def __new__(
+        cls: type[GradientField],
+        grid: Grid,
+        rank: int = 3,
+        label: str | None = None,
+        name: str | None = None,
+        data: npt.NDArray | None = None,
+    ) -> GradientField:
         if label is None:
             label = "GRA"
         if name is None:
             name = "gradient"
 
-        obj = super().__new__(cls, grid, rank, name, label, data)
-
+        # VolumetricField.__new__ signature: (grid, rank, label, name, data)
+        obj = super().__new__(cls, grid, rank, label, name, data)
         obj._modulus = ScalarField(grid, name=name + "modulus", label=label + "M")
         return obj
 
-    def __array_finalize__(self, obj) -> None:
+    def __array_finalize__(self, obj: np.ndarray | None) -> None:
         # Restore attributes when we are taking a slice
         super().__array_finalize__(obj)
         if obj is None:
             return
-        if isinstance(obj, (GradientField)):
-            self._modulus = getattr(obj, "_modulus", None)
+        if isinstance(obj, GradientField):
+            self._modulus = obj._modulus
 
     @property
     def modulus(self) -> ScalarField:

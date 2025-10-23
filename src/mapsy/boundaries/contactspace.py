@@ -1,11 +1,11 @@
 import numpy as np
+import numpy.typing as npt
 import pandas as pd
 
 from mapsy.boundaries import Boundary
 
 
 class ContactSpace:
-
     nn = np.zeros((6, 3), dtype=int)
     nn[0], nn[2], nn[4] = np.eye(3, dtype=int)
     nn[1], nn[3], nn[5] = -np.eye(3, dtype=int)
@@ -24,7 +24,7 @@ class ContactSpace:
             # only select the points with the highest modulus
             tol = np.max(boundary.gradient.modulus) - epsilon
 
-        self.mask = boundary.gradient.modulus > tol
+        self.mask: npt.NDArray[np.bool_] = boundary.gradient.modulus > tol
         self.norm = np.sum(boundary.gradient.modulus[self.mask])
 
         self._get_indexes()
@@ -67,7 +67,7 @@ class ContactSpace:
         """docstring"""
         self.neighbors = []
         # -- For each contact space point find the indexes of its six neighbors
-        for i, m in enumerate(self.i2m):
+        for m in self.i2m:
             nearest = m[np.newaxis, :] + self.nn
             # -- Apply periodic boundary conditions
             nearest = nearest - self.grid.scalars * (nearest // self.grid.scalars)
@@ -85,7 +85,7 @@ class ContactSpace:
             # -- Update region number
             count += 1  # NOTE: count from 1 to allow boolean operations on visited
             # -- Add first non-visited point to the stack
-            stack = [np.where(visited == False)[0][0]]
+            stack = [np.where(not visited)[0][0]]
             while stack:
                 # -- Pop last entry from the stack
                 i = stack.pop()

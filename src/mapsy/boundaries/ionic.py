@@ -1,13 +1,11 @@
-from copy import deepcopy
-from typing import Optional
-
 import numpy as np
 import numpy.typing as npt
+from ase.atoms import Atoms
 
-from mapsy.data import Grid, System, ScalarField, GradientField
-from mapsy.utils import get_vdw_radii
-from mapsy.utils.functions import FunctionContainer, ERFC
 from mapsy.boundaries import Boundary
+from mapsy.data import Grid, System
+from mapsy.utils import get_vdw_radii
+from mapsy.utils.functions import ERFC, FunctionContainer
 
 
 class IonicBoundary(Boundary):
@@ -22,7 +20,6 @@ class IonicBoundary(Boundary):
         system: System,
         label: str = "",
     ) -> None:
-
         super().__init__(
             mode,
             grid,
@@ -32,7 +29,10 @@ class IonicBoundary(Boundary):
         self.alpha = alpha
         self.softness = softness
 
-        self.ions = system.atoms
+        atoms = system.atoms
+        if not isinstance(atoms, Atoms) or len(atoms) == 0:
+            raise ValueError("System has no atoms defined.")
+        self.ions = atoms.copy()
 
         self._set_soft_spheres()
 
@@ -91,3 +91,7 @@ class IonicBoundary(Boundary):
     def _update_soft_spheres(self) -> None:
         """docstring"""
         pass
+
+    def _build_solvent_aware_boundary(self) -> None:
+        # TODO: real implementation
+        return None

@@ -5,7 +5,7 @@ build-backend = "flit_core.buildapi"
 [project]
 name = "mapsy"
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.11"
 license = { file = "LICENSE" }
 authors = [{ name = "Oliviero Andreussi", email = "olivieroandreuss@boisestate.edu" }]
 maintainers = [{ name = "Oliviero Andreussi", email = "olivieroandreuss@boisestate.edu" }]
@@ -31,7 +31,6 @@ dependencies = [
 tester = ["pytest ~= 7.0"]
 linter = ["ruff ~= 0.6"]
 mypy = ["mypy ~= 1.10", "types-PyYAML ~= 6.0"]
-formatter = ["black ~= 24.4"]
 doc = ["sphinx ~= 7.0", "myst-parser ~= 3.0"]
 
 [project.urls]
@@ -56,4 +55,7 @@ disable_error_code = "no-redef"
 include = ["docs/**", "examples/**"]
 
 [tool.ruff]
+line-length = 100
+
+[tool.black]
 line-length = 100

@@ -1,38 +1,36 @@
+from collections.abc import Callable, Iterator
 from typing import (
+    Annotated,
     Any,
-    List,
-    Union,
 )
-
-from typing_extensions import Annotated
 
 from pydantic import (
     confloat,
     conint,
 )
-
-from pydantic.validators import (
-    int_validator,
-    float_validator,
-)
-
 from pydantic.errors import (
     NumberNotGeError,
     NumberNotGtError,
 )
+from pydantic.validators import (
+    float_validator,
+    int_validator,
+)
+
+Validator = Callable[[Any], Any]
 
 # numerical type aliases
-IntFloat = Union[int, float]
+IntFloat = int | float
 IntGT1 = Annotated[int, conint(gt=1)]
 FloatGE1 = Annotated[float, confloat(ge=1)]
-NonZeroFloat = Annotated[float, confloat(le=-1.e-6, ge=1.e-6)]
+NonZeroFloat = Annotated[float, confloat(le=-1.0e-6, ge=1.0e-6)]
 Dimensions = Annotated[int, conint(ge=0, le=3)]
 Axis = Annotated[int, conint(ge=0, le=2)]
 
 # yapf: enable
 
 
-def int_list(value: List[Any]) -> List[int]:
+def int_list(value: list[Any]) -> list[int]:
     """Convert items to integers.
 
     Parameters
@@ -48,7 +46,7 @@ def int_list(value: List[Any]) -> List[int]:
     return [int_validator(v) for v in value]
 
 
-def float_list(value: List[Any]) -> List[float]:
+def float_list(value: list[Any]) -> list[float]:
     """Convert items to floats.
 
     Parameters
@@ -64,7 +62,7 @@ def float_list(value: List[Any]) -> List[float]:
     return [float_validator(v) for v in value]
 
 
-def list_ge_zero(value: List[IntFloat]) -> List[IntFloat]:
+def list_ge_zero(value: list[IntFloat]) -> list[IntFloat]:
     """Check that all array values are greater than or equal to zero.
 
     Parameters
@@ -83,7 +81,7 @@ def list_ge_zero(value: List[IntFloat]) -> List[IntFloat]:
     return value
 
 
-def list_gt_zero(value: List[IntFloat]) -> List[IntFloat]:
+def list_gt_zero(value: list[IntFloat]) -> list[IntFloat]:
     """Check that all array values are positive.
 
     Parameters
@@ -120,54 +118,41 @@ def ne_zero(value: IntFloat) -> IntFloat:
     return value
 
 
-class NonZeroFloat(float):
-
-    @classmethod
-    def __get_validators__(cls):
-        yield float_validator
-        yield ne_zero
-
-
 class NonNegativeFloatList(list):
-
     @classmethod
-    def __get_validators__(cls):
+    def __get_validators__(cls) -> Iterator[Validator]:
         yield float_list
         yield list_ge_zero
 
 
 class PositiveFloatList(list):
-
     @classmethod
-    def __get_validators__(cls):
+    def __get_validators__(cls) -> Iterator[Validator]:
         yield float_list
         yield list_gt_zero
 
 
 class NonNegativeIntList(list):
-
     @classmethod
-    def __get_validators__(cls):
+    def __get_validators__(cls) -> Iterator[Validator]:
         yield int_list
         yield list_ge_zero
 
 
 class PositiveIntList(list):
-
     @classmethod
-    def __get_validators__(cls):
+    def __get_validators__(cls) -> Iterator[Validator]:
         yield int_list
         yield list_gt_zero
 
-    
-class Vector(list):
 
+class Vector(list):
     @classmethod
-    def __get_validators__(cls):
+    def __get_validators__(cls) -> Iterator[Validator]:
         yield cls.vectorize
 
     @classmethod
-    def vectorize(cls, value: List[Any]) -> List[Any]:
+    def vectorize(cls, value: list[Any]) -> list[Any]:
         """Scale vector input to 3D.
 
         Parameters
@@ -187,17 +172,15 @@ class Vector(list):
 
 
 class FloatVector(Vector):
-
     @classmethod
-    def __get_validators__(cls):
+    def __get_validators__(cls) -> Iterator[Validator]:
         yield cls.vectorize
         yield float_list
 
 
 class NonNegativeIntVector(Vector):
-
     @classmethod
-    def __get_validators__(cls):
+    def __get_validators__(cls) -> Iterator[Validator]:
         yield cls.vectorize
         yield int_list
         yield list_ge_zero

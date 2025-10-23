@@ -1,21 +1,22 @@
 # Behler-Parrinello Symmetry Functions
+import itertools
+from collections.abc import Callable
+
 import numpy as np
 import numpy.typing as npt
-from typing import Callable, Optional
-import itertools
+from ase import Atoms
 
-from mapsy.symfunc.input import SymFuncModel
 from mapsy.symfunc import SymmetryFunction
+from mapsy.symfunc.input import SymFuncModel
 from mapsy.utils import cutoff
 
 
 class BPSFParser:
-
     def __init__(self, symfuncmodel: SymFuncModel) -> None:
         self.cutoff = symfuncmodel.cutoff
         self.radius = symfuncmodel.radius
 
-        self.order = np.array(symfuncmodel.order,dtype=np.int64)
+        self.order = np.array(symfuncmodel.order, dtype=np.int64)
         self.etas = np.array(symfuncmodel.etas)
         self.rss = np.array(symfuncmodel.rss)
         self.zetas = np.array(symfuncmodel.zetas)
@@ -23,11 +24,11 @@ class BPSFParser:
         self.kappas = np.array(symfuncmodel.kappas)
 
     def parse(self) -> list[SymmetryFunction]:
-        symmetryfunctions: list = []
+        symmetryfunctions: list[SymmetryFunction] = []
         for i in self.order:
             symmetryfunctions.append(
                 BPSymmetryFunction(
-                    i+1,
+                    i + 1,
                     self.radius,
                     self.cutoff,
                     self.etas,
@@ -41,55 +42,62 @@ class BPSFParser:
 
 
 class BPSymmetryFunction(SymmetryFunction):
-
-    order: int = 0
-    rcut: float = 0.0
-    fc: Callable = None
-
-    etas: npt.NDArray[np.float64] = None
-    rss: npt.NDArray[np.float64] = None
-    lambdas: npt.NDArray[np.float64] = None
-    kappas: npt.NDArray[np.float64] = None
-    zetas: npt.NDArray[np.float64] = None
-
-    types: list[str] = None
-    itypes: npt.NDArray[np.int64] = None
-    icombos: list = None
-
     def __init__(
         self,
         order: int,
         radius: float,
         cutofftype: str,
-        etas: Optional[npt.NDArray[np.float64]] = None,
-        rss: Optional[npt.NDArray[np.float64]] = None,
-        lambdas: Optional[npt.NDArray[np.float64]] = None,
-        kappas: Optional[npt.NDArray[np.float64]] = None,
-        zetas: Optional[npt.NDArray[np.float64]] = None,
+        etas: npt.NDArray[np.float64] | None = None,
+        rss: npt.NDArray[np.float64] | None = None,
+        lambdas: npt.NDArray[np.float64] | None = None,
+        kappas: npt.NDArray[np.float64] | None = None,
+        zetas: npt.NDArray[np.float64] | None = None,
     ) -> None:
         super().__init__(kind=1, label="BP-G")
         self.order = order
-
-        self.fc = cutoff(cutofftype, radius)
-        self.rcut = radius
-
-        if self.order == 2:
-            self.etas = etas
-            self.rss = rss
-        elif self.order == 3:
-            self.kappas = kappas
-        elif self.order >= 4:
-            self.etas = etas
-            self.zetas = zetas
-            self.lambdas = lambdas
-
-    def setup(self, atoms):
-        elements = atoms.get_chemical_symbols()
-        self.types = sorted(list(dict.fromkeys(elements)))
-        self.itypes = np.array([self.types.index(e) for e in elements]).astype("int")
-        self.icombos = list(
-            itertools.combinations_with_replacement(np.unique(self.itypes), 2)
+        self.rcut: float = radius
+        # fc(r) returns an array-like; annotate as callable over ndarray -> ndarray
+        self.fc: Callable[[npt.NDArray[np.float64]], npt.NDArray[np.float64]] = cutoff(
+            cutofftype, radius
         )
+
+        # Normalize optional arrays: keep attributes as ndarrays (possibly empty) to avoid Optional flow
+        self.etas: npt.NDArray[np.float64] = (
+            np.asarray(etas, dtype=np.float64)
+            if etas is not None
+            else np.empty(0, dtype=np.float64)
+        )
+        self.rss: npt.NDArray[np.float64] = (
+            np.asarray(rss, dtype=np.float64) if rss is not None else np.empty(0, dtype=np.float64)
+        )
+        self.lambdas: npt.NDArray[np.float64] = (
+            np.asarray(lambdas, dtype=np.float64)
+            if lambdas is not None
+            else np.empty(0, dtype=np.float64)
+        )
+        self.kappas: npt.NDArray[np.float64] = (
+            np.asarray(kappas, dtype=np.float64)
+            if kappas is not None
+            else np.empty(0, dtype=np.float64)
+        )
+        self.zetas: npt.NDArray[np.float64] = (
+            np.asarray(zetas, dtype=np.float64)
+            if zetas is not None
+            else np.empty(0, dtype=np.float64)
+        )
+
+        # Filled in during setup()
+        self.types: list[str] = []
+        self.itypes: npt.NDArray[np.int64] = np.empty(0, dtype=np.int64)
+        self.icombos: list[tuple[int, int]] = []
+
+    def setup(self, atoms: Atoms | None = None) -> None:
+        if atoms is None:
+            raise ValueError("atoms must be provided to setup()")
+        elements = atoms.get_chemical_symbols()
+        self.types = sorted(dict.fromkeys(elements))
+        self.itypes = np.array([self.types.index(e) for e in elements], dtype=np.int64)
+        self.icombos = list(itertools.combinations_with_replacement(np.unique(self.itypes), 2))
 
     @property
     def order(self) -> int:
@@ -104,12 +112,14 @@ class BPSymmetryFunction(SymmetryFunction):
 
     def _generate_keys(self) -> list[str]:
         """docstring"""
-        self.__keys = []
+        if not self.types:
+            raise RuntimeError("setup() must be called before generating keys")
+        self.__keys: list[str] = []
         if self.order == 1:
             for elem in self.types:
                 self.__keys.append(f"{self.label}1_{elem}_r{self.rcut}")
         elif self.order == 2:
-            for eta, rs in zip(self.etas, self.rss):
+            for eta, rs in zip(self.etas, self.rss, strict=False):
                 for elem in self.types:
                     self.__keys.append(
                         f"{self.label}2_{elem}_r{self.rcut}_eta{eta:3.2f}_rs{rs:3.2f}"
@@ -117,9 +127,7 @@ class BPSymmetryFunction(SymmetryFunction):
         elif self.order == 3:
             for kappa in self.kappas:
                 for elem in self.types:
-                    self.__keys.append(
-                        f"{self.label}3_{elem}_r{self.rcut}_kappa{kappa}"
-                    )
+                    self.__keys.append(f"{self.label}3_{elem}_r{self.rcut}_kappa{kappa}")
         elif self.order == 4:
             for zeta in self.zetas:
                 for eta in self.etas:
@@ -146,9 +154,9 @@ class BPSymmetryFunction(SymmetryFunction):
 
     def _compute_values(
         self,
-        distances: npt.NDArray,
-        vectors: Optional[npt.NDArray],
-    ) -> npt.NDArray:
+        distances: npt.NDArray[np.float64],
+        vectors: npt.NDArray[np.float64] | None,
+    ) -> npt.NDArray[np.float64]:
         """docstring"""
         if self.order == 1:
             values = G1(self.fc, distances, self.itypes)
@@ -157,6 +165,8 @@ class BPSymmetryFunction(SymmetryFunction):
         elif self.order == 3:
             values = G3(self.fc, distances, self.kappas, self.itypes)
         elif self.order == 4:
+            if vectors is None:
+                raise ValueError("vectors are required for order-4 symmetry functions")
             values = G4(
                 self.fc,
                 distances,
@@ -168,6 +178,8 @@ class BPSymmetryFunction(SymmetryFunction):
                 self.icombos,
             )
         elif self.order == 5:
+            if vectors is None:
+                raise ValueError("vectors are required for order-5 symmetry functions")
             values = G5(
                 self.fc,
                 distances,
@@ -182,11 +194,11 @@ class BPSymmetryFunction(SymmetryFunction):
 
 
 def G1(
-    fc: Callable,
+    fc: Callable[[npt.NDArray[np.float64]], npt.NDArray[np.float64]],
     distances: npt.NDArray[np.float64],
     types: npt.NDArray[np.int64],
 ) -> npt.NDArray[np.float64]:
-    ntypes: np.int64 = np.max(types) + 1
+    ntypes: int = int(np.max(types) + 1)
     g1: npt.NDArray[np.float64] = np.zeros(ntypes, dtype=np.float64)
     for itype in range(ntypes):
         rij: npt.NDArray[np.float64] = distances[types == itype]
@@ -195,28 +207,28 @@ def G1(
 
 
 def G2(
-    fc: Callable,
+    fc: Callable[[npt.NDArray[np.float64]], npt.NDArray[np.float64]],
     distances: npt.NDArray[np.float64],
     etas: npt.NDArray[np.float64],
     rss: npt.NDArray[np.float64],
     types: npt.NDArray[np.int64],
 ) -> npt.NDArray[np.float64]:
-    ntypes: np.int64 = np.max(types) + 1
+    ntypes: int = int(np.max(types) + 1)
     g2: npt.NDArray[np.float64] = np.zeros((len(etas), ntypes), dtype=np.float64)
     for itype in range(ntypes):
         rij: npt.NDArray[np.float64] = distances[types == itype]
-        for ieta, (eta, rs) in enumerate(zip(etas, rss)):
+        for ieta, (eta, rs) in enumerate(zip(etas, rss, strict=False)):
             g2[ieta, itype] = np.sum(np.exp(-eta * (rij - rs) ** 2) * fc(rij))
     return g2
 
 
 def G3(
-    fc: Callable,
+    fc: Callable[[npt.NDArray[np.float64]], npt.NDArray[np.float64]],
     distances: npt.NDArray[np.float64],
     kappas: npt.NDArray[np.float64],
     types: npt.NDArray[np.int64],
 ) -> npt.NDArray[np.float64]:
-    ntypes: np.int64 = np.max(types) + 1
+    ntypes: int = int(np.max(types) + 1)
     g3: npt.NDArray[np.float64] = np.zeros((len(kappas), ntypes), dtype=float)
     for itype in range(ntypes):
         rij: npt.NDArray[np.float64] = distances[types == itype]
@@ -226,16 +238,16 @@ def G3(
 
 
 def G4(
-    fc: Callable,
+    fc: Callable[[npt.NDArray[np.float64]], npt.NDArray[np.float64]],
     distances: npt.NDArray[np.float64],
     vectors: npt.NDArray[np.float64],
     zetas: npt.NDArray[np.float64],
     etas: npt.NDArray[np.float64],
     lambdas: npt.NDArray[np.float64],
     types: npt.NDArray[np.int64],
-    combos: list[tuple],
+    combos: list[tuple[int, int]],
 ) -> npt.NDArray[np.float64]:
-    ncombos: np.int64 = (np.unique(combos)).shape[0] + 1
+    ncombos: int = int(np.unique(combos).shape[0] + 1)
     g4: npt.NDArray[np.float64] = np.zeros(
         (len(zetas), len(etas), len(lambdas), ncombos), dtype=np.float64
     )
@@ -255,12 +267,15 @@ def G4(
             rjk = np.linalg.norm(rjk_vec)
 
             costheta = np.dot(rij_vec, rik_vec) / (rij * rik)
-            fc_fac = fci[j] * fci[k] * fc(rjk)
+            fc_fac = fci[j] * fci[k] * fc(np.asarray([rjk], dtype=np.float64))
             exp_arg = rij**2 + rik**2 + rjk**2
 
-            combo: tuple = tuple(sorted([types[j], types[k]]))
-            if combo in combos:
-                icombo: int = combos.index(combo)
+            tj = int(types[j])
+            tk = int(types[k])
+            combo: tuple[int, int] = (tj, tk) if tj <= tk else (tk, tj)
+            if combo not in combos:
+                continue
+            icombo: int = combos.index(combo)
 
             exp_fac = np.exp(-etas * exp_arg)
             for ilambda, lambd in enumerate(lambdas):
@@ -271,16 +286,16 @@ def G4(
 
 
 def G5(
-    fc: Callable,
+    fc: Callable[[npt.NDArray[np.float64]], npt.NDArray[np.float64]],
     distances: npt.NDArray[np.float64],
     vectors: npt.NDArray[np.float64],
     zetas: npt.NDArray[np.float64],
     etas: npt.NDArray[np.float64],
     lambdas: npt.NDArray[np.float64],
     types: npt.NDArray[np.int64],
-    combos: list[tuple],
+    combos: list[tuple[int, int]],
 ) -> npt.NDArray[np.float64]:
-    ncombos: np.int64 = (np.unique(combos)).shape[0] + 1
+    ncombos: int = int(np.unique(combos).shape[0] + 1)
     g5: npt.NDArray[np.float64] = np.zeros(
         (len(zetas), len(etas), len(lambdas), ncombos), dtype=np.float64
     )
@@ -299,9 +314,12 @@ def G5(
             costheta = np.dot(rij_vec, rik_vec) / (rij * rik)
             g5_fc_fac = fci[j] * fci[k]
 
-            combo: tuple = tuple(sorted([types[j], types[k]]))
-            if combo in combos:
-                icombo: int = combos.index(combo)
+            tj = int(types[j])
+            tk = int(types[k])
+            combo: tuple[int, int] = (tj, tk) if tj <= tk else (tk, tj)
+            if combo not in combos:
+                continue
+            icombo: int = combos.index(combo)
 
             g5_exp_fac = np.exp(-etas * (rij**2 + rik**2))
             for ilambda, lambd in enumerate(lambdas):

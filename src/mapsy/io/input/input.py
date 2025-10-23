@@ -1,19 +1,16 @@
-from typing import (
-    Any,
-    Dict,
-    Optional,
-)
-
 from pathlib import Path
-from yaml import load, SafeLoader
+from typing import Any, cast
+
+from yaml import SafeLoader, load
+
+from mapsy.symfunc.parser import SymmetryFunctionsModel
 
 from .base import (
     BaseModel,
+    ContactSpaceModel,
     ControlModel,
     SystemModel,
-    ContactSpaceModel,
 )
-from mapsy.symfunc.parser import SymmetryFunctionsModel
 
 
 class Input(BaseModel):
@@ -21,19 +18,18 @@ class Input(BaseModel):
     Model for MapSy input.
     """
 
-    control: Optional[ControlModel] = None
-    system: Optional[SystemModel] = None
-    contactspace: Optional[ContactSpaceModel] = None
-    symmetryfunctions: Optional[SymmetryFunctionsModel] = None
+    control: ControlModel | None = None
+    system: SystemModel | None = None
+    contactspace: ContactSpaceModel | None = None
+    symmetryfunctions: SymmetryFunctionsModel | None = None
 
     def __init__(
         self,
-        filename: Optional[str] = None,
-        **params: Dict[str, Any],
+        filename: str | None = None,
+        **params: dict[str, Any],
     ) -> None:
-
         # default parameter dictionary
-        param_dict: Dict[str, Dict[str, Any]] = {
+        param_dict: dict[str, dict[str, Any]] = {
             "control": {},
             "system": {},
             "contactspace": {},
@@ -56,7 +52,7 @@ class Input(BaseModel):
         if input_dict:
             self.sanity_check()
 
-    def read(self, filename: str) -> Dict[str, Any]:
+    def read(self, filename: str) -> dict[str, Any]:
         """Read parameter dictionary from a YAML input file.
 
         Parameters
@@ -71,7 +67,10 @@ class Input(BaseModel):
         """
         try:
             with open(Path(filename).absolute()) as f:
-                return load(f, SafeLoader)
+                data = load(f, SafeLoader)  # returns Any
+            if data is None:
+                return {}
+            return cast(dict[str, Any], data)
         except Exception:
             raise
 
@@ -81,5 +80,10 @@ class Input(BaseModel):
 
     def _validate_system(self) -> None:
         """Validate system input"""
-        if self.system.systemtype != "ions" and self.system.file.fileformat != "cube":
-            raise ValueError("System mode electronic or full requires a cubefile")
+        sys = self.system
+        if sys is None:
+            return  # nothing to validate if no system provided
+        if sys.systemtype != "ions":
+            file = sys.file
+            if file is None or file.fileformat != "cube":
+                raise ValueError("System mode 'electronic' or 'full' requires a cube file.")
