@@ -1,6 +1,6 @@
-from mapsy.symfunc.atomic import ACSFParser, BPSFParser, CubeSFParser
-from mapsy.symfunc.input import SymmetryFunctionsModel
-from mapsy.symfunc.symmetryfunction import SymmetryFunction
+from .atomic import ACSFParser, BPSFParser, CubeSFParser
+from .input import SymmetryFunctionsModel
+from .symmetryfunction import SymmetryFunction
 
 
 class SymmetryFunctionsParser:

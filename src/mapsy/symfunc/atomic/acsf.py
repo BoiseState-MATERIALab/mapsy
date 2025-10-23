@@ -6,9 +6,10 @@ import numpy.typing as npt
 from ase import Atoms
 from numpy.polynomial.chebyshev import Chebyshev as cheb
 
-from mapsy.symfunc import SymmetryFunction
-from mapsy.symfunc.input import SymFuncModel
 from mapsy.utils import cutoff
+
+from ..input import SymFuncModel
+from ..symmetryfunction import SymmetryFunction
 
 
 def wrapcheby(

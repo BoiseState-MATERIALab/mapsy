@@ -1,5 +1,5 @@
-from mapsy.symfunc import SymmetryFunction
-from mapsy.symfunc.input import SymFuncModel
+from ..input import SymFuncModel
+from ..symmetryfunction import SymmetryFunction
 
 
 class CubeSFParser:
