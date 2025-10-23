@@ -171,7 +171,7 @@ class Maps:
         f = filterdata[feature].values.astype(np.float64)
         # Select the axis for splitting
         if splitby not in self.data.columns:
-            raise ValueError(f"Split axis {splitby[0]} not found in maps data.")
+            raise ValueError(f"Split axis {splitby} not found in maps data.")
         s = filterdata[splitby].values
         nsplit = np.unique(s).size
         if nsplit == 1:
@@ -489,7 +489,7 @@ class Maps:
     def graph(self, clusters: npt.NDArray[np.int64]) -> npt.NDArray[np.int64]:
         # Check that contact space exists
         if self.contactspace is None:
-            raise RuntimeError("Trying to use maps.plot() without contact space")
+            raise RuntimeError("Trying to use maps.graph() without contact space")
         nclusters: np.int64 = np.max(clusters) + 1
         graph: npt.NDArray[np.int64] = np.zeros((nclusters, nclusters), dtype=np.int64)
         for i in range(self.contactspace.nm):
@@ -712,6 +712,8 @@ class Maps:
                     # ensure row shape (1, n_features_for_sf)
                     row = values.reshape(1, -1)
                     per_sf_rows[i].append(row)
+                else:
+                    raise RuntimeError("Non-atomic symmetry functions not implemented yet")
         # Stack per-sf rows into arrays (#points_in_chunk, #features_for_sf)
         out: list[NDArrayF] = []
         for i, rows in enumerate(per_sf_rows):

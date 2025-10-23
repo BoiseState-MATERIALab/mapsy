@@ -11,6 +11,8 @@ T = TypeVar("T")
 def full2chunk(inputs: npt.NDArray) -> list[npt.NDArray]:
     """Split along axis 0 and return a list of ndarray chunks."""
     n_cpus = min(cpu_count(), len(inputs))
+    if n_cpus <= 1:
+        return [inputs]
     return list(np.array_split(inputs, n_cpus, axis=0))
 
 
