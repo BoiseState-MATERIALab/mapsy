@@ -3,7 +3,8 @@ from __future__ import annotations
 from collections.abc import Iterator
 
 from mapsy.data import GradientField, Grid, HessianField, ScalarField
-from mapsy.utils.functions import FieldFunction
+
+from .functions import FieldFunction
 
 
 class FunctionContainer:
