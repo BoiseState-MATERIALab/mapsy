@@ -1,12 +1,15 @@
 from mapsy.boundaries import Boundary, ContactSpace, IonicBoundary, SystemBoundary
 from mapsy.data import Grid, ScalarField, System
-from mapsy.io import BaseParser, CubeParser, XYZParser
 from mapsy.io.input.base import (
     ContactSpaceModel,
     FileModel,
     SystemModel,
 )
 from mapsy.utils import setscalars
+
+from .base import BaseParser
+from .cube import CubeParser
+from .xyz import XYZParser
 
 
 class DataParser:
