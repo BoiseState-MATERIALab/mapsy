@@ -37,6 +37,10 @@ tester = ["pytest ~= 7.0"]
 linter = ["ruff ~= 0.6"]
 mypy = ["mypy ~= 1.10", "types-PyYAML ~= 6.0"]
 doc = ["sphinx ~= 7.0", "myst-parser ~= 3.0"]
+examples = ["networkx",
+     "seaborn",
+     "",
+     ]
 
 [project.urls]
 Source = "https://github.com/BoiseState-MATERIALab/mapsy"
