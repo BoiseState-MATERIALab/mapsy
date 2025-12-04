@@ -1,5 +1,5 @@
 from collections.abc import Callable
-from typing import Any, SupportsFloat
+from typing import Any
 
 import numpy as np
 import numpy.typing as npt
@@ -8,7 +8,7 @@ import numpy.typing as npt
 def cutoff(
     type: str,
     rcut: float,
-) -> Callable:
+) -> Callable[..., npt.NDArray[np.float64]]:
     if type == "cos":
         fc = cosfc
     elif type == "tanh":
@@ -19,11 +19,12 @@ def cutoff(
 
 
 def wraprcut(
-    f: Callable[..., SupportsFloat],
+    f: Callable[..., npt.NDArray[np.float64]],
     rcut: float,
-) -> Callable[..., float]:
-    def wrapped(*args: Any, **kwargs: Any) -> float:
-        return float(f(rcut, *args, **kwargs))
+) -> Callable[..., npt.NDArray[np.float64]]:
+    def wrapped(*args: Any, **kwargs: Any) -> npt.NDArray[np.float64]:
+        # Preserve ndarray outputs (needed for vectorized distance evaluations)
+        return np.asarray(f(rcut, *args, **kwargs), dtype=np.float64)
 
     return wrapped
 
