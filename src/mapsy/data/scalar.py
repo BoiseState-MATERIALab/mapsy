@@ -29,8 +29,8 @@ class ScalarField(VolumetricField):
         if name is None:
             name = "scalar"
 
-        # VolumetricField.__new__ signature: (grid, rank, label, name, data)
-        obj = super().__new__(cls, grid, rank, label, name, data)
+        # VolumetricField.__new__ signature: (grid, rank, rank_axis_first, label, name, data)
+        obj = super().__new__(cls, grid, rank, False, label, name, data)
         obj._integral = None
         return obj
 
@@ -198,12 +198,12 @@ class ScalarField(VolumetricField):
         ax2 = fig.add_subplot(gs[0, 1])
         ax2_pos = ax2.get_position().bounds
         ax2.set_position(
-            [
+            (
                 ax2_pos[0] + ax2_pos[2] * 0.35,
                 ax2_pos[1] + ax2_pos[3] * 0.05,
                 ax2_pos[2] * 0.1,
                 ax2_pos[3] * 0.9,
-            ]
+            )
         )
         fig.colorbar(cont, cax=ax2)
         plt.show()

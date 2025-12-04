@@ -27,33 +27,43 @@ class VolumetricField(np.ndarray):
         cls: type[T],
         grid: Grid,
         rank: int = 1,
+        rank_axis_first: bool = False,
         label: str | None = None,
         name: str | None = None,
         data: npt.ArrayLike | None = None,
     ) -> T:
         base_shape = _shape_from_scalars(grid.scalars)  # (nx, ny, nz)
-        expected = (
-            (*base_shape, rank) if rank != 1 else base_shape
-        )  # (nx, ny, nz, rank) or (nx, ny, nz)
+        expected: tuple[int, ...]
+        if rank == 1:
+            expected = base_shape
+        elif rank_axis_first:
+            expected = (rank, *base_shape)  # (rank, nx, ny, nz)
+        else:
+            expected = (*base_shape, rank)  # (nx, ny, nz, rank)
 
         if data is None:
             arr = np.zeros(expected, dtype=np.float64)
         else:
             arr = np.asarray(data, dtype=np.float64)
             if arr.shape != expected:
-                # If you want to allow broadcasting, keep this block; otherwise raise immediately.
-                try:
-                    arr = np.broadcast_to(arr, expected).copy()
-                except ValueError as e:
-                    raise ValueError(
-                        f"data.shape {arr.shape} incompatible with expected {expected}"
-                    ) from e
+                # Try a common alternative layout (swap leading/trailing rank axis) before broadcasting.
+                if rank != 1:
+                    alt_expected = (*base_shape, rank) if rank_axis_first else (rank, *base_shape)
+                    if arr.shape == alt_expected:
+                        moved_axis = -1 if rank_axis_first else 0
+                        arr = np.moveaxis(arr, moved_axis, 0 if rank_axis_first else -1)
+                if arr.shape != expected:
+                    try:
+                        arr = np.broadcast_to(arr, expected).copy()
+                    except ValueError as e:
+                        raise ValueError(
+                            f"data.shape {arr.shape} incompatible with expected {expected}"
+                        ) from e
 
-        obj = np.asarray(arr, dtype=np.float64).view(cls)
-
-        out = cast(T, obj)
+        out = cast(T, np.asarray(arr, dtype=np.float64).view(cls))
         out.grid = grid
         out.rank = int(rank)
+        out.rank_axis_first = bool(rank_axis_first)
         if label is not None:
             out.label = label
         if name is not None:
@@ -66,5 +76,6 @@ class VolumetricField(np.ndarray):
             return
         self.grid = getattr(obj, "grid", None)
         self.rank = getattr(obj, "rank", None)
+        self.rank_axis_first = getattr(obj, "rank_axis_first", False)
         self.label = getattr(obj, "label", None)
         self.name = getattr(obj, "name", None)

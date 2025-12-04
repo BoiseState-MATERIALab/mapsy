@@ -85,7 +85,7 @@ class ContactSpace:
             # -- Update region number
             count += 1  # NOTE: count from 1 to allow boolean operations on visited
             # -- Add first non-visited point to the stack
-            stack = [np.where(not visited)[0][0]]
+            stack = [np.where(visited == 0)[0][0]]
             while stack:
                 # -- Pop last entry from the stack
                 i = stack.pop()

@@ -26,8 +26,8 @@ class GradientField(VolumetricField):
         if name is None:
             name = "gradient"
 
-        # VolumetricField.__new__ signature: (grid, rank, label, name, data)
-        obj = super().__new__(cls, grid, rank, label, name, data)
+        # VolumetricField.__new__ signature: (grid, rank, rank_axis_first, label, name, data)
+        obj = super().__new__(cls, grid, rank, True, label, name, data)
         obj._modulus = ScalarField(grid, name=name + "modulus", label=label + "M")
         return obj
 

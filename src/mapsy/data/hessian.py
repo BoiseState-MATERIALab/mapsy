@@ -23,8 +23,8 @@ class HessianField(VolumetricField):
         if name is None:
             name = "hessian"
 
-        # VolumetricField.__new__ signature: (grid, rank, label, name, data)
-        obj = super().__new__(cls, grid, rank, label, name, data)
+        # VolumetricField.__new__ signature: (grid, rank, rank_axis_first, label, name, data)
+        obj = super().__new__(cls, grid, rank, True, label, name, data)
         return obj
 
     def __array_finalize__(self, obj: np.ndarray | None) -> None:
