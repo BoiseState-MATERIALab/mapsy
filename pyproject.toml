@@ -28,6 +28,7 @@ dependencies = [
     "numpy",
     "pandas",
     "pathos",
+    "scikit-learn",
     "ase"   
 ]
 
