@@ -85,11 +85,16 @@ class ContactSpaceGenerator:
             self.distance = csmodel.distance
         elif csmodel.mode == "ionic":
             self.radiusmode = csmodel.radiusmode
+            self.radiusfile = csmodel.radiusfile
             self.alpha = csmodel.alpha
         else:
             raise ValueError("Unkonwn contact space mode in input")
 
-    def generate(self, system: System) -> ContactSpace:
+    def generate(
+        self,
+        system: System,
+        radius_table_file: str | None = None,
+    ) -> ContactSpace:
         self.cell = system.grid.cell
         self.scalars = setscalars(self.cell, self.cutoff)
         self.grid = Grid(scalars=self.scalars, cell=self.cell)
@@ -105,12 +110,14 @@ class ContactSpaceGenerator:
                 system=system,
             )
         elif self.mode == "ionic":
+            user_radius_table = radius_table_file or self.radiusfile
             boundary = IonicBoundary(
                 mode=self.radiusmode,
                 grid=self.grid,
                 alpha=self.alpha,
                 softness=self.spread,
                 system=system,
+                radius_table_file=user_radius_table,
             )
         elif self.mode == "electronic":
             raise NotImplementedError("Electronic boundary not implemented yet")

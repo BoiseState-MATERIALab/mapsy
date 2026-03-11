@@ -1,5 +1,6 @@
 line-length = 100
 target-version = "py311"
+exclude = ["dev"]
 
 [lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "C4", "T20"]

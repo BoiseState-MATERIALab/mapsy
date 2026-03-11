@@ -67,6 +67,7 @@ class ContactSpaceModel(BaseModel):
 
     mode: ContactSpaceMode = "system"
     radiusmode: RadiusMode = "muff"
+    radiusfile: str | None = None
     alpha: PositiveFloat = 1.0
     spread: PositiveFloat = 0.5
     distance: PositiveFloat = 0
