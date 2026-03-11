@@ -23,3 +23,18 @@ except ImportError:  # pragma: no cover
 
 with suppress(_md.PackageNotFoundError):
     __version__ = _md.version("mapsy")
+
+__all__ = ["__version__", "Maps", "MapsFromFile", "MultiMaps"]
+
+
+def __getattr__(name: str) -> Any:
+    if name in {"Maps", "MapsFromFile"}:
+        from .maps import Maps, MapsFromFile
+
+        exports = {"Maps": Maps, "MapsFromFile": MapsFromFile}
+        return exports[name]
+    if name == "MultiMaps":
+        from .multimaps import MultiMaps
+
+        return MultiMaps
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
