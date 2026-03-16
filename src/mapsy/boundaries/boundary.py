@@ -1,7 +1,6 @@
 from abc import ABC, abstractmethod
 
-from mapsy.data import Grid, ScalarField, GradientField
-from mapsy.utils.functions import ERFC
+from mapsy.data import GradientField, Grid, ScalarField
 
 
 class Boundary(ABC):
@@ -39,6 +38,6 @@ class Boundary(ABC):
         if self.solvent_aware:
             self._build_solvent_aware_boundary()
 
+    @abstractmethod
     def _build_solvent_aware_boundary(self) -> None:
         """docstring"""
-        pass

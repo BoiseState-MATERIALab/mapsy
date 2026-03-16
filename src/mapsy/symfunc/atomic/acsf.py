@@ -1,48 +1,49 @@
 # Atom-Centered Symmetry Functions
-from abc import ABC
-from typing import Callable, List, Union, Tuple, Optional
+from collections.abc import Callable
+from typing import TYPE_CHECKING
 
-from ase import Atoms
 import numpy as np
 import numpy.typing as npt
+from ase import Atoms
 from numpy.polynomial.chebyshev import Chebyshev as cheb
 
-from mapsy.symfunc.input import SymFuncModel
-from mapsy.symfunc import SymmetryFunction
 from mapsy.utils import cutoff
+
+from ..symmetryfunction import SymmetryFunction
+
+if TYPE_CHECKING:
+    from ..input import SymFuncModel
 
 
 def wrapcheby(
-    f: Callable,
+    f: Callable[[int, float, npt.ArrayLike], npt.NDArray[np.float64]],
     order: int,
     rcut: float,
-) -> Callable:
-    def wrapped(*args) -> float:
-        return f(order, rcut, *args)
+) -> Callable[[npt.ArrayLike], npt.NDArray[np.float64]]:
+    def wrapped(x: npt.ArrayLike) -> npt.NDArray[np.float64]:
+        return np.asarray(f(order, rcut, x), dtype=np.float64)
 
     return wrapped
 
 
-def dual_basis_function(order: int, rcut: float, x: float):
-    return cheb.basis(order)(2 * x / rcut - 1)
+def dual_basis_function(order: int, rcut: float, x: npt.ArrayLike) -> npt.NDArray[np.float64]:
+    return np.asarray(cheb.basis(order)(2 * np.asarray(x) / rcut - 1), dtype=np.float64)
 
 
-def basis_function(order: int, rcut: float, x: float):
-    k = 1
-    if order == 0: k = 2
-    return (
-        k
-        / (2 * np.pi * np.sqrt(x / rcut - x**2 / rcut**2))
-        / 4
+def basis_function(order: int, rcut: float, x: npt.ArrayLike) -> npt.NDArray[np.float64]:
+    xa = np.asarray(x, dtype=np.float64)
+    k = 2 if order == 0 else 1
+    return np.asarray(
+        (k / (2 * np.pi * np.sqrt(xa / rcut - xa**2 / rcut**2)) / 4)
         * rcut
-        * cheb.basis(order)(2 * x / rcut - 1)
+        * cheb.basis(order)(2 * xa / rcut - 1),
+        dtype=np.float64,
     )
 
 
 class ACSFParser:
-
-    def __init__(self, symfuncmodel: SymFuncModel) -> None:
-        self.order = np.array(symfuncmodel.order,dtype=np.int64)
+    def __init__(self, symfuncmodel: "SymFuncModel") -> None:
+        self.order = np.array(symfuncmodel.order, dtype=np.int64)
         self.cutoff = symfuncmodel.cutoff
         self.radius = symfuncmodel.radius
         self.radial = symfuncmodel.radial
@@ -50,7 +51,7 @@ class ACSFParser:
         self.structural = symfuncmodel.structural
 
     def parse(self) -> list[SymmetryFunction]:
-        symmetryfunctions: list = []
+        symmetryfunctions: list[SymmetryFunction] = []
         symmetryfunctions.append(
             ACSymmetryFunction(
                 self.order,
@@ -65,22 +66,6 @@ class ACSFParser:
 
 
 class ACSymmetryFunction(SymmetryFunction):
-
-    order: npt.NDArray[np.int64] = None
-    radial: bool = True  # angular if False
-    cutoff: float = 0.0
-    fc: Callable = None
-    rcut: float = 0.0
-
-    compositional: bool = False
-    weights: npt.NDArray[np.float64] = None
-    structural: bool = False
-
-    polynomia: List[Callable] = []
-
-    types: list[str] = None
-    itypes: npt.NDArray[np.int64] = None
-
     def __init__(
         self,
         order: npt.NDArray[np.int64],
@@ -93,37 +78,40 @@ class ACSymmetryFunction(SymmetryFunction):
         super().__init__(kind=2, label="ACSF")
         self.order = order
 
-        self.fc: Callable = cutoff(cutofftype, radius)
+        self.fc: Callable[[npt.NDArray[np.float64]], npt.NDArray[np.float64]] = cutoff(
+            cutofftype, radius
+        )
         self.rcut: float = radius
 
-        self.compositional: bool = compositional
-        self.structural: bool = structural
-        self.radial: bool = radial
+        self.compositional = bool(compositional)
+        self.structural = bool(structural)
+        self.radial = bool(radial)
+        # If neither structural nor compositional was requested, default to structural to avoid empty outputs.
+        if not (self.structural or self.compositional):
+            self.structural = True
         if self.radial:
             if radius == 0:
                 raise ValueError()
-            self.cutoff: float = radius
+            self.cutoff = float(radius)
         else:
-            self.cutoff: float = np.pi
-        self.polynomia: List[Callable] = []
+            self.cutoff = float(np.pi)
+        # polynomial basis functions: arraylike -> ndarray
+        self.polynomia: list[Callable[[npt.ArrayLike], npt.NDArray[np.float64]]] = []
         self._generate_functions()
 
     def _generate_functions(self) -> None:
-        if self.radial : 
-            function = basis_function
-        else:
-            function = dual_basis_function
+        function = basis_function if self.radial else dual_basis_function
         for order in self.order:
             pol_order = wrapcheby(function, order, self.cutoff)
             self.polynomia.append(pol_order)
 
-    def _init_weights(self):
+    def _init_weights(self) -> None:
         # This will have to be implemented later with a correct weight function
-        n = self.ntypes//2
-        weights = list(range(-n,n+1))
-        if self.ntypes%2 == 0:
+        n = int(self.ntypes) // 2
+        weights = list(range(-n, n + 1))
+        if self.ntypes % 2 == 0:
             weights.remove(0)
-        self.weights = np.array([ weights[i] for i in self.itypes ])
+        self.weights = np.array([weights[int(i)] for i in self.itypes], dtype=np.float64)
 
     def _check_angular(self) -> bool:
         return not self.radial
@@ -131,12 +119,14 @@ class ACSymmetryFunction(SymmetryFunction):
     def _check_atomic(self) -> bool:
         return True
 
-    def setup(self, atoms: Optional[Atoms] = None) -> None:
+    def setup(self, atoms: Atoms | None = None) -> None:
         """"""
+        if atoms is None:
+            raise ValueError("atoms must be provided to setup()")
         elements = atoms.get_chemical_symbols()
-        self.types = sorted(list(dict.fromkeys(elements)))
-        self.itypes = np.array([self.types.index(e) for e in elements]).astype("int")
-        self.ntypes = np.max(self.itypes).astype("int")+1
+        self.types = sorted(dict.fromkeys(elements))
+        self.itypes = np.array([self.types.index(e) for e in elements], dtype=np.int64)
+        self.ntypes = int(np.max(self.itypes)) + 1
         if self.compositional:
             self._init_weights()
 
@@ -154,30 +144,23 @@ class ACSymmetryFunction(SymmetryFunction):
 
     def _generate_keys(self) -> list[str]:
         """docstring"""
-        self.__keys = []
-        if self.radial:
-            typelabel = "R"
-        else:
-            typelabel = "A"
+        self.__keys: list[str] = []
+        typelabel = "R" if self.radial else "A"
         if self.structural:
             locallabel = "S"
             for order in self.order:
-                self.__keys.append(
-                    f"{self.label}_{typelabel}{locallabel}_r{self.rcut}_{order:03d}"
-                )
+                self.__keys.append(f"{self.label}_{typelabel}{locallabel}_r{self.rcut}_{order:03d}")
         if self.compositional:
             locallabel = "C"
             for order in self.order:
-                self.__keys.append(
-                    f"{self.label}_{typelabel}{locallabel}_r{self.rcut}_{order:03d}"
-                )
+                self.__keys.append(f"{self.label}_{typelabel}{locallabel}_r{self.rcut}_{order:03d}")
         return self.__keys
 
     def _compute_values(
         self,
-        distances: npt.NDArray,
-        vectors: Optional[npt.NDArray] = None,
-    ) -> npt.NDArray:
+        distances: npt.NDArray[np.float64],
+        vectors: npt.NDArray[np.float64] | None = None,
+    ) -> npt.NDArray[np.float64]:
         """"""
         if self.radial:
             return self._calculate_radial(distances)
@@ -186,41 +169,38 @@ class ACSymmetryFunction(SymmetryFunction):
 
     def _calculate_radial(
         self,
-        distances: npt.NDArray,
-    ):
+        distances: npt.NDArray[np.float64],
+    ) -> npt.NDArray[np.float64]:
         """"""
         fci = self.fc(distances)
         mask = fci > 1.0e-6
-        if self.structural:
-            structural_coefficients = np.zeros(len(self.order))
-        if self.compositional:
-            composition_coefficients = np.zeros(len(self.order))
+        structural_coefficients = np.zeros(len(self.order), dtype=np.float64)
+        composition_coefficients = np.zeros(len(self.order), dtype=np.float64)
 
-        for i,order in enumerate(self.order):
+        for i in range(len(self.order)):
             if self.structural:
-                structural_coefficients[i] = np.sum(
-                    self.polynomia[i](distances[mask]) * fci[mask]
-                )
+                structural_coefficients[i] = np.sum(self.polynomia[i](distances[mask]) * fci[mask])
             if self.compositional:
                 composition_coefficients[i] = np.sum(
-                    self.polynomia[i](distances[mask])
-                    * fci[mask]
-                    * self.weights[mask]
+                    self.polynomia[i](distances[mask]) * fci[mask] * self.weights[mask]
                 )
 
+        if self.structural and self.compositional:
+            return np.concatenate((structural_coefficients, composition_coefficients))
         if self.structural:
-            if self.compositional:
-                return np.concatenate((structural_coefficients, composition_coefficients))
             return structural_coefficients
-        if self.compositional:
-            return composition_coefficients
+        return composition_coefficients
 
-    def _calculate_angular(self, distances, vectors):
+    def _calculate_angular(
+        self,
+        distances: npt.NDArray[np.float64],
+        vectors: npt.NDArray[np.float64] | None,
+    ) -> npt.NDArray[np.float64]:
+        if vectors is None:
+            raise ValueError("vectors are required for angular ACSF")
         fci = self.fc(distances)
-        if self.structural:
-            structural_coefficients = np.zeros(len(self.order))
-        if self.compositional:
-            composition_coefficients = np.zeros(len(self.order))
+        structural_coefficients = np.zeros(len(self.order), dtype=np.float64)
+        composition_coefficients = np.zeros(len(self.order), dtype=np.float64)
 
         # iterate through distance pairs and their corresponding vector pairs
         for j in fci.nonzero()[0]:
@@ -231,23 +211,21 @@ class ACSymmetryFunction(SymmetryFunction):
                     continue
                 rik = distances[k]
                 rik_vec = vectors[k]
-                angle = np.arccos(
-                    np.clip(np.dot(rij_vec, rik_vec) / (rij * rik), -1, 1)
-                )
-                for i,order in enumerate(self.order):
+                angle = np.arccos(np.clip(np.dot(rij_vec, rik_vec) / (rij * rik), -1, 1))
+                for i in range(len(self.order)):
                     if self.structural:
-                        structural_coefficients[i] += (
-                            self.polynomia[i](angle)*fci[j]*fci[k]
-                        )
+                        structural_coefficients[i] += self.polynomia[i](angle) * fci[j] * fci[k]
                     if self.compositional:
                         composition_coefficients[i] += (
-                            self.polynomia[i](angle)*fci[j]*fci[k]
-                            * self.weights[j] * self.weights[k]
+                            self.polynomia[i](angle)
+                            * fci[j]
+                            * fci[k]
+                            * self.weights[j]
+                            * self.weights[k]
                         )
 
+        if self.structural and self.compositional:
+            return np.concatenate((structural_coefficients, composition_coefficients))
         if self.structural:
-            if self.compositional:
-                return np.concatenate((structural_coefficients, composition_coefficients))
             return structural_coefficients
-        if self.compositional:
-            return composition_coefficients
+        return composition_coefficients

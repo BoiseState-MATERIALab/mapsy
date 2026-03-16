@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from typing import Iterator, List, Union
+from collections.abc import Iterator
 
-from mapsy.data import Grid
-from mapsy.data import ScalarField, GradientField, HessianField
-from mapsy.utils.functions import FieldFunction
+from mapsy.data import GradientField, Grid, HessianField, ScalarField
+
+from .functions import FieldFunction
 
 
 class FunctionContainer:
@@ -12,14 +12,13 @@ class FunctionContainer:
 
     def __init__(self, grid: Grid) -> None:
         self.grid = grid
-        self.functions: List[FieldFunction] = []
+        self.functions: list[FieldFunction] = []
         self.count = 0
 
     def __getitem__(
         self,
-        slice: Union[int, List[int], slice],
-    ) -> Union[FieldFunction, FunctionContainer]:
-
+        slice: int | list[int] | slice,
+    ) -> FieldFunction | FunctionContainer:
         if isinstance(slice, int):
             return self.functions[slice]
         else:

@@ -1,0 +1,12 @@
+line-length = 100
+target-version = "py311"
+exclude = ["dev"]
+
+[lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "C4", "T20"]
+ignore = ["E501"]  # auto-format handles long lines; allow print statements
+
+[lint.per-file-ignores]
+"docs/notebooks/*ipynb" = ["T201"]
+"examples/Pt/*ipynb" = ["T201"]
+"examples/Perovskites/*ipynb" = ["T201"]

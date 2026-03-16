@@ -1,14 +1,17 @@
 # Refactored from Stephen Weitzner cube_vizkit
+import logging
+
 import numpy as np
 import numpy.typing as npt
-import sys
 
 #
 from ase import Atoms
 from ase.units import Bohr
 
-from mapsy.io.base import BaseParser
 from mapsy.data import Grid, ScalarField
+from mapsy.io.base import BaseParser
+
+logger = logging.getLogger(__name__)
 
 
 class CubeParser(BaseParser):
@@ -60,7 +63,7 @@ class CubeParser(BaseParser):
         try:
             # -- Parse the header of the cube file
             self.natoms = int(self.contents[2].split()[0])
-            origin: npt.NDArray[np.float64] = np.array(
+            self.origin: npt.NDArray[np.float64] = np.array(
                 list(map(float, self.contents[2].split()[1:])), dtype=np.float64
             )
             header: list[str] = self.contents[3:6]
@@ -71,10 +74,8 @@ class CubeParser(BaseParser):
             R2: list[float] = list(map(float, header[1].split()[1:4]))
             R3: list[float] = list(map(float, header[2].split()[1:4]))
         except Exception as e:
-            print("Error parsing header:")
-            print(e)
-            print("Exiting with code -2.")
-            sys.exit(-2)
+            logger.exception(f"Error parsing cube header for {self.fname}")
+            raise ValueError("Invalid cube header") from e
 
         # -- Get supercell dimensions
         basis: npt.NDArray[np.float64] = np.array(
@@ -108,17 +109,13 @@ class CubeParser(BaseParser):
         """
         # -- Create an ASE Atoms object
         atoms: list[str] = self.contents[6 : 6 + self.natoms]
-        tmp: npt.NDArray[np.float64] = np.array(
-            [line.split() for line in atoms], dtype=np.float64
-        )
+        tmp: npt.NDArray[np.float64] = np.array([line.split() for line in atoms], dtype=np.float64)
         numbers: npt.NDArray[np.int64] = tmp[:, 0].astype(np.int64)
         charges: npt.NDArray[np.float64] = tmp[:, 1]
         positions: npt.NDArray[np.float64] = tmp[:, 2:]
         if self.units == "bohr":
             positions = positions * Bohr
-        return Atoms(
-            numbers=numbers, positions=positions, charges=charges, cell=grid.cell.T
-        )
+        return Atoms(numbers=numbers, positions=positions, charges=charges, cell=grid.cell.T)
 
     def _read_data(
         self,
@@ -146,11 +143,7 @@ class CubeParser(BaseParser):
         """
         # -- Isolate scalar field data
         data1D = np.array(
-            [
-                float(val)
-                for line in self.contents[6 + self.natoms :]
-                for val in line.split()
-            ]
+            [float(val) for line in self.contents[6 + self.natoms :] for val in line.split()]
         )
         data3D = data1D.reshape(
             (grid.scalars[2], grid.scalars[1], grid.scalars[0]),

@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Optional
+
 import numpy.typing as npt
 from ase import Atoms
 
@@ -12,11 +12,10 @@ KINDS = {
 
 
 class SymmetryFunction(ABC):
-
     def __init__(
         self,
         kind: int,
-        label: Optional[str] = None,
+        label: str | None = None,
     ) -> None:
         self.kind = kind
         self.label = label
@@ -24,7 +23,7 @@ class SymmetryFunction(ABC):
         self.__atomic: bool = False
 
     @abstractmethod
-    def setup(self, atoms: Optional[Atoms] = None) -> None:
+    def setup(self, atoms: Atoms | None = None) -> None:
         """docstring"""
 
     @property
@@ -57,7 +56,7 @@ class SymmetryFunction(ABC):
     def values(
         self,
         distances: npt.NDArray,
-        vectors: Optional[npt.NDArray] = None,
+        vectors: npt.NDArray | None = None,
     ) -> npt.NDArray:
         """docstring"""
         return self._compute_values(distances, vectors)
@@ -66,7 +65,7 @@ class SymmetryFunction(ABC):
     def _compute_values(
         self,
         distances: npt.NDArray,
-        vectors: Optional[npt.NDArray],
+        vectors: npt.NDArray | None,
     ) -> npt.NDArray:
         """docstring"""
 

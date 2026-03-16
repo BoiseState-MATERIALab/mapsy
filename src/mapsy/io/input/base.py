@@ -1,26 +1,19 @@
-from typing import (
-    List,
-)
-
 from pydantic import (
-    NonNegativeInt,
-    PositiveFloat,
-    PositiveInt,
     BaseModel as PydanticBaseModel,
 )
+from pydantic import NonNegativeInt, PositiveFloat, PositiveInt
 
 from mapsy.io.input.keytypes import (
-    SystemType,
-    FileFormat,
-    Units,
     ContactSpaceMode,
+    FileFormat,
     RadiusMode,
+    SystemType,
+    Units,
 )
-
 from mapsy.utils.iotypes import (
-    NonZeroFloat,
-    Dimensions,
     Axis,
+    Dimensions,
+    NonZeroFloat,
 )
 
 
@@ -36,6 +29,8 @@ class FileModel(BaseModel):
 
     fileformat: FileFormat = "xyz+"
     name: str = ""
+    folder: str = ""
+    root: str = ""
     units: Units = "bohr"
 
 
@@ -44,7 +39,7 @@ class PropertyModel(BaseModel):
 
     name: str = ""
     label: str = ""
-    file: FileModel = None
+    file: FileModel | None = None
 
 
 class ControlModel(BaseModel):
@@ -59,10 +54,10 @@ class SystemModel(BaseModel):
     """System input model."""
 
     systemtype: SystemType = "ions"
-    file: FileModel = None
+    file: FileModel | None = None
     dimension: Dimensions = 2
     axis: Axis = 2
-    properties: List[PropertyModel] = []
+    properties: list[PropertyModel] = []
 
 
 class ContactSpaceModel(BaseModel):
@@ -70,10 +65,10 @@ class ContactSpaceModel(BaseModel):
 
     mode: ContactSpaceMode = "system"
     radiusmode: RadiusMode = "muff"
+    radiusfile: str | None = None
     alpha: PositiveFloat = 1.0
     spread: PositiveFloat = 0.5
     distance: PositiveFloat = 0
     cutoff: PositiveInt = 300
     threshold: NonZeroFloat = 0.1
     side: NonZeroFloat = 1.0
-

@@ -1,14 +1,36 @@
 #
-import numpy.typing as npt
-from typing import Tuple, Optional
+from __future__ import annotations
+
+from collections.abc import Sequence
 from itertools import product
+from typing import TypeAlias  # or: from typing_extensions import TypeAlias (if <3.10)
+
 import numpy as np
+import numpy.typing as npt
+
+# Type aliases (helps mypy & your IDE)
+Int3: TypeAlias = npt.NDArray[np.int64]  # shape: (3,)
+Vec3f: TypeAlias = npt.NDArray[np.float64]  # shape: (3,)
+Mat3f: TypeAlias = npt.NDArray[np.float64]  # shape: (3, 3)
 
 
 class Grid:
+    scalars: Int3
+    basis: Mat3f
+    cell: Mat3f
+    origin: Vec3f
+    ndata: np.int64
+    coordinates: npt.NDArray[np.float64]  # shape (3, nx, ny, nz)
+    corners: npt.NDArray[np.float64]  # shape (8, 3)
+    _volume: np.float64 | None
 
-    def __init__(self, scalars=None, basis=None, cell=None, origin=None):
-        """"""
+    def __init__(
+        self,
+        scalars: Sequence[int] | Int3 | None = None,
+        basis: Mat3f | None = None,
+        cell: Mat3f | None = None,
+        origin: Vec3f | None = None,
+    ) -> None:
         if scalars is not None:
             self.scalars = np.array(scalars, dtype=np.int64)
         else:
@@ -29,24 +51,20 @@ class Grid:
         self.ndata = np.prod(self.scalars)
 
         # -- Construct the grid
-        mesh: npt.NDArray = np.mgrid[
-            0 : self.scalars[0], 0 : self.scalars[1], 0 : self.scalars[2]
-        ]
+        mesh: npt.NDArray = np.mgrid[0 : self.scalars[0], 0 : self.scalars[1], 0 : self.scalars[2]]
         self.coordinates = (
-            np.einsum("ij,jklm->iklm", self.basis.T, mesh)
-            + self.origin[:, None, None, None]
+            np.einsum("ij,jklm->iklm", self.basis.T, mesh) + self.origin[:, None, None, None]
         )
 
         self.corners = -np.array(list(product(range(2), repeat=3))).dot(self.cell)
-
-        self._volume: Optional[np.float64] = None
+        self._volume = None
 
     def get_min_distance(
         self,
         origin: npt.NDArray,
         dim: int = 0,
         axis: int = 0,
-    ) -> Tuple[npt.NDArray, npt.NDArray]:
+    ) -> tuple[npt.NDArray, npt.NDArray]:
         """docstring"""
         r = self.coordinates - origin[:, np.newaxis, np.newaxis, np.newaxis]
         r, r2 = self._apply_minimum_image_convension(r, dim, axis)
@@ -56,7 +74,7 @@ class Grid:
         self,
         dim: int = 0,
         axis: int = 0,
-    ):
+    ) -> Vec3f:
         """docstring"""
         if dim == 0:
             n = np.zeros(3)
@@ -78,7 +96,7 @@ class Grid:
         r: npt.NDArray,
         n: npt.NDArray,
         dim: int = 0,
-    ):
+    ) -> Vec3f:
         """docstring"""
         if dim == 0:
             pass
@@ -95,7 +113,7 @@ class Grid:
         r: npt.NDArray,
         dim: int = 0,
         axis: int = 0,
-    ) -> Tuple[npt.NDArray, npt.NDArray]:
+    ) -> tuple[npt.NDArray, npt.NDArray]:
         """docstring"""
 
         n = self._get_direction(dim, axis)
@@ -126,23 +144,24 @@ class Grid:
     @property
     def volume(self) -> np.float64:
         if self._volume is None:
-            self._compute_volume()
+            return self._compute_volume()
         return self._volume
 
-    def _compute_volume(self):
-        a1 = self.cell[:, 0]
-        a2 = self.cell[:, 1]
-        a3 = self.cell[:, 2]
+    def _compute_volume(self) -> np.float64:
+        a1: Vec3f = self.cell[:, 0]
+        a2: Vec3f = self.cell[:, 1]
+        a3: Vec3f = self.cell[:, 2]
         a2crossa3 = np.cross(a2, a3)
-        self._volume = np.dot(a1, a2crossa3)
+        vol: np.float64 = np.float64(np.dot(a1, a2crossa3))
+        self._volume = vol
+        return vol
 
-    def reciprocal(self):
-
-        a1 = self.cell[:, 0]
-        a2 = self.cell[:, 1]
-        a3 = self.cell[:, 2]
+    def reciprocal(self) -> Mat3f:
+        a1: Vec3f = self.cell[:, 0]
+        a2: Vec3f = self.cell[:, 1]
+        a3: Vec3f = self.cell[:, 2]
         a2crossa3 = np.cross(a2, a3)
-        volume = np.dot(a1, a2crossa3)
+        volume: np.float64 = np.float64(np.dot(a1, a2crossa3))
 
         b1 = a2crossa3 / volume
         b2 = np.cross(a3, a1) / volume

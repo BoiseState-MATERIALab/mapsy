@@ -1,4 +1,11 @@
 from .boundary import Boundary
+from .contactspace import ContactSpace
 from .ionic import IonicBoundary
 from .system import SystemBoundary
-from .contactspace import ContactSpace
+
+__all__ = [
+    "Boundary",
+    "ContactSpace",
+    "IonicBoundary",
+    "SystemBoundary",
+]

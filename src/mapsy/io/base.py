@@ -1,13 +1,14 @@
-from sys import exit
+import logging
 from abc import ABC, abstractmethod
-from mapsy.data import System, ScalarField
+
 from ase import Atoms
 
-from mapsy.data import Grid
+from mapsy.data import Grid, ScalarField, System
+
+logger = logging.getLogger(__name__)
 
 
 class BaseParser(ABC):
-
     fname: str = ""
     units: str = "bohr"
     natoms: int = 0
@@ -32,24 +33,20 @@ class BaseParser(ABC):
         # Contains volumetric data
         self.hasdata = hasdata
 
-    def _check_file(self, fname) -> None:
+    def _check_file(self, fname: str) -> None:
+        if fname:
+            self.fname = fname
+        if not self.fname:
+            raise ValueError("File name is required for file parser")
+
+        logger.info(f"Loading {self.fname} ...")
+        self.prefix = self.fname.rsplit(".", 1)[0]
         try:
-            if fname:
-                self.fname = fname
-            assert self.fname, "No filename provided."
-
-            print(f"Loading {self.fname} ...")
-
-            self.prefix = self.fname.split(".")[0]
-
-            with open(self.fname, "r") as f:
+            with open(self.fname) as f:
                 self.contents: list[str] = f.readlines()
-
         except Exception as e:
-            print("Unable to open file:")
-            print(e)
-            print("Exiting with code -1.")
-            exit(-1)
+            logger.exception(f"Unable to open file:{self.fname}")
+            raise OSError(f"Unable to open file {self.fname}") from e
 
     def _check_units(self, units: str = "bohr") -> None:
         allowed_units = ["bohr", "angstrom", "alat"]
@@ -60,25 +57,26 @@ class BaseParser(ABC):
     def systemparse(self) -> System:
         # Read the header and generate the grid
         grid: Grid = self._read_header()
+
         # Read atoms
-        atoms = None
+        atoms: Atoms | None = None
         if self.natoms:
-            atoms: Atoms = self._read_atoms(grid)
+            atoms = self._read_atoms(grid)
+
         # Read data
-        electrons = None
+        electrons: ScalarField | None = None
         if self.hasdata:
-            electrons: ScalarField = self._read_data(
-                grid, name="electrons", label="ELE"
-            )
+            electrons = self._read_data(grid, name="electrons", label="ELE")
+
         return System(grid, atoms, electrons)
 
-    def dataparse(self, name="data", label="DAT") -> ScalarField:
+    def dataparse(self, name: str = "data", label: str = "DAT") -> ScalarField | None:
         # Read the header and generate the grid
         grid: Grid = self._read_header()
         # Read data
-        data = None
+        data: ScalarField | None = None
         if self.hasdata:
-            data: ScalarField = self._read_data(grid, name, label)
+            data = self._read_data(grid, name, label)
         return data
 
     @abstractmethod
@@ -92,6 +90,6 @@ class BaseParser(ABC):
         ...
 
     @abstractmethod
-    def _read_data(self, grid: Grid, name: str, label: str) -> ScalarField:
+    def _read_data(self, grid: Grid, name: str, label: str) -> ScalarField | None:
         """"""
         ...

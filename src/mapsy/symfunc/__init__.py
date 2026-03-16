@@ -1,4 +1,13 @@
-from .symmetryfunction import SymmetryFunction
+from .atomic import ACSymmetryFunction, BPSymmetryFunction
 from .input import SymFuncModel, SymmetryFunctionsModel
 from .parser import SymmetryFunctionsParser
-from .atomic import BPSymmetryFunction, ACSymmetryFunction
+from .symmetryfunction import SymmetryFunction
+
+__all__ = [
+    "ACSymmetryFunction",
+    "BPSymmetryFunction",
+    "SymFuncModel",
+    "SymmetryFunctionsModel",
+    "SymmetryFunctionsParser",
+    "SymmetryFunction",
+]

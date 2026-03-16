@@ -1,33 +1,32 @@
-from pathos.multiprocessing import cpu_count, ProcessingPool
-from typing import Callable
-import numpy.typing as npt
+from collections.abc import Callable, Sequence
+from typing import Any, TypeVar, cast
+
 import numpy as np
+import numpy.typing as npt
+from pathos.multiprocessing import ProcessingPool, cpu_count
 
-def full2chunk(inputs: npt.NDArray) -> list[tuple[npt.NDArray]]:
-    """ 
-    Split a set of input values into chunks according to the first dimension of the array 
-    """
-    n_cpus = min(cpu_count(), len(inputs))  # Ensure we don't use more CPUs than input values
-    chunks: list[npt.NDArray] = np.array_split(inputs,n_cpus,0)# Split positions into chunks along first axis
-    args: list[tuple[npt.NDArray]] = [(chunk) for chunk in chunks] # do we need to put the chunks into a tuple?
-    return args
+T = TypeVar("T")
 
-def chunk2full(outputs: list, n: int) -> list:
-    """ 
-    Combine results from different processors into a sigle list. 
-    Assume results for each processor are lists of size n
-    Return a single list of size n with all the results
-    """
-    results: list[list] = [[] for i in range(n)]
+
+def full2chunk(inputs: npt.NDArray) -> list[npt.NDArray]:
+    """Split along axis 0 and return a list of ndarray chunks."""
+    n_cpus = min(cpu_count(), len(inputs))
+    if n_cpus <= 1:
+        return [inputs]
+    return list(np.array_split(inputs, n_cpus, axis=0))
+
+
+def chunk2full(outputs: Sequence[Sequence[Sequence[Any]]], n: int) -> list[list[np.float64]]:
+    """Combine per-chunk results into a list of length n."""
+    results: list[list[np.float64]] = [[] for _ in range(n)]
     for i in range(n):
         for chunk in outputs:
             results[i].extend(chunk[i])
     return results
 
-def multiproc(function: Callable, args: list[tuple])-> list:
-    """
-    Split processing of function over multiple processors
-    """
+
+def multiproc(function: Callable[[npt.NDArray], T], args: Sequence[npt.NDArray]) -> list[T]:
+    """Map `function` over array chunks using a process pool."""
     with ProcessingPool() as pool:
-        chunk_results: list = pool.map(function, args)
-    return chunk_results
+        # `pool.map` is untyped; tell mypy what it returns.
+        return cast(list[T], pool.map(function, args))

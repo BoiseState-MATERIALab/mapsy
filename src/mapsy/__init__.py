@@ -1,22 +1,41 @@
 """A Python Tool to Compute Local Symmetry Maps"""
-import os
+
+from contextlib import suppress
+from typing import Any
 
 __author__ = "MATERIALab"
 __contact__ = "olivieroandreuss@boisestate.edu"
 __license__ = "MIT"
-__version__ = "0.0.1"
+__version__ = "0.0.1"  # fallback if package metadata isn't available
 __date__ = "2024-05-24"
 
 try:
-    from importlib.metadata import version # python >= 3.8
-except Exception :
-    try:
-        from importlib_metadata import version
-    except Exception :
-        pass
+    import importlib.metadata as _stdlib_metadata
 
-try:
-    __version__ = version("mapsy")
-except Exception:
-    pass
+    _md: Any = _stdlib_metadata
+except ImportError:  # pragma: no cover
+    import importlib_metadata as _backport_metadata
 
+    _md = _backport_metadata
+
+# Optional: define a default so __version__ always exists
+# __version__ = "0.0.1"
+
+with suppress(_md.PackageNotFoundError):
+    __version__ = _md.version("mapsy")
+
+__all__ = ["__version__", "Maps", "MapsFromFile", "MultiMaps", "MultiMapsFromFile"]
+
+
+def __getattr__(name: str) -> Any:
+    if name in {"Maps", "MapsFromFile"}:
+        from .maps import Maps, MapsFromFile
+
+        exports = {"Maps": Maps, "MapsFromFile": MapsFromFile}
+        return exports[name]
+    if name in {"MultiMaps", "MultiMapsFromFile"}:
+        from .multimaps import MultiMaps, MultiMapsFromFile
+
+        exports = {"MultiMaps": MultiMaps, "MultiMapsFromFile": MultiMapsFromFile}
+        return exports[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

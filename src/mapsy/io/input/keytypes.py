@@ -33,4 +33,5 @@ RadiusMode = Literal[
     'bondi',
     'uff',
     'muff',
+    'user',
 ]

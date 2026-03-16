@@ -1,11 +1,11 @@
 import numpy as np
+import numpy.typing as npt
 import pandas as pd
 
 from mapsy.boundaries import Boundary
 
 
 class ContactSpace:
-
     nn = np.zeros((6, 3), dtype=int)
     nn[0], nn[2], nn[4] = np.eye(3, dtype=int)
     nn[1], nn[3], nn[5] = -np.eye(3, dtype=int)
@@ -24,8 +24,10 @@ class ContactSpace:
             # only select the points with the highest modulus
             tol = np.max(boundary.gradient.modulus) - epsilon
 
-        self.mask = boundary.gradient.modulus > tol
+        self.mask: npt.NDArray[np.bool_] = boundary.gradient.modulus > tol
         self.norm = np.sum(boundary.gradient.modulus[self.mask])
+        self._annotation_columns: list[str] = []
+        self._feature_columns: list[str] = []
 
         self._get_indexes()
 
@@ -43,6 +45,44 @@ class ContactSpace:
                 "region": self.regions,
             }
         )
+
+    @property
+    def annotation_columns(self) -> list[str]:
+        return list(self._annotation_columns)
+
+    @property
+    def feature_columns(self) -> list[str]:
+        return list(self._feature_columns)
+
+    def annotate(
+        self,
+        name: str,
+        values: npt.ArrayLike,
+        *,
+        as_feature: bool = True,
+    ) -> npt.NDArray[np.float64]:
+        """Attach pointwise values to the sampled contact-space points."""
+        reserved = {"x", "y", "z", "nn", "region", "probability"}
+        if name in reserved and name not in self._annotation_columns:
+            raise ValueError(f"{name!r} is a reserved contact-space column")
+
+        array = np.asarray(values, dtype=np.float64).reshape(-1)
+        if array.size != self.nm:
+            raise ValueError(
+                f"Annotation {name!r} has length {array.size}, expected {self.nm} contact-space points."
+            )
+
+        self.data.loc[:, name] = array
+        if name not in self._annotation_columns:
+            self._annotation_columns.append(name)
+
+        if as_feature:
+            if name not in self._feature_columns:
+                self._feature_columns.append(name)
+        elif name in self._feature_columns:
+            self._feature_columns.remove(name)
+
+        return array
 
     def _get_indexes(self) -> None:
         """docstring"""
@@ -67,7 +107,7 @@ class ContactSpace:
         """docstring"""
         self.neighbors = []
         # -- For each contact space point find the indexes of its six neighbors
-        for i, m in enumerate(self.i2m):
+        for m in self.i2m:
             nearest = m[np.newaxis, :] + self.nn
             # -- Apply periodic boundary conditions
             nearest = nearest - self.grid.scalars * (nearest // self.grid.scalars)
@@ -85,7 +125,7 @@ class ContactSpace:
             # -- Update region number
             count += 1  # NOTE: count from 1 to allow boolean operations on visited
             # -- Add first non-visited point to the stack
-            stack = [np.where(visited == False)[0][0]]
+            stack = [np.where(visited == 0)[0][0]]
             while stack:
                 # -- Pop last entry from the stack
                 i = stack.pop()

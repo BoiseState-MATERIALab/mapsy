@@ -1,11 +1,14 @@
-from mapsy.symfunc.atomic import BPSFParser, ACSFParser, CubeSFParser
-from mapsy.symfunc.input import SymmetryFunctionsModel
-from mapsy.symfunc.symmetryfunction import SymmetryFunction
+from typing import TYPE_CHECKING
+
+from .atomic import ACSFParser, BPSFParser, CubeSFParser
+from .symmetryfunction import SymmetryFunction
+
+if TYPE_CHECKING:
+    from .input import SymmetryFunctionsModel
+
 
 class SymmetryFunctionsParser:
-
-    def __init__(self, sfsmodel: SymmetryFunctionsModel) -> None:
-
+    def __init__(self, sfsmodel: "SymmetryFunctionsModel") -> None:
         self.symmfuncs: list = []
         for sf in sfsmodel.functions:
             if sf.type == "bp":

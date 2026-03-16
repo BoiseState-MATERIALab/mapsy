@@ -1,9 +1,9 @@
-from typing import Optional
-import numpy.typing as npt
-import numpy as np
 from abc import ABC, abstractmethod
 
-from mapsy.data import Grid, ScalarField, GradientField, HessianField
+import numpy as np
+import numpy.typing as npt
+
+from mapsy.data import GradientField, Grid, HessianField, ScalarField
 
 KINDS = {
     1: "gaussian",
@@ -28,7 +28,7 @@ class FieldFunction(ABC):
         width: float,
         spread: float,
         volume: float,
-        pos: npt.NDArray[np.float64] = np.zeros(3),
+        pos: npt.NDArray[np.float64] | None = None,
         label: str = "",
     ) -> None:
         self.kind = kind
@@ -37,15 +37,17 @@ class FieldFunction(ABC):
         self.width = width
         self.spread = spread
         self.volume = volume
-        self.pos = pos
+        self.pos = (
+            np.asarray(pos, dtype=np.float64) if pos is not None else np.zeros(3, dtype=np.float64)
+        )
         self.grid = grid
         self.label = label
 
-        self._density: Optional[ScalarField] = None
-        self._gradient: Optional[GradientField] = None
-        self._laplacian: Optional[ScalarField] = None
-        self._hessian: Optional[HessianField] = None
-        self._derivative: Optional[ScalarField] = None
+        self._density: ScalarField | None = None
+        self._gradient: GradientField | None = None
+        self._laplacian: ScalarField | None = None
+        self._hessian: HessianField | None = None
+        self._derivative: ScalarField | None = None
 
     @property
     def kind(self) -> int:
@@ -91,7 +93,7 @@ class FieldFunction(ABC):
     @spread.setter
     def spread(self, spread: float) -> None:
         """docstring"""
-        if np.abs(spread < FUNC_TOL):
+        if abs(spread) < FUNC_TOL:
             raise ValueError(f"wrong spread for {self.kind} function")
         self.__spread = spread
 
@@ -100,6 +102,7 @@ class FieldFunction(ABC):
         """docstring"""
         if self._density is None:
             self._compute_density()
+        assert self._density is not None, "internal: _compute_density() did not set _density"
         return self._density
 
     @property
@@ -107,6 +110,7 @@ class FieldFunction(ABC):
         """docstring"""
         if self._gradient is None:
             self._compute_gradient()
+        assert self._gradient is not None, "internal: _compute_gradient() did not set _gradient"
         return self._gradient
 
     @property
@@ -114,6 +118,7 @@ class FieldFunction(ABC):
         """docstring"""
         if self._laplacian is None:
             self._compute_laplacian()
+        assert self._laplacian is not None, "internal: _compute_laplacian() did not set _laplacian"
         return self._laplacian
 
     @property
@@ -121,6 +126,7 @@ class FieldFunction(ABC):
         """docstring"""
         if self._hessian is None:
             self._compute_hessian()
+        assert self._hessian is not None, "internal: _compute_hessian() did not set _hessian"
         return self._hessian
 
     @property
@@ -128,6 +134,9 @@ class FieldFunction(ABC):
         """docstring"""
         if self._derivative is None:
             self._compute_derivative()
+        assert self._derivative is not None, (
+            "internal: _compute_derivative() did not set _derivative"
+        )
         return self._derivative
 
     def reset_derivatives(self) -> None:
