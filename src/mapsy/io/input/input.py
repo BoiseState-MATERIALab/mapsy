@@ -3,12 +3,13 @@ from typing import Any, cast
 
 from yaml import SafeLoader, load
 
-from mapsy.symfunc.parser import SymmetryFunctionsModel
+from mapsy.symfunc.input import SymmetryFunctionsModel
 
 from .base import (
     BaseModel,
     ContactSpaceModel,
     ControlModel,
+    FileModel,
     SystemModel,
 )
 
@@ -83,7 +84,29 @@ class Input(BaseModel):
         sys = self.system
         if sys is None:
             return  # nothing to validate if no system provided
+        self._validate_file(sys.file, "system")
+        for prop in sys.properties or []:
+            self._validate_file(prop.file, f"property {prop.name!r}")
         if sys.systemtype != "ions":
             file = sys.file
             if file is None or file.fileformat != "cube":
                 raise ValueError("System mode 'electronic' or 'full' requires a cube file.")
+
+    def _validate_file(self, file: FileModel | None, context: str) -> None:
+        if file is None:
+            return
+
+        has_name = bool(file.name)
+        has_folder = bool(file.folder)
+        has_root = bool(file.root)
+
+        if has_name and (has_folder or has_root):
+            raise ValueError(
+                f"{context} file input must use either 'name' or 'folder'/'root', not both."
+            )
+        if has_folder != has_root:
+            raise ValueError(f"{context} file input requires both 'folder' and 'root'.")
+        if not has_name and not (has_folder and has_root):
+            raise ValueError(
+                f"{context} file input requires either 'name' or both 'folder' and 'root'."
+            )

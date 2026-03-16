@@ -1,8 +1,13 @@
+from pathlib import Path
+from textwrap import dedent
+from types import SimpleNamespace
+
 import numpy as np
 import pandas as pd
 import pytest
 
-from mapsy import MultiMaps
+from mapsy import MultiMaps, MultiMapsFromFile
+from mapsy.io.parser import resolve_file_model
 
 
 class FakeMaps:
@@ -20,6 +25,19 @@ class FakeMaps:
     def graph(self, clusters: np.ndarray) -> np.ndarray:
         nclusters = int(np.max(clusters)) + 1
         return np.zeros((nclusters, nclusters), dtype=np.int64)
+
+
+def _write_xyz(path: Path, x: float) -> None:
+    path.write_text(
+        "\n".join(
+            [
+                "1",
+                "5.0 5.0 5.0",
+                f"H {x:.1f} 1.0 1.0",
+            ]
+        )
+        + "\n"
+    )
 
 
 def test_multimaps_combines_contact_space_data() -> None:
@@ -154,3 +172,80 @@ def test_multimaps_cluster_propagates_labels() -> None:
     assert map_b.data is not None
     assert "Cluster" in map_a.data.columns
     assert "Cluster" in map_b.data.columns
+
+
+def test_resolve_file_model_supports_folder_and_root(tmp_path: Path) -> None:
+    systems_dir = tmp_path / "systems"
+    systems_dir.mkdir()
+    _write_xyz(systems_dir / "sample_a.xyz", 1.0)
+    _write_xyz(systems_dir / "sample_b.xyz", 2.0)
+
+    filemodel = SimpleNamespace(
+        fileformat="xyz+",
+        name="",
+        folder="systems",
+        root="sample_",
+        units="angstrom",
+    )
+    resolved = resolve_file_model(filemodel, basepath=tmp_path)
+
+    assert resolved == [
+        str((systems_dir / "sample_a.xyz").resolve()),
+        str((systems_dir / "sample_b.xyz").resolve()),
+    ]
+
+
+def test_multimaps_from_file_loads_multiple_systems(tmp_path: Path) -> None:
+    systems_dir = tmp_path / "systems"
+    systems_dir.mkdir()
+    _write_xyz(systems_dir / "sample_a.xyz", 1.0)
+    _write_xyz(systems_dir / "sample_b.xyz", 2.0)
+
+    input_file = tmp_path / "multimaps.yaml"
+    input_file.write_text(
+        dedent(
+            """
+            control:
+              debug: false
+              verbosity: 0
+
+            system:
+              systemtype: ions
+              file:
+                fileformat: xyz+
+                folder: systems
+                root: sample_
+                units: angstrom
+              dimension: 2
+              axis: 2
+
+            contactspace:
+              mode: system
+              distance: 0.5
+              spread: 0.5
+              cutoff: 2
+              threshold: 0.1
+
+            symmetryfunctions:
+              functions:
+                - type: ac
+                  cutoff: cos
+                  radius: 2.0
+                  order: [0]
+                  compositional: false
+                  structural: true
+                  radial: true
+            """
+        ).strip()
+        + "\n"
+    )
+
+    multimaps = MultiMapsFromFile(str(input_file))
+
+    assert len(multimaps.maps) == 2
+    assert multimaps.names == ["sample_a", "sample_b"]
+
+    combined = multimaps.atcontactspace()
+
+    assert not combined.empty
+    assert combined["system"].isin(["sample_a", "sample_b"]).all()

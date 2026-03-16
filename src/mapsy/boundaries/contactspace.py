@@ -26,6 +26,8 @@ class ContactSpace:
 
         self.mask: npt.NDArray[np.bool_] = boundary.gradient.modulus > tol
         self.norm = np.sum(boundary.gradient.modulus[self.mask])
+        self._annotation_columns: list[str] = []
+        self._feature_columns: list[str] = []
 
         self._get_indexes()
 
@@ -43,6 +45,44 @@ class ContactSpace:
                 "region": self.regions,
             }
         )
+
+    @property
+    def annotation_columns(self) -> list[str]:
+        return list(self._annotation_columns)
+
+    @property
+    def feature_columns(self) -> list[str]:
+        return list(self._feature_columns)
+
+    def annotate(
+        self,
+        name: str,
+        values: npt.ArrayLike,
+        *,
+        as_feature: bool = True,
+    ) -> npt.NDArray[np.float64]:
+        """Attach pointwise values to the sampled contact-space points."""
+        reserved = {"x", "y", "z", "nn", "region", "probability"}
+        if name in reserved and name not in self._annotation_columns:
+            raise ValueError(f"{name!r} is a reserved contact-space column")
+
+        array = np.asarray(values, dtype=np.float64).reshape(-1)
+        if array.size != self.nm:
+            raise ValueError(
+                f"Annotation {name!r} has length {array.size}, expected {self.nm} contact-space points."
+            )
+
+        self.data.loc[:, name] = array
+        if name not in self._annotation_columns:
+            self._annotation_columns.append(name)
+
+        if as_feature:
+            if name not in self._feature_columns:
+                self._feature_columns.append(name)
+        elif name in self._feature_columns:
+            self._feature_columns.remove(name)
+
+        return array
 
     def _get_indexes(self) -> None:
         """docstring"""

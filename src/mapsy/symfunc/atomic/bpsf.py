@@ -1,6 +1,7 @@
 # Behler-Parrinello Symmetry Functions
 import itertools
 from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 import numpy as np
 import numpy.typing as npt
@@ -8,12 +9,14 @@ from ase import Atoms
 
 from mapsy.utils import cutoff
 
-from ..input import SymFuncModel
 from ..symmetryfunction import SymmetryFunction
+
+if TYPE_CHECKING:
+    from ..input import SymFuncModel
 
 
 class BPSFParser:
-    def __init__(self, symfuncmodel: SymFuncModel) -> None:
+    def __init__(self, symfuncmodel: "SymFuncModel") -> None:
         self.cutoff = symfuncmodel.cutoff
         self.radius = symfuncmodel.radius
 

@@ -1,5 +1,6 @@
 # Atom-Centered Symmetry Functions
 from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 import numpy as np
 import numpy.typing as npt
@@ -8,8 +9,10 @@ from numpy.polynomial.chebyshev import Chebyshev as cheb
 
 from mapsy.utils import cutoff
 
-from ..input import SymFuncModel
 from ..symmetryfunction import SymmetryFunction
+
+if TYPE_CHECKING:
+    from ..input import SymFuncModel
 
 
 def wrapcheby(
@@ -39,7 +42,7 @@ def basis_function(order: int, rcut: float, x: npt.ArrayLike) -> npt.NDArray[np.
 
 
 class ACSFParser:
-    def __init__(self, symfuncmodel: SymFuncModel) -> None:
+    def __init__(self, symfuncmodel: "SymFuncModel") -> None:
         self.order = np.array(symfuncmodel.order, dtype=np.int64)
         self.cutoff = symfuncmodel.cutoff
         self.radius = symfuncmodel.radius

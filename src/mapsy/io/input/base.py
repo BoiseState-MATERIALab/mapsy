@@ -1,11 +1,7 @@
 from pydantic import (
     BaseModel as PydanticBaseModel,
 )
-from pydantic import (
-    NonNegativeInt,
-    PositiveFloat,
-    PositiveInt,
-)
+from pydantic import NonNegativeInt, PositiveFloat, PositiveInt
 
 from mapsy.io.input.keytypes import (
     ContactSpaceMode,
@@ -33,6 +29,8 @@ class FileModel(BaseModel):
 
     fileformat: FileFormat = "xyz+"
     name: str = ""
+    folder: str = ""
+    root: str = ""
     units: Units = "bohr"
 
 

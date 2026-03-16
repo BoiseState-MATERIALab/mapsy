@@ -24,7 +24,7 @@ except ImportError:  # pragma: no cover
 with suppress(_md.PackageNotFoundError):
     __version__ = _md.version("mapsy")
 
-__all__ = ["__version__", "Maps", "MapsFromFile", "MultiMaps"]
+__all__ = ["__version__", "Maps", "MapsFromFile", "MultiMaps", "MultiMapsFromFile"]
 
 
 def __getattr__(name: str) -> Any:
@@ -33,8 +33,9 @@ def __getattr__(name: str) -> Any:
 
         exports = {"Maps": Maps, "MapsFromFile": MapsFromFile}
         return exports[name]
-    if name == "MultiMaps":
-        from .multimaps import MultiMaps
+    if name in {"MultiMaps", "MultiMapsFromFile"}:
+        from .multimaps import MultiMaps, MultiMapsFromFile
 
-        return MultiMaps
+        exports = {"MultiMaps": MultiMaps, "MultiMapsFromFile": MultiMapsFromFile}
+        return exports[name]
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

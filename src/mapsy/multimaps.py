@@ -1,4 +1,5 @@
 from collections.abc import Sequence
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeAlias
 
 import matplotlib.pyplot as plt
@@ -11,6 +12,7 @@ from sklearn.cluster import SpectralClustering
 from sklearn.decomposition import PCA
 from sklearn.metrics import davies_bouldin_score, silhouette_score
 from sklearn.preprocessing import StandardScaler
+from yaml import SafeLoader, load
 
 if TYPE_CHECKING:
     from .maps import Maps
@@ -230,8 +232,9 @@ class MultiMaps:
         return maps.data
 
     def _get_map_features(self, maps: "Maps") -> list[str]:
-        if maps.features:
-            return list(maps.features)
+        features = list(maps.features)
+        if features:
+            return features
         if maps.data is None:
             raise RuntimeError("No maps data available.")
         return [column for column in maps.data.columns if column not in {"x", "y", "z"}]
@@ -267,3 +270,54 @@ class MultiMaps:
                 ].values[0]
             )
         return int(np.random.randint(0, 1000))
+
+
+class MultiMapsFromFile(MultiMaps):
+    def __init__(self, filename: str) -> None:
+        from mapsy.io.parser import ContactSpaceGenerator, SystemParser
+        from mapsy.maps import (
+            Maps,
+            _namespace_contactspace,
+            _namespace_symmetryfunctions,
+            _namespace_system,
+        )
+        from mapsy.symfunc.parser import SymmetryFunctionsParser
+
+        with open(Path(filename).expanduser().resolve()) as handle:
+            params = load(handle, SafeLoader) or {}
+
+        control = params.get("control") or {}
+        system = params.get("system")
+        symmetryfunctions = params.get("symmetryfunctions")
+        contactspace = params.get("contactspace")
+
+        if system is None:
+            raise RuntimeError("System section missing in input file")
+        if symmetryfunctions is None:
+            raise RuntimeError("Symmetry functions section missing in input file")
+        if contactspace is None:
+            raise RuntimeError("Contact space section missing in input file")
+
+        basepath = Path(filename).expanduser().resolve().parent
+        systemmodel = _namespace_system(system)
+        system_parser = SystemParser(systemmodel, basepath=basepath)
+        system_files = system_parser.filenames()
+
+        if len(system_files) > 1 and systemmodel.properties:
+            raise NotImplementedError(
+                "MultiMapsFromFile does not support per-system properties yet."
+            )
+
+        maps_list = []
+        for system in system_parser.parse_many():
+            parsed_symmetryfunctions = SymmetryFunctionsParser(
+                _namespace_symmetryfunctions(symmetryfunctions)
+            ).parse()
+            parsed_contactspace = ContactSpaceGenerator(
+                _namespace_contactspace(contactspace)
+            ).generate(system)
+            maps_list.append(Maps(system, parsed_symmetryfunctions, parsed_contactspace))
+
+        super().__init__(maps_list, names=[Path(path).stem for path in system_files])
+        self.debug = bool(control.get("debug", False))
+        self.verbosity = int(control.get("verbosity", 0))

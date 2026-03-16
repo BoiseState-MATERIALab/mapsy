@@ -4,17 +4,18 @@ control:
   output : test.out
 
 system:
-  type : ions
+  systemtype : ions
   file:
     fileformat : xyz+
-    name : ./data-files/MoS2_defect.xyz
+    folder : ./data-files
+    root : MoS2_defect
     units : alat
   dimension : 2
   axis : 2
 
 contactspace:
   mode : ionic
-  radii : muff
+  radiusmode : muff
   alpha : 1.12
   spread : 1.0
   cutoff : 10

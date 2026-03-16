@@ -4,9 +4,7 @@ from typing import Any, Literal, cast
 from pydantic import (
     BaseModel as PydanticBaseModel,
 )
-from pydantic import (
-    NonNegativeFloat,
-)
+from pydantic import NonNegativeFloat
 
 from mapsy.utils.iotypes import (
     NonNegativeFloatList,

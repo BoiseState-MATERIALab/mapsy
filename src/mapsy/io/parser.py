@@ -1,15 +1,51 @@
+from pathlib import Path
+from typing import TYPE_CHECKING
+
 from mapsy.boundaries import Boundary, ContactSpace, IonicBoundary, SystemBoundary
 from mapsy.data import Grid, ScalarField, System
-from mapsy.io.input.base import (
-    ContactSpaceModel,
-    FileModel,
-    SystemModel,
-)
 from mapsy.utils import setscalars
 
 from .base import BaseParser
 from .cube import CubeParser
 from .xyz import XYZParser
+
+if TYPE_CHECKING:
+    from mapsy.io.input.base import ContactSpaceModel, FileModel, SystemModel
+
+
+def _resolve_path(pathname: str, basepath: str | Path | None = None) -> Path:
+    path = Path(pathname).expanduser()
+    if not path.is_absolute() and basepath is not None:
+        path = Path(basepath).expanduser() / path
+    return path.resolve()
+
+
+def _file_pattern(filemodel: "FileModel") -> str:
+    suffixes = {
+        "xyz+": ".xyz",
+        "cube": ".cube",
+        "ase": "",
+    }
+    suffix = suffixes[filemodel.fileformat]
+    return f"{filemodel.root}*{suffix}" if suffix else f"{filemodel.root}*"
+
+
+def resolve_file_model(filemodel: "FileModel", basepath: str | Path | None = None) -> list[str]:
+    if filemodel.name:
+        return [str(_resolve_path(filemodel.name, basepath))]
+
+    folder = _resolve_path(filemodel.folder, basepath)
+    if not folder.exists():
+        raise OSError(f"Input folder does not exist: {folder}")
+    if not folder.is_dir():
+        raise OSError(f"Input folder is not a directory: {folder}")
+
+    matches = sorted(path for path in folder.glob(_file_pattern(filemodel)) if path.is_file())
+    if not matches:
+        raise OSError(
+            f"No files matched root {filemodel.root!r} in {folder} for format {filemodel.fileformat!r}"
+        )
+    return [str(path) for path in matches]
 
 
 class DataParser:
@@ -17,10 +53,19 @@ class DataParser:
     name: str = ""
     label: str = ""
 
-    def __init__(self, filemodel: FileModel, name: str = "data", label: str = "DAT") -> None:
+    def __init__(
+        self,
+        filemodel: "FileModel",
+        name: str = "data",
+        label: str = "DAT",
+        basepath: str | Path | None = None,
+    ) -> None:
+        filenames = resolve_file_model(filemodel, basepath)
+        if len(filenames) != 1:
+            raise ValueError("Data input must resolve to exactly one file.")
         if filemodel.fileformat == "cube":
             self.file = CubeParser(
-                filemodel.name,
+                filenames[0],
                 units=filemodel.units,
                 hasdata=True,
             )
@@ -36,22 +81,15 @@ class DataParser:
 
 
 class SystemParser:
-    file: BaseParser | None = None
     propfiles: list["DataParser"]
 
-    def __init__(self, systemmodel: SystemModel) -> None:
-        readdata = systemmodel.systemtype != "ions"
-
+    def __init__(self, systemmodel: "SystemModel", basepath: str | Path | None = None) -> None:
         f = systemmodel.file
         if f is None:
             raise ValueError("SystemModel.file is required.")
-
-        if f.fileformat == "xyz+":
-            self.file = XYZParser(f.name, units=f.units)
-        elif f.fileformat == "cube":
-            self.file = CubeParser(f.name, units=f.units, hasdata=readdata)
-        else:
-            raise ValueError(f"Unsupported system file format: {f.fileformat!r}")
+        self.filemodel = f
+        self.basepath = basepath
+        self.readdata = systemmodel.systemtype != "ions"
 
         self.dimension = systemmodel.dimension
         self.axis = systemmodel.axis
@@ -60,21 +98,39 @@ class SystemParser:
         for prop in systemmodel.properties or []:
             if prop.file is None:
                 raise ValueError(f"Property {prop.name!r} has no file attached.")
-            self.propfiles.append(DataParser(prop.file, prop.name, prop.label))
+            self.propfiles.append(DataParser(prop.file, prop.name, prop.label, basepath))
 
     def parse(self) -> System:
-        if self.file is None:
-            raise RuntimeError("SystemParser is not configured with a file.")
-        system = self.file.systemparse()
+        filenames = self.filenames()
+        if len(filenames) != 1:
+            raise ValueError("System input resolved to multiple files; use MultiMapsFromFile.")
+        return self._parse_file(filenames[0])
+
+    def parse_many(self) -> list[System]:
+        return [self._parse_file(filename) for filename in self.filenames()]
+
+    def filenames(self) -> list[str]:
+        return resolve_file_model(self.filemodel, self.basepath)
+
+    def _parse_file(self, filename: str) -> System:
+        file = self._build_file_parser(filename)
+        system = file.systemparse()
         system.dimension = self.dimension
         system.axis = self.axis
         for propfile in self.propfiles:
             system.addproperty(propfile.parse())
         return system
 
+    def _build_file_parser(self, filename: str) -> BaseParser:
+        if self.filemodel.fileformat == "xyz+":
+            return XYZParser(filename, units=self.filemodel.units)
+        if self.filemodel.fileformat == "cube":
+            return CubeParser(filename, units=self.filemodel.units, hasdata=self.readdata)
+        raise ValueError(f"Unsupported system file format: {self.filemodel.fileformat!r}")
+
 
 class ContactSpaceGenerator:
-    def __init__(self, csmodel: ContactSpaceModel) -> None:
+    def __init__(self, csmodel: "ContactSpaceModel") -> None:
         self.mode = csmodel.mode
         self.cutoff = csmodel.cutoff
         self.threshold = csmodel.threshold

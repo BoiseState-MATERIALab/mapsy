@@ -16,11 +16,12 @@ from sklearn.cluster import SpectralClustering
 from sklearn.decomposition import PCA
 from sklearn.metrics import davies_bouldin_score, silhouette_score
 from sklearn.preprocessing import StandardScaler
+from yaml import SafeLoader, load
 
 from mapsy.boundaries import ContactSpace
+from mapsy.boundaries.ionic import IonicGeometry
 from mapsy.data import ScalarField, System
-from mapsy.io import ContactSpaceGenerator, Input, SystemParser
-from mapsy.symfunc import SymmetryFunction, SymmetryFunctionsParser
+from mapsy.symfunc.symmetryfunction import SymmetryFunction
 from mapsy.utils import full2chunk, multiproc
 
 logger = logging.getLogger(__name__)
@@ -95,9 +96,54 @@ class Maps:
         positions: npt.NDArray = self.contactspace.data[["x", "y", "z"]].values
 
         self.data = self.atpoints(positions)
-        self.features = self.data.columns.drop(["x", "y", "z"])
+        self._sync_contactspace_features()
+        self._refresh_features()
 
         return self.data
+
+    def annotate_contactspace(
+        self,
+        name: str,
+        values: npt.ArrayLike,
+        *,
+        as_feature: bool = True,
+    ) -> npt.NDArray[np.float64]:
+        """Attach pointwise values to the current contact space."""
+        if self.contactspace is None:
+            raise RuntimeError("Trying to annotate contact space without contact space")
+
+        annotation = self.contactspace.annotate(name, values, as_feature=as_feature)
+        if self.data is not None:
+            self.data.loc[:, name] = annotation
+            self._refresh_features()
+
+        return annotation
+
+    def annotate_ionic_distance(
+        self,
+        column: str = "ionic_distance",
+        radiusmode: str = "muff",
+        alpha: float = 1.0,
+        radius_table_file: str | None = None,
+        *,
+        as_feature: bool = True,
+    ) -> npt.NDArray[np.float64]:
+        """Annotate contact-space points with their distance to the ionic interface."""
+        if self.contactspace is None:
+            raise RuntimeError("Trying to annotate contact space without contact space")
+        if self.system is None:
+            raise RuntimeError("Trying to annotate ionic distance without a system")
+
+        system = self.system
+        metric = IonicGeometry(
+            mode=radiusmode,
+            alpha=alpha,
+            system=system,
+            radius_table_file=radius_table_file,
+        )
+        positions = self.contactspace.data[["x", "y", "z"]].to_numpy(dtype=np.float64)
+        distances = metric.signed_distance(positions)
+        return self.annotate_contactspace(column, distances, as_feature=as_feature)
 
     def atpoints(self, positions: npt.NDArray) -> pd.DataFrame:
         """
@@ -745,27 +791,137 @@ class Maps:
                 data.loc[:, key] = y
         return data
 
+    def _sync_contactspace_features(self) -> None:
+        """Propagate scalar contact-space annotations into Maps data."""
+        if self.contactspace is None or self.data is None:
+            return
+
+        for column in self.contactspace.feature_columns:
+            self.data.loc[:, column] = self.contactspace.data[column].to_numpy()
+
+    def _refresh_features(self) -> None:
+        """Update the list of feature columns exposed by the current dataset."""
+        if self.data is None:
+            self.features = []
+            return
+
+        self.features = [column for column in self.data.columns if column not in {"x", "y", "z"}]
+
 
 # Class that extends the Maps class to load data from a file
 class MapsFromFile(Maps):
     def __init__(self, filename: str) -> None:
-        input = Input(filename)
-        if input.control is None:
-            raise RuntimeError("Control section missing in input file")
-        if input.system is None:
+        from pathlib import Path
+
+        from mapsy.io.parser import ContactSpaceGenerator, SystemParser
+        from mapsy.symfunc.parser import SymmetryFunctionsParser
+
+        with open(Path(filename).expanduser().resolve()) as handle:
+            params = load(handle, SafeLoader) or {}
+
+        control = params.get("control") or {}
+        system = params.get("system")
+        symmetryfunctions = params.get("symmetryfunctions")
+        contactspace = params.get("contactspace")
+
+        if system is None:
             raise RuntimeError("System section missing in input file")
-        if input.symmetryfunctions is None:
+        if symmetryfunctions is None:
             raise RuntimeError("Symmetry functions section missing in input file")
-        if input.contactspace is None:
+        if contactspace is None:
             raise RuntimeError("Contact space section missing in input file")
+        if control is None:
+            raise RuntimeError("Control section missing in input file")
+
+        basepath = Path(filename).expanduser().resolve().parent
         # Set debug and verbosity levels from the input file
-        self.debug = input.control.debug
-        self.verbosity = input.control.verbosity
+        self.debug = bool(control.get("debug", False))
+        self.verbosity = int(control.get("verbosity", 0))
         # Parse the system from the input file and assign it to the system attribute
-        self.system = SystemParser(input.system).parse()
+        systemmodel = _namespace_system(system)
+        self.system = SystemParser(systemmodel, basepath=basepath).parse()
         # Parse the symmetry functions from the input file
-        self.symmetryfunctions = SymmetryFunctionsParser(input.symmetryfunctions).parse()
+        self.symmetryfunctions = SymmetryFunctionsParser(
+            _namespace_symmetryfunctions(symmetryfunctions)
+        ).parse()
         # Generate the contact space for the system
-        self.contactspace = ContactSpaceGenerator(input.contactspace).generate(self.system)
+        self.contactspace = ContactSpaceGenerator(_namespace_contactspace(contactspace)).generate(
+            self.system
+        )
         # Call the parent class (Maps) constructor to complete initialization
         super().__init__(self.system, self.symmetryfunctions, self.contactspace)
+
+
+def _namespace_system(system: dict[str, Any]) -> Any:
+    from types import SimpleNamespace
+
+    file = system.get("file") or {}
+    properties = system.get("properties") or []
+    return SimpleNamespace(
+        systemtype=system.get("systemtype", system.get("type", "ions")),
+        file=SimpleNamespace(
+            fileformat=file.get("fileformat", "xyz+"),
+            name=file.get("name", ""),
+            folder=file.get("folder", ""),
+            root=file.get("root", ""),
+            units=file.get("units", "bohr"),
+        ),
+        dimension=system.get("dimension", 2),
+        axis=system.get("axis", 2),
+        properties=[
+            SimpleNamespace(
+                name=prop.get("name", ""),
+                label=prop.get("label", ""),
+                file=SimpleNamespace(
+                    fileformat=(prop.get("file") or {}).get("fileformat", "cube"),
+                    name=(prop.get("file") or {}).get("name", ""),
+                    folder=(prop.get("file") or {}).get("folder", ""),
+                    root=(prop.get("file") or {}).get("root", ""),
+                    units=(prop.get("file") or {}).get("units", "bohr"),
+                )
+                if prop.get("file") is not None
+                else None,
+            )
+            for prop in properties
+        ],
+    )
+
+
+def _namespace_contactspace(contactspace: dict[str, Any]) -> Any:
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        mode=contactspace.get("mode", "system"),
+        radiusmode=contactspace.get("radiusmode", contactspace.get("radii", "muff")),
+        radiusfile=contactspace.get("radiusfile"),
+        alpha=contactspace.get("alpha", 1.0),
+        spread=contactspace.get("spread", 0.5),
+        distance=contactspace.get("distance", 0.0),
+        cutoff=contactspace.get("cutoff", 300),
+        threshold=contactspace.get("threshold", 0.1),
+        side=contactspace.get("side", 1.0),
+    )
+
+
+def _namespace_symmetryfunctions(symmetryfunctions: dict[str, Any]) -> Any:
+    from types import SimpleNamespace
+
+    functions = []
+    for function in symmetryfunctions.get("functions") or []:
+        functions.append(
+            SimpleNamespace(
+                type=function.get("type", "bp"),
+                cutoff=function.get("cutoff", "cos"),
+                radius=function.get("radius", 5.0),
+                order=function.get("order", 1),
+                etas=function.get("etas", [1.0]),
+                rss=function.get("rss", [0.0]),
+                lambdas=function.get("lambdas", [-1.0, 1.0]),
+                kappas=function.get("kappas", [1.0]),
+                zetas=function.get("zetas", [1]),
+                radial=function.get("radial", True),
+                compositional=function.get("compositional", False),
+                structural=function.get("structural", False),
+            )
+        )
+    return SimpleNamespace(functions=functions)
