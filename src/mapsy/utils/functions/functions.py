@@ -134,9 +134,9 @@ class FieldFunction(ABC):
         """docstring"""
         if self._derivative is None:
             self._compute_derivative()
-        assert self._derivative is not None, (
-            "internal: _compute_derivative() did not set _derivative"
-        )
+        assert (
+            self._derivative is not None
+        ), "internal: _compute_derivative() did not set _derivative"
         return self._derivative
 
     def reset_derivatives(self) -> None:

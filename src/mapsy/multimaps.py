@@ -135,7 +135,8 @@ class MultiMaps:
             for candidate_random_state in random_states:
                 cluster_random_states.append(int(candidate_random_state))
                 labels = SpectralClustering(
-                    n_clusters=candidate_nclusters, random_state=int(candidate_random_state)
+                    n_clusters=candidate_nclusters,
+                    random_state=int(candidate_random_state),
                 ).fit_predict(X)
                 actual_nclusters = len(np.unique(labels))
                 cluster_sizes.append(actual_nclusters)

@@ -873,15 +873,17 @@ def _namespace_system(system: dict[str, Any]) -> Any:
             SimpleNamespace(
                 name=prop.get("name", ""),
                 label=prop.get("label", ""),
-                file=SimpleNamespace(
-                    fileformat=(prop.get("file") or {}).get("fileformat", "cube"),
-                    name=(prop.get("file") or {}).get("name", ""),
-                    folder=(prop.get("file") or {}).get("folder", ""),
-                    root=(prop.get("file") or {}).get("root", ""),
-                    units=(prop.get("file") or {}).get("units", "bohr"),
-                )
-                if prop.get("file") is not None
-                else None,
+                file=(
+                    SimpleNamespace(
+                        fileformat=(prop.get("file") or {}).get("fileformat", "cube"),
+                        name=(prop.get("file") or {}).get("name", ""),
+                        folder=(prop.get("file") or {}).get("folder", ""),
+                        root=(prop.get("file") or {}).get("root", ""),
+                        units=(prop.get("file") or {}).get("units", "bohr"),
+                    )
+                    if prop.get("file") is not None
+                    else None
+                ),
             )
             for prop in properties
         ],

@@ -29,8 +29,18 @@ def __getattr__(name: str) -> Any:
         from .input import Input
 
         return Input
-    if name in {"DataParser", "SystemParser", "ContactSpaceGenerator", "resolve_file_model"}:
-        from .parser import ContactSpaceGenerator, DataParser, SystemParser, resolve_file_model
+    if name in {
+        "DataParser",
+        "SystemParser",
+        "ContactSpaceGenerator",
+        "resolve_file_model",
+    }:
+        from .parser import (
+            ContactSpaceGenerator,
+            DataParser,
+            SystemParser,
+            resolve_file_model,
+        )
 
         exports = {
             "DataParser": DataParser,
