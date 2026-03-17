@@ -8,8 +8,10 @@
    ```
 2. Run checks:
    ```bash
-   ruff . && black . && mypy . && pytest -q
+   pre-commit run --all-files && pytest -q
    ```
+
+The repository pins tool versions in both `pre-commit` and optional dependencies so local runs and CI use the same formatter, linter, and type checker versions.
 
 ## Commit style
 - Keep pull requests focused and add tests for bug fixes.
