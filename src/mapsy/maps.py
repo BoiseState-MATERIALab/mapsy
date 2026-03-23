@@ -29,6 +29,7 @@ logger = logging.getLogger(__name__)
 
 AxesLike: TypeAlias = Axes | npt.NDArray[np.object_]  # array of Axes objects
 NDArrayF: TypeAlias = npt.NDArray[np.float64]
+NDArrayI: TypeAlias = npt.NDArray[np.int64]
 
 
 # Tell mypy we are calling multiproc with a worker that returns a list of ndarrays.
@@ -38,6 +39,165 @@ def _run_multiproc_lists(
     args: Sequence[NDArrayF],
 ) -> list[list[NDArrayF]]:
     return multiproc(func, list(args))
+
+
+class SpecialPointRegistry:
+    """Registry of contact-space points selected for downstream simulations."""
+
+    _BASE_COLUMNS = ["point_index", "kind", "iteration", "label_status"]
+    _ALLOWED_LABEL_STATUS = {"unlabeled", "completed", "failed"}
+
+    def __init__(self) -> None:
+        self._data = pd.DataFrame(columns=self._BASE_COLUMNS)
+
+    def add(
+        self,
+        point_indexes: npt.ArrayLike,
+        *,
+        kind: str,
+        iteration: int | None = None,
+        label_status: str = "unlabeled",
+        replace_kind: bool = False,
+        **metadata: Any,
+    ) -> pd.DataFrame:
+        indexes = np.asarray(point_indexes, dtype=np.int64).reshape(-1)
+        if indexes.size == 0:
+            return self.frame(kind=kind)
+
+        self._validate_label_status(label_status)
+
+        if replace_kind:
+            self.remove(kind=kind)
+
+        rows = pd.DataFrame(
+            {
+                "point_index": indexes,
+                "kind": kind,
+                "iteration": iteration,
+                "label_status": label_status,
+            }
+        )
+
+        for key, value in metadata.items():
+            if np.isscalar(value) or value is None:
+                rows.loc[:, key] = value
+                continue
+
+            values = np.asarray(value)
+            if values.reshape(-1).size != indexes.size:
+                raise ValueError(
+                    f"Metadata column {key!r} has length {values.reshape(-1).size}, expected {indexes.size}."
+                )
+            rows.loc[:, key] = values.reshape(-1)
+
+        self._data = pd.concat([self._data, rows], ignore_index=True)
+        self._data = self._data.drop_duplicates(subset=["point_index", "kind"], keep="last")
+        return self.frame(kind=kind)
+
+    def remove(
+        self,
+        *,
+        kind: str | None = None,
+        point_indexes: npt.ArrayLike | None = None,
+    ) -> None:
+        if self._data.empty:
+            return
+
+        mask = np.ones(len(self._data), dtype=bool)
+        if kind is not None:
+            mask &= self._data["kind"].to_numpy() == kind
+        if point_indexes is not None:
+            indexes = np.asarray(point_indexes, dtype=np.int64).reshape(-1)
+            mask &= self._data["point_index"].isin(indexes).to_numpy()
+
+        self._data = self._data.loc[~mask].reset_index(drop=True)
+
+    def update(
+        self,
+        *,
+        kind: str | None = None,
+        point_indexes: npt.ArrayLike | None = None,
+        **metadata: Any,
+    ) -> pd.DataFrame:
+        if self._data.empty:
+            return self.frame(kind=kind)
+
+        mask = np.ones(len(self._data), dtype=bool)
+        if kind is not None:
+            mask &= self._data["kind"].to_numpy() == kind
+        if point_indexes is not None:
+            indexes = np.asarray(point_indexes, dtype=np.int64).reshape(-1)
+            mask &= self._data["point_index"].isin(indexes).to_numpy()
+
+        if not np.any(mask):
+            return self.frame(kind=kind)
+
+        count = int(np.count_nonzero(mask))
+        for key, value in metadata.items():
+            if key == "label_status":
+                if np.isscalar(value) or value is None:
+                    self._validate_label_status(str(value))
+                else:
+                    statuses = np.asarray(value, dtype=object).reshape(-1)
+                    if statuses.size != count:
+                        raise ValueError(
+                            f"Metadata column {key!r} has length {statuses.size}, expected {count}."
+                        )
+                    for status in statuses:
+                        self._validate_label_status(str(status))
+
+            if np.isscalar(value) or value is None:
+                self._data.loc[mask, key] = value
+                continue
+
+            values = np.asarray(value, dtype=object).reshape(-1)
+            if values.size != count:
+                raise ValueError(
+                    f"Metadata column {key!r} has length {values.size}, expected {count}."
+                )
+            self._data.loc[mask, key] = values
+
+        return self.frame(kind=kind)
+
+    def frame(
+        self,
+        *,
+        kind: str | None = None,
+        label_status: str | Sequence[str] | None = None,
+    ) -> pd.DataFrame:
+        data = self._data
+        if kind is not None:
+            data = data.loc[data["kind"] == kind]
+        if label_status is not None:
+            statuses = [label_status] if isinstance(label_status, str) else list(label_status)
+            for status in statuses:
+                self._validate_label_status(status)
+            data = data.loc[data["label_status"].isin(statuses)]
+        return data.copy()
+
+    def indexes(
+        self,
+        *,
+        kind: str | None = None,
+        label_status: str | Sequence[str] | None = None,
+    ) -> NDArrayI:
+        frame = self.frame(kind=kind, label_status=label_status)
+        if frame.empty:
+            return np.array([], dtype=np.int64)
+        return frame["point_index"].to_numpy(dtype=np.int64)
+
+    def reference_indexes(self) -> NDArrayI:
+        """Unique point indexes that should act as reference special points."""
+        indexes = self.indexes()
+        if indexes.size == 0:
+            return indexes
+        return np.unique(indexes.astype(np.int64))
+
+    def _validate_label_status(self, label_status: str) -> None:
+        if label_status not in self._ALLOWED_LABEL_STATUS:
+            raise ValueError(
+                f"label_status must be one of {sorted(self._ALLOWED_LABEL_STATUS)}, got {label_status!r}."
+            )
 
 
 # Class for Maps, which includes functionality for processing symmetry functions
@@ -64,6 +224,7 @@ class Maps:
     cluster_edges: npt.NDArray[np.int64] | None = None
     best_clusters: pd.DataFrame | None = None
     cluster_screening: pd.DataFrame | None = None
+    special_points: SpecialPointRegistry
 
     def __init__(
         self,
@@ -79,9 +240,25 @@ class Maps:
         self.symmetryfunctions: list[SymmetryFunction] = deepcopy(symmetryfunctions)
         self.hasatomicsf = any(sf.atomic for sf in self.symmetryfunctions)
         self.nsfs = self.len()
+        self.special_points = SpecialPointRegistry()
         # Call setup for each symmetry function to initialize with the system
         for sf in self.symmetryfunctions:
             sf.setup(self.system.atoms)
+
+    @property
+    def centroids(self) -> NDArrayI:
+        """Backward-compatible view over centroid special points."""
+        return self.special_points.indexes(kind="centroid")
+
+    @centroids.setter
+    def centroids(self, point_indexes: npt.ArrayLike) -> None:
+        indexes = np.asarray(point_indexes, dtype=np.int64).reshape(-1)
+        self.special_points.add(
+            indexes,
+            kind="centroid",
+            label_status="unlabeled",
+            replace_kind=True,
+        )
 
     # Method to return the number of symmetry functions
     def len(self) -> int:
@@ -145,6 +322,55 @@ class Maps:
         positions = self.contactspace.data[["x", "y", "z"]].to_numpy(dtype=np.float64)
         distances = metric.signed_distance(positions)
         return self.annotate_contactspace(column, distances, as_feature=as_feature)
+
+    def add_special_points(
+        self,
+        point_indexes: npt.ArrayLike,
+        *,
+        kind: str,
+        iteration: int | None = None,
+        label_status: str = "unlabeled",
+        replace_kind: bool = False,
+        **metadata: Any,
+    ) -> pd.DataFrame:
+        """Register contact-space points chosen for downstream simulations."""
+        return self.special_points.add(
+            point_indexes,
+            kind=kind,
+            iteration=iteration,
+            label_status=label_status,
+            replace_kind=replace_kind,
+            **metadata,
+        )
+
+    def get_special_points(
+        self,
+        *,
+        kind: str | None = None,
+        label_status: str | Sequence[str] | None = None,
+    ) -> pd.DataFrame:
+        """Return the special-point registry joined with point data when available."""
+        frame = self.special_points.frame(kind=kind, label_status=label_status)
+        if self.data is None or frame.empty:
+            return frame
+
+        point_data = self.data.copy()
+        point_data.index.name = "point_index"
+        return frame.merge(point_data, on="point_index", how="left")
+
+    def update_special_points(
+        self,
+        *,
+        kind: str | None = None,
+        point_indexes: npt.ArrayLike | None = None,
+        **metadata: Any,
+    ) -> pd.DataFrame:
+        """Update metadata for existing special points."""
+        return self.special_points.update(
+            kind=kind,
+            point_indexes=point_indexes,
+            **metadata,
+        )
 
     def atpoints(self, positions: npt.NDArray) -> pd.DataFrame:
         """
@@ -343,11 +569,12 @@ class Maps:
                         **kwargs,
                     )
             if centroids:
-                if self.centroids is None:
+                centroid_indexes = self.centroids
+                if centroid_indexes.size == 0:
                     raise RuntimeError("No centroids available.")
-                pos = self.data.loc[self.centroids, axes].values
+                pos = self.data.loc[centroid_indexes, axes].values
                 if splitby is not None:
-                    posmask = self.data.loc[self.centroids, splitby].values == sval
+                    posmask = self.data.loc[centroid_indexes, splitby].values == sval
                 else:
                     posmask = np.ones(pos.shape[0], dtype=bool)
                 ax.scatter(
@@ -720,8 +947,199 @@ class Maps:
             # Save the global index of the cluster centroid
             centroid_indexes.append(cluster_indexes[cluster_centroid])
         # Convert the list of indexes to a numpy array
-        self.centroids = np.array(centroid_indexes, dtype=int)
+        self.add_special_points(
+            np.array(centroid_indexes, dtype=np.int64),
+            kind="centroid",
+            iteration=0,
+            label_status="unlabeled",
+            replace_kind=True,
+        )
         return None
+
+    def select_points(
+        self,
+        npoints: int,
+        feature_columns: list[str] | None = None,
+        energy_column: str | None = None,
+        uncertainty_column: str | None = None,
+        special_point_indexes: npt.ArrayLike | None = None,
+        centroid_indexes: npt.ArrayLike | None = None,
+        region: int | None = None,
+        real_space_weight: float = 0.0,
+        feature_space_weight: float = 1.0,
+        energy_weight: float = 0.0,
+        uncertainty_weight: float = 0.0,
+        scale_features: bool = True,
+    ) -> pd.DataFrame:
+        """
+        Greedily select contact-space points with a weighted balance of diversity and utility.
+
+        The acquisition score combines:
+            - real-space distance from existing centroids / already selected points
+            - feature-space distance from existing centroids / already selected points
+            - low energy
+            - high uncertainty
+        """
+        if npoints <= 0:
+            raise ValueError("npoints must be positive")
+        if self.data is None:
+            raise RuntimeError("No contact space data available.")
+
+        weights = np.array(
+            [real_space_weight, feature_space_weight, energy_weight, uncertainty_weight],
+            dtype=np.float64,
+        )
+        if np.any(weights < 0.0):
+            raise ValueError("Selection weights must be non-negative")
+        if not np.any(weights > 0.0):
+            raise ValueError("At least one selection weight must be positive")
+
+        frame = self.data
+        if region is not None:
+            if self.contactspace is None:
+                raise RuntimeError("Trying to filter by region without contact space")
+            mask = self.contactspace.data["region"] == region
+            frame = self.data.loc[mask].copy()
+        else:
+            frame = self.data.copy()
+
+        if frame.empty:
+            raise RuntimeError("No candidate points available for selection")
+
+        seed_source = (
+            special_point_indexes if special_point_indexes is not None else centroid_indexes
+        )
+        if seed_source is None:
+            seed_source = self.special_points.reference_indexes()
+
+        if seed_source is None:
+            seed_indexes = np.array([], dtype=np.int64)
+        else:
+            seed_indexes = np.asarray(seed_source, dtype=np.int64).reshape(-1)
+            seed_indexes = seed_indexes[np.isin(seed_indexes, frame.index.to_numpy())]
+
+        candidate_frame = frame.drop(index=seed_indexes, errors="ignore").copy()
+        if candidate_frame.empty:
+            raise RuntimeError("No candidate points remain after excluding seed centroids")
+        if npoints > len(candidate_frame):
+            raise ValueError(
+                f"Requested {npoints} points, but only {len(candidate_frame)} candidates are available."
+            )
+
+        feature_columns = self._resolve_selection_feature_columns(
+            feature_columns,
+            energy_column=energy_column,
+            uncertainty_column=uncertainty_column,
+            feature_space_weight=feature_space_weight,
+        )
+
+        real_candidates = candidate_frame[["x", "y", "z"]].to_numpy(dtype=np.float64)
+        real_seeds = frame.loc[seed_indexes, ["x", "y", "z"]].to_numpy(dtype=np.float64)
+
+        if feature_columns:
+            full_features = frame.loc[:, feature_columns].to_numpy(dtype=np.float64)
+            if scale_features:
+                full_features = StandardScaler().fit_transform(full_features)
+            feature_frame = pd.DataFrame(full_features, index=frame.index, columns=feature_columns)
+            feature_candidates = feature_frame.loc[candidate_frame.index].to_numpy(dtype=np.float64)
+            feature_seeds = feature_frame.loc[seed_indexes].to_numpy(dtype=np.float64)
+        else:
+            feature_candidates = np.zeros((len(candidate_frame), 0), dtype=np.float64)
+            feature_seeds = np.zeros((len(seed_indexes), 0), dtype=np.float64)
+
+        energy_values = (
+            candidate_frame[energy_column].to_numpy(dtype=np.float64)
+            if energy_column is not None
+            else np.zeros(len(candidate_frame), dtype=np.float64)
+        )
+        uncertainty_values = (
+            candidate_frame[uncertainty_column].to_numpy(dtype=np.float64)
+            if uncertainty_column is not None
+            else np.zeros(len(candidate_frame), dtype=np.float64)
+        )
+
+        remaining = np.arange(len(candidate_frame), dtype=np.int64)
+        selected_local: list[int] = []
+        selected_real: list[npt.NDArray[np.float64]] = []
+        selected_feature: list[npt.NDArray[np.float64]] = []
+        records: list[dict[str, Any]] = []
+
+        for rank in range(npoints):
+            current_real = real_candidates[remaining]
+            current_feature = feature_candidates[remaining]
+            current_energy = energy_values[remaining]
+            current_uncertainty = uncertainty_values[remaining]
+
+            real_refs = self._stack_references(real_seeds, selected_real, width=3)
+            feature_refs = self._stack_references(
+                feature_seeds,
+                selected_feature,
+                width=feature_candidates.shape[1],
+            )
+
+            real_component = (
+                self._normalize_component(self._min_distance_to_references(current_real, real_refs))
+                if real_space_weight > 0.0
+                else np.zeros(len(remaining), dtype=np.float64)
+            )
+            feature_component = (
+                self._normalize_component(
+                    self._min_distance_to_references(current_feature, feature_refs)
+                )
+                if feature_space_weight > 0.0
+                else np.zeros(len(remaining), dtype=np.float64)
+            )
+            energy_component = (
+                self._normalize_component(-current_energy)
+                if energy_weight > 0.0
+                else np.zeros(len(remaining), dtype=np.float64)
+            )
+            uncertainty_component = (
+                self._normalize_component(current_uncertainty)
+                if uncertainty_weight > 0.0
+                else np.zeros(len(remaining), dtype=np.float64)
+            )
+
+            total_score = (
+                real_space_weight * real_component
+                + feature_space_weight * feature_component
+                + energy_weight * energy_component
+                + uncertainty_weight * uncertainty_component
+            )
+
+            best_position = int(np.argmax(total_score))
+            best_local = int(remaining[best_position])
+            best_index = candidate_frame.index[best_local]
+
+            selected_local.append(best_local)
+            selected_real.append(real_candidates[best_local])
+            if feature_candidates.shape[1] > 0:
+                selected_feature.append(feature_candidates[best_local])
+
+            records.append(
+                {
+                    "selection_rank": rank,
+                    "selection_score": float(total_score[best_position]),
+                    "real_space_score": float(real_component[best_position]),
+                    "feature_space_score": float(feature_component[best_position]),
+                    "energy_score": float(energy_component[best_position]),
+                    "uncertainty_score": float(uncertainty_component[best_position]),
+                    "point_index": int(best_index),
+                }
+            )
+
+            remaining = np.delete(remaining, best_position)
+
+        selection = candidate_frame.loc[[record["point_index"] for record in records]].copy()
+        selection.loc[:, "selection_rank"] = [record["selection_rank"] for record in records]
+        selection.loc[:, "selection_score"] = [record["selection_score"] for record in records]
+        selection.loc[:, "real_space_score"] = [record["real_space_score"] for record in records]
+        selection.loc[:, "feature_space_score"] = [
+            record["feature_space_score"] for record in records
+        ]
+        selection.loc[:, "energy_score"] = [record["energy_score"] for record in records]
+        selection.loc[:, "uncertainty_score"] = [record["uncertainty_score"] for record in records]
+        return selection.sort_values("selection_rank")
 
     def _process_chunk(self, chunk: NDArrayF) -> list[NDArrayF]:
         """
@@ -807,6 +1225,62 @@ class Maps:
             return
 
         self.features = [column for column in self.data.columns if column not in {"x", "y", "z"}]
+
+    def _resolve_selection_feature_columns(
+        self,
+        feature_columns: list[str] | None,
+        *,
+        energy_column: str | None,
+        uncertainty_column: str | None,
+        feature_space_weight: float,
+    ) -> list[str]:
+        if feature_columns is not None:
+            return list(feature_columns)
+        if feature_space_weight <= 0.0:
+            return []
+
+        cluster_features = getattr(self, "cluster_features", [])
+        if cluster_features:
+            return list(cluster_features)
+
+        excluded = {"Cluster"}
+        if energy_column is not None:
+            excluded.add(energy_column)
+        if uncertainty_column is not None:
+            excluded.add(uncertainty_column)
+        return [column for column in self.features if column not in excluded]
+
+    @staticmethod
+    def _normalize_component(values: NDArrayF) -> NDArrayF:
+        if values.size == 0:
+            return values
+        vmin = float(np.min(values))
+        vmax = float(np.max(values))
+        if np.isclose(vmax, vmin):
+            return np.zeros_like(values)
+        return (values - vmin) / (vmax - vmin)
+
+    @staticmethod
+    def _min_distance_to_references(points: NDArrayF, references: NDArrayF) -> NDArrayF:
+        if points.size == 0:
+            return np.zeros(0, dtype=np.float64)
+        if references.size == 0:
+            return np.zeros(points.shape[0], dtype=np.float64)
+        return np.min(distance.cdist(points, references), axis=1)
+
+    @staticmethod
+    def _stack_references(
+        seeds: NDArrayF,
+        selected: list[NDArrayF],
+        *,
+        width: int,
+    ) -> NDArrayF:
+        selected_array = np.vstack(selected) if selected else np.zeros((0, width), dtype=np.float64)
+        if seeds.size == 0:
+            return selected_array
+        if selected_array.size == 0:
+            return seeds
+        return np.vstack([seeds, selected_array])
 
 
 # Class that extends the Maps class to load data from a file

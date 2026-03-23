@@ -24,7 +24,17 @@ except ImportError:  # pragma: no cover
 with suppress(_md.PackageNotFoundError):
     __version__ = _md.version("mapsy")
 
-__all__ = ["__version__", "Maps", "MapsFromFile", "MultiMaps", "MultiMapsFromFile"]
+__all__ = [
+    "__version__",
+    "Maps",
+    "MapsFromFile",
+    "MultiMaps",
+    "MultiMapsFromFile",
+    "CalculationWorkflow",
+    "QuantumEspressoOutputParser",
+    "QuantumEspressoSetup",
+    "SlurmTemplate",
+]
 
 
 def __getattr__(name: str) -> Any:
@@ -38,4 +48,20 @@ def __getattr__(name: str) -> Any:
 
         exports = {"MultiMaps": MultiMaps, "MultiMapsFromFile": MultiMapsFromFile}
         return exports[name]
+    if name in {"CalculationWorkflow"}:
+        from .workflows import CalculationWorkflow
+
+        return CalculationWorkflow
+    if name in {"QuantumEspressoSetup"}:
+        from .calculations import QuantumEspressoSetup
+
+        return QuantumEspressoSetup
+    if name in {"QuantumEspressoOutputParser"}:
+        from .calculations import QuantumEspressoOutputParser
+
+        return QuantumEspressoOutputParser
+    if name in {"SlurmTemplate"}:
+        from .calculations import SlurmTemplate
+
+        return SlurmTemplate
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
