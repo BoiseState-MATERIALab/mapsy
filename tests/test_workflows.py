@@ -46,7 +46,7 @@ def test_calculation_workflow_run_and_collect_updates_special_points() -> None:
     after_run = maps.get_special_points(kind="adaptive")
     assert after_run["label_status"].tolist() == ["unlabeled"]
     assert after_run["calculation_name"].tolist() == ["qe_relax"]
-    assert after_run["label_name"].tolist() == ["qe_relax"]
+    assert after_run["calculation_description"].tolist() == [{"code": "mock", "method": "relax"}]
     assert after_run["label_file"].tolist() == ["calc_1.out"]
 
     workflow.collect(maps, kind="adaptive")
