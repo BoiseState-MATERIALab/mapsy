@@ -34,11 +34,17 @@ class FakeCalc:
 
 
 class FakePreparedCalc:
-    def __init__(self) -> None:
+    def __init__(self, input_path: str | None = None) -> None:
         self.written = False
+        self.input_path = input_path
 
     def write_input(self, atoms) -> None:
         self.written = True
+        if self.input_path is not None:
+            with open(self.input_path, "w", encoding="utf-8") as handle:
+                handle.write("&CONTROL\n")
+                handle.write("   calculation = 'relax'\n")
+                handle.write("/\n")
 
 
 def test_qe_setup_generates_metadata_and_profile() -> None:
@@ -135,12 +141,11 @@ def test_qe_setup_prepares_slurm_job_and_cluster_runner(tmp_path) -> None:
         setup_commands=["echo preparing"],
     )
 
-    fake_calc = FakePreparedCalc()
     created: dict[str, object] = {}
 
     def fake_make_calculator(**kwargs):
         created.update(kwargs)
-        return fake_calc
+        return FakePreparedCalc(input_path=str(tmp_path / "qe_job_7" / "espresso.pwi"))
 
     class FakeCompleted:
         stdout = "Submitted batch job 321\n"
@@ -164,7 +169,8 @@ def test_qe_setup_prepares_slurm_job_and_cluster_runner(tmp_path) -> None:
     script_path = tmp_path / "qe_job_7" / "submit.slurm"
     script_text = script_path.read_text()
 
-    assert fake_calc.written is True
+    input_text = (tmp_path / "qe_job_7" / "espresso.pwi").read_text()
+
     assert created["directory"] == tmp_path / "qe_job_7"
     assert metadata["label_file"] == str(tmp_path / "qe_job_7")
     assert metadata["submit_script"] == str(script_path)
@@ -172,6 +178,7 @@ def test_qe_setup_prepares_slurm_job_and_cluster_runner(tmp_path) -> None:
     assert "#SBATCH --partition=debug" in script_text
     assert "module load qe/7.2" in script_text
     assert "srun /opt/qe/bin/pw.x -in espresso.pwi > espresso.pwo" in script_text
+    assert "outdir =" not in input_text
 
     frame = pd.DataFrame({"x": [1.0], "y": [2.0], "z": [3.0]})
     maps = _build_maps(frame)
@@ -207,12 +214,11 @@ def test_qe_setup_generates_dynamic_scratch_outdir(tmp_path) -> None:
         modules=["qe/7.2"],
     )
 
-    fake_calc = FakePreparedCalc()
     created: dict[str, object] = {}
 
     def fake_make_calculator(**kwargs):
         created.update(kwargs)
-        return fake_calc
+        return FakePreparedCalc(input_path=str(tmp_path / "qe_job_7" / "espresso.pwi"))
 
     setup.make_calculator = fake_make_calculator  # type: ignore[method-assign]
 
@@ -226,8 +232,10 @@ def test_qe_setup_generates_dynamic_scratch_outdir(tmp_path) -> None:
 
     expected_outdir = scratch_root / "qe_job_7"
     script_text = (tmp_path / "qe_job_7" / "submit.slurm").read_text()
+    input_text = (tmp_path / "qe_job_7" / "espresso.pwi").read_text()
 
     assert created["qe_outdir"] == expected_outdir
     assert expected_outdir.exists()
     assert metadata["qe_outdir"] == str(expected_outdir)
     assert f"mkdir -p {expected_outdir}" in script_text
+    assert f"outdir = '{expected_outdir}'" in input_text

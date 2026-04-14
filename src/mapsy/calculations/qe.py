@@ -116,20 +116,8 @@ class QuantumEspressoSetup:
         else:
             calculator_factory = espresso_cls
 
-        local_input_data = deepcopy(self.input_data)
-        control = deepcopy(local_input_data.get("control", {}))
-        control.setdefault("pseudo_dir", str(Path(self.pseudodir).expanduser()))
-        if qe_outdir is not None:
-            control["outdir"] = str(Path(qe_outdir).expanduser())
-        local_input_data["control"] = control
-
-        kwargs = deepcopy(self.calculator_kwargs)
-        if self.tstress is not None:
-            kwargs.setdefault("tstress", self.tstress)
-        if self.tprnfor is not None:
-            kwargs.setdefault("tprnfor", self.tprnfor)
-        if calculator_overrides:
-            kwargs.update(calculator_overrides)
+        local_input_data = self.build_input_data(qe_outdir=qe_outdir)
+        kwargs = self.build_calculator_kwargs(calculator_overrides=calculator_overrides)
 
         return calculator_factory(
             profile=self.make_profile(profile_cls=profile_cls) if profile is None else profile,
@@ -140,6 +128,35 @@ class QuantumEspressoSetup:
             koffset=tuple(self.koffset),
             **kwargs,
         )
+
+    def build_input_data(
+        self,
+        *,
+        qe_outdir: str | Path | None = None,
+    ) -> dict[str, Any]:
+        """Build QE input_data with pseudo_dir and optional outdir resolved."""
+        local_input_data = deepcopy(self.input_data)
+        control = deepcopy(local_input_data.get("control", {}))
+        control.setdefault("pseudo_dir", str(Path(self.pseudodir).expanduser()))
+        if qe_outdir is not None:
+            control["outdir"] = str(Path(qe_outdir).expanduser())
+        local_input_data["control"] = control
+        return local_input_data
+
+    def build_calculator_kwargs(
+        self,
+        *,
+        calculator_overrides: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Build calculator/write kwargs derived from the QE setup."""
+        kwargs = deepcopy(self.calculator_kwargs)
+        if self.tstress is not None:
+            kwargs.setdefault("tstress", self.tstress)
+        if self.tprnfor is not None:
+            kwargs.setdefault("tprnfor", self.tprnfor)
+        if calculator_overrides:
+            kwargs.update(calculator_overrides)
+        return kwargs
 
     def resolve_workdir(
         self,
@@ -247,19 +264,115 @@ class QuantumEspressoSetup:
         atoms: Atoms,
         calculator: Any,
         *,
+        qe_outdir: str | Path | None = None,
+        directory: str | Path | None = None,
         input_writer: Callable[..., Any] | None = None,
     ) -> None:
         """Write QE input files for a prepared job directory."""
         if input_writer is not None:
             input_writer(atoms=atoms, calculator=calculator, setup=self)
+        else:
+            target_directory = directory
+            if target_directory is None:
+                target_directory = getattr(calculator, "directory", None)
+            if target_directory is None:
+                raise AttributeError(
+                    "Missing target directory for QE input writing and no input_writer was provided."
+                )
+            self.write_espresso_input(
+                atoms,
+                directory=target_directory,
+                qe_outdir=qe_outdir,
+            )
+
+        if qe_outdir is None or directory is None:
             return
-        write_input = getattr(calculator, "write_input", None)
-        if callable(write_input):
-            write_input(atoms)
-            return
-        raise AttributeError(
-            "Calculator does not expose write_input and no input_writer was provided."
+
+        self.ensure_input_outdir(
+            Path(directory).expanduser() / self.input_filename,
+            qe_outdir,
         )
+
+    def write_espresso_input(
+        self,
+        atoms: Atoms,
+        *,
+        directory: str | Path,
+        qe_outdir: str | Path | None = None,
+        write_func: Callable[..., Any] | None = None,
+    ) -> Path:
+        """Write a QE input file using setup-owned serialization defaults."""
+        writer: Callable[..., Any]
+        if write_func is None:
+            from ase.io import write as ase_write
+
+            writer = ase_write
+        else:
+            writer = write_func
+
+        directory_path = Path(directory).expanduser()
+        directory_path.mkdir(parents=True, exist_ok=True)
+        input_path = directory_path / self.input_filename
+        writer(
+            input_path,
+            atoms,
+            format="espresso-in",
+            input_data=self.build_input_data(qe_outdir=qe_outdir),
+            pseudopotentials=dict(self.pseudopotentials),
+            kpts=tuple(self.kpts),
+            koffset=tuple(self.koffset),
+            **self.build_calculator_kwargs(),
+        )
+        return input_path
+
+    def ensure_input_outdir(
+        self,
+        input_path: str | Path,
+        qe_outdir: str | Path,
+    ) -> None:
+        """Ensure the QE input file contains the requested outdir in the CONTROL block."""
+        path = Path(input_path).expanduser()
+        if not path.exists():
+            return
+
+        outdir_value = str(Path(qe_outdir).expanduser())
+        lines = path.read_text().splitlines()
+        output: list[str] = []
+        in_control = False
+        control_found = False
+        outdir_found = False
+        inserted = False
+
+        for line in lines:
+            stripped = line.strip()
+            lower = stripped.lower()
+            if lower.startswith("&control"):
+                in_control = True
+                control_found = True
+                output.append(line)
+                continue
+            if in_control and lower.startswith("outdir"):
+                indent = line[: len(line) - len(line.lstrip())]
+                output.append(f"{indent}outdir = '{outdir_value}'")
+                outdir_found = True
+                continue
+            if in_control and stripped == "/":
+                if not outdir_found:
+                    output.append(f"   outdir = '{outdir_value}'")
+                    outdir_found = True
+                output.append(line)
+                in_control = False
+                inserted = True
+                continue
+            output.append(line)
+
+        if control_found:
+            if not inserted and not outdir_found:
+                output.append(f"   outdir = '{outdir_value}'")
+        else:
+            output = ["&CONTROL", f"   outdir = '{outdir_value}'", "/", *output]
+
+        path.write_text("\n".join(output) + "\n")
 
     def prepare_single_calculation(
         self,
@@ -304,8 +417,13 @@ class QuantumEspressoSetup:
             calculator_overrides=calculator_overrides,
         )
         atoms_to_write.calc = calculator
-        self.write_inputs(atoms_to_write, calculator, input_writer=input_writer)
-
+        self.write_inputs(
+            atoms_to_write,
+            calculator,
+            qe_outdir=qe_outdir,
+            directory=workdir,
+            input_writer=input_writer,
+        )
         scheduler_for_job = scheduler_template
         if qe_outdir is not None:
             mkdir_outdir = f"mkdir -p {shlex.quote(str(qe_outdir))}"
