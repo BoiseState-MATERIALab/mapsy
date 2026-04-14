@@ -189,3 +189,45 @@ def test_qe_setup_prepares_slurm_job_and_cluster_runner(tmp_path) -> None:
 
     assert prepared["label_file"] == str(tmp_path / "qe_job_0")
     assert prepared["submit_script"] == str(tmp_path / "qe_job_0" / "submit.slurm")
+
+
+def test_qe_setup_generates_dynamic_scratch_outdir(tmp_path) -> None:
+    scratch_root = tmp_path / "scratch"
+    setup = QuantumEspressoSetup(
+        runprefix="srun ",
+        qepath="/opt/qe/bin",
+        pseudodir="/opt/qe/pseudo",
+        pseudopotentials={"Co": "Co.UPF", "H": "H.UPF"},
+        input_data={"control": {"calculation": "relax", "prefix": "CoP"}},
+        outdir_root=str(scratch_root),
+    )
+    scheduler = SlurmTemplate(
+        partition="debug",
+        time="00:10:00",
+        modules=["qe/7.2"],
+    )
+
+    fake_calc = FakePreparedCalc()
+    created: dict[str, object] = {}
+
+    def fake_make_calculator(**kwargs):
+        created.update(kwargs)
+        return fake_calc
+
+    setup.make_calculator = fake_make_calculator  # type: ignore[method-assign]
+
+    atoms = Atoms("H", positions=[[0.0, 0.0, 0.0]])
+    metadata = setup.prepare_single_calculation(
+        7,
+        atoms,
+        scheduler_template=scheduler,
+        workdir_root=tmp_path,
+    )
+
+    expected_outdir = scratch_root / "qe_job_7"
+    script_text = (tmp_path / "qe_job_7" / "submit.slurm").read_text()
+
+    assert created["qe_outdir"] == expected_outdir
+    assert expected_outdir.exists()
+    assert metadata["qe_outdir"] == str(expected_outdir)
+    assert f"mkdir -p {expected_outdir}" in script_text

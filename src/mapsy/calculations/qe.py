@@ -4,7 +4,7 @@ import re
 import shlex
 from collections.abc import Callable, Sequence
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, cast
 
@@ -33,6 +33,8 @@ class QuantumEspressoSetup:
     executable: str = "pw.x"
     input_filename: str = "espresso.pwi"
     output_filename: str = "espresso.pwo"
+    outdir_root: str | None = None
+    outdir_template: str | None = None
     tstress: bool | None = None
     tprnfor: bool | None = None
     calculator_kwargs: dict[str, Any] = field(default_factory=dict)
@@ -59,6 +61,8 @@ class QuantumEspressoSetup:
             "koffset": tuple(self.koffset),
             "input_filename": self.input_filename,
             "output_filename": self.output_filename,
+            "outdir_root": self.outdir_root,
+            "outdir_template": self.outdir_template,
             "tstress": self.tstress,
             "tprnfor": self.tprnfor,
             "calculator_kwargs": deepcopy(self.calculator_kwargs),
@@ -97,6 +101,7 @@ class QuantumEspressoSetup:
         self,
         directory: str | Path,
         *,
+        qe_outdir: str | Path | None = None,
         profile: Any | None = None,
         espresso_cls: type[Any] | None = None,
         profile_cls: type[Any] | None = None,
@@ -114,6 +119,8 @@ class QuantumEspressoSetup:
         local_input_data = deepcopy(self.input_data)
         control = deepcopy(local_input_data.get("control", {}))
         control.setdefault("pseudo_dir", str(Path(self.pseudodir).expanduser()))
+        if qe_outdir is not None:
+            control["outdir"] = str(Path(qe_outdir).expanduser())
         local_input_data["control"] = control
 
         kwargs = deepcopy(self.calculator_kwargs)
@@ -133,6 +140,37 @@ class QuantumEspressoSetup:
             koffset=tuple(self.koffset),
             **kwargs,
         )
+
+    def resolve_workdir(
+        self,
+        point_index: int,
+        *,
+        directory_template: str = "qe_job_{point_index}",
+        workdir_root: str | Path | None = None,
+    ) -> Path:
+        """Resolve the per-job working directory."""
+        folder_name = directory_template.format(point_index=point_index)
+        if workdir_root is None:
+            return Path(folder_name)
+        return Path(workdir_root).expanduser() / folder_name
+
+    def resolve_outdir(
+        self,
+        point_index: int,
+        *,
+        directory_template: str = "qe_job_{point_index}",
+        outdir_root: str | Path | None = None,
+        outdir_template: str | None = None,
+    ) -> Path | None:
+        """Resolve the per-job QE outdir, if configured."""
+        root = self.outdir_root if outdir_root is None else outdir_root
+        if root is None:
+            return None
+
+        template = self.outdir_template if outdir_template is None else outdir_template
+        name_template = directory_template if template is None else template
+        folder_name = name_template.format(point_index=point_index)
+        return Path(root).expanduser() / folder_name
 
     def add_single_atom_adsorbate(
         self,
@@ -165,21 +203,33 @@ class QuantumEspressoSetup:
         *,
         directory_template: str = "qe_job_{point_index}",
         workdir_root: str | Path | None = None,
+        outdir_root: str | Path | None = None,
+        outdir_template: str | None = None,
         calculator_overrides: dict[str, Any] | None = None,
         espresso_cls: type[Any] | None = None,
         profile_cls: type[Any] | None = None,
         energy_key: str = "runner_energy",
     ) -> QE_RUNNER_RESULT:
         """Run a single QE job in its own directory and return workflow metadata."""
-        folder_name = directory_template.format(point_index=point_index)
-        workdir = (
-            Path(workdir_root).expanduser() / folder_name if workdir_root else Path(folder_name)
+        workdir = self.resolve_workdir(
+            point_index,
+            directory_template=directory_template,
+            workdir_root=workdir_root,
         )
         workdir.mkdir(parents=True, exist_ok=True)
+        qe_outdir = self.resolve_outdir(
+            point_index,
+            directory_template=directory_template,
+            outdir_root=outdir_root,
+            outdir_template=outdir_template,
+        )
+        if qe_outdir is not None:
+            qe_outdir.mkdir(parents=True, exist_ok=True)
 
         atoms_to_run = atoms.copy()
         atoms_to_run.calc = self.make_calculator(
             directory=workdir,
+            qe_outdir=qe_outdir,
             espresso_cls=espresso_cls,
             profile_cls=profile_cls,
             calculator_overrides=calculator_overrides,
@@ -188,6 +238,7 @@ class QuantumEspressoSetup:
 
         return {
             "label_file": str(workdir),
+            "qe_outdir": str(qe_outdir) if qe_outdir is not None else None,
             energy_key: energy,
         }
 
@@ -219,6 +270,8 @@ class QuantumEspressoSetup:
         directory_template: str = "qe_job_{point_index}",
         job_name_template: str = "qe-{point_index}",
         workdir_root: str | Path | None = None,
+        outdir_root: str | Path | None = None,
+        outdir_template: str | None = None,
         calculator_overrides: dict[str, Any] | None = None,
         espresso_cls: type[Any] | None = None,
         profile_cls: type[Any] | None = None,
@@ -227,15 +280,25 @@ class QuantumEspressoSetup:
         subprocess_run: Callable[..., Any] | None = None,
     ) -> QE_RUNNER_RESULT:
         """Prepare a QE job directory and Slurm script, optionally submitting it."""
-        folder_name = directory_template.format(point_index=point_index)
-        workdir = (
-            Path(workdir_root).expanduser() / folder_name if workdir_root else Path(folder_name)
+        workdir = self.resolve_workdir(
+            point_index,
+            directory_template=directory_template,
+            workdir_root=workdir_root,
         )
         workdir.mkdir(parents=True, exist_ok=True)
+        qe_outdir = self.resolve_outdir(
+            point_index,
+            directory_template=directory_template,
+            outdir_root=outdir_root,
+            outdir_template=outdir_template,
+        )
+        if qe_outdir is not None:
+            qe_outdir.mkdir(parents=True, exist_ok=True)
 
         atoms_to_write = atoms.copy()
         calculator = self.make_calculator(
             directory=workdir,
+            qe_outdir=qe_outdir,
             espresso_cls=espresso_cls,
             profile_cls=profile_cls,
             calculator_overrides=calculator_overrides,
@@ -243,7 +306,16 @@ class QuantumEspressoSetup:
         atoms_to_write.calc = calculator
         self.write_inputs(atoms_to_write, calculator, input_writer=input_writer)
 
-        script_path = scheduler_template.write(
+        scheduler_for_job = scheduler_template
+        if qe_outdir is not None:
+            mkdir_outdir = f"mkdir -p {shlex.quote(str(qe_outdir))}"
+            if mkdir_outdir not in scheduler_template.setup_commands:
+                scheduler_for_job = replace(
+                    scheduler_template,
+                    setup_commands=[*scheduler_template.setup_commands, mkdir_outdir],
+                )
+
+        script_path = scheduler_for_job.write(
             workdir,
             self.run_command(),
             job_name=job_name_template.format(point_index=point_index),
@@ -251,12 +323,13 @@ class QuantumEspressoSetup:
 
         metadata: QE_RUNNER_RESULT = {
             "label_file": str(workdir),
+            "qe_outdir": str(qe_outdir) if qe_outdir is not None else None,
             "submit_script": str(script_path),
             "scheduler": "slurm",
         }
         if submit:
             metadata.update(
-                scheduler_template.submit(
+                scheduler_for_job.submit(
                     script_path,
                     subprocess_run=subprocess_run,
                 )
@@ -273,6 +346,8 @@ class QuantumEspressoSetup:
         adsorbate_mask: Sequence[bool] | None = (True, True, False),
         directory_template: str = "qe_job_{point_index}",
         workdir_root: str | Path | None = None,
+        outdir_root: str | Path | None = None,
+        outdir_template: str | None = None,
         calculator_overrides: dict[str, Any] | None = None,
         espresso_cls: type[Any] | None = None,
         profile_cls: type[Any] | None = None,
@@ -295,6 +370,8 @@ class QuantumEspressoSetup:
                 atoms,
                 directory_template=directory_template,
                 workdir_root=workdir_root,
+                outdir_root=outdir_root,
+                outdir_template=outdir_template,
                 calculator_overrides=calculator_overrides,
                 espresso_cls=espresso_cls,
                 profile_cls=profile_cls,
@@ -315,6 +392,8 @@ class QuantumEspressoSetup:
         directory_template: str = "qe_job_{point_index}",
         job_name_template: str = "qe-{point_index}",
         workdir_root: str | Path | None = None,
+        outdir_root: str | Path | None = None,
+        outdir_template: str | None = None,
         calculator_overrides: dict[str, Any] | None = None,
         espresso_cls: type[Any] | None = None,
         profile_cls: type[Any] | None = None,
@@ -341,6 +420,8 @@ class QuantumEspressoSetup:
                 directory_template=directory_template,
                 job_name_template=job_name_template,
                 workdir_root=workdir_root,
+                outdir_root=outdir_root,
+                outdir_template=outdir_template,
                 calculator_overrides=calculator_overrides,
                 espresso_cls=espresso_cls,
                 profile_cls=profile_cls,
