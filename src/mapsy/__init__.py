@@ -31,7 +31,9 @@ __all__ = [
     "MultiMaps",
     "MultiMapsFromFile",
     "CalculationWorkflow",
-    "QuantumEspressoOutputParser",
+    "QuantumEspressoMultiRelaxParser",
+    "QuantumEspressoRelaxParser",
+    "QuantumEspressoScfParser",
     "QuantumEspressoSetup",
     "SlurmTemplate",
 ]
@@ -56,10 +58,18 @@ def __getattr__(name: str) -> Any:
         from .calculations import QuantumEspressoSetup
 
         return QuantumEspressoSetup
-    if name in {"QuantumEspressoOutputParser"}:
-        from .calculations import QuantumEspressoOutputParser
+    if name in {"QuantumEspressoMultiRelaxParser"}:
+        from .calculations import QuantumEspressoMultiRelaxParser
 
-        return QuantumEspressoOutputParser
+        return QuantumEspressoMultiRelaxParser
+    if name in {"QuantumEspressoRelaxParser"}:
+        from .calculations import QuantumEspressoRelaxParser
+
+        return QuantumEspressoRelaxParser
+    if name in {"QuantumEspressoScfParser"}:
+        from .calculations import QuantumEspressoScfParser
+
+        return QuantumEspressoScfParser
     if name in {"SlurmTemplate"}:
         from .calculations import SlurmTemplate
 

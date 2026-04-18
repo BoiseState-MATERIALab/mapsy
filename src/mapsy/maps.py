@@ -83,6 +83,10 @@ class SpecialPointRegistry:
                 rows.loc[:, key] = value
                 continue
 
+            if indexes.size == 1:
+                rows.loc[:, key] = pd.Series([value], dtype=object)
+                continue
+
             values = np.asarray(value)
             if values.reshape(-1).size != indexes.size:
                 raise ValueError(
@@ -148,6 +152,12 @@ class SpecialPointRegistry:
 
             if np.isscalar(value) or value is None:
                 self._data.loc[mask, key] = value
+                continue
+
+            if count == 1:
+                self._data.loc[mask, key] = pd.Series(
+                    [value], index=self._data.index[mask], dtype=object
+                )
                 continue
 
             values = np.asarray(value, dtype=object).reshape(-1)
@@ -342,6 +352,87 @@ class Maps:
             replace_kind=replace_kind,
             **metadata,
         )
+
+    def select_special_points(
+        self,
+        npoints: int,
+        *,
+        kind: str = "adaptive",
+        iteration: int | None = None,
+        label_status: str = "unlabeled",
+        replace_kind: bool = False,
+        store_selection_metadata: bool = True,
+        feature_columns: list[str] | None = None,
+        energy_column: str | None = None,
+        uncertainty_column: str | None = None,
+        special_point_indexes: npt.ArrayLike | None = None,
+        centroid_indexes: npt.ArrayLike | None = None,
+        region: int | None = None,
+        real_space_weight: float = 0.0,
+        feature_space_weight: float = 1.0,
+        energy_weight: float = 0.0,
+        uncertainty_weight: float = 0.0,
+        scale_features: bool = True,
+        energy_selection_mode: str = "global_minimum",
+        gradient_columns: list[str] | None = None,
+        gradient_norm_column: str | None = None,
+        curvature_columns: list[str] | None = None,
+        stationary_orders: int | Sequence[int] = 0,
+        gradient_tolerance: float = 1.0e-6,
+        curvature_tolerance: float = 1.0e-8,
+        **metadata: Any,
+    ) -> pd.DataFrame:
+        """Select and register new special points in one step."""
+        selected = self.select_points(
+            npoints=npoints,
+            feature_columns=feature_columns,
+            energy_column=energy_column,
+            uncertainty_column=uncertainty_column,
+            special_point_indexes=special_point_indexes,
+            centroid_indexes=centroid_indexes,
+            region=region,
+            real_space_weight=real_space_weight,
+            feature_space_weight=feature_space_weight,
+            energy_weight=energy_weight,
+            uncertainty_weight=uncertainty_weight,
+            scale_features=scale_features,
+            energy_selection_mode=energy_selection_mode,
+            gradient_columns=gradient_columns,
+            gradient_norm_column=gradient_norm_column,
+            curvature_columns=curvature_columns,
+            stationary_orders=stationary_orders,
+            gradient_tolerance=gradient_tolerance,
+            curvature_tolerance=curvature_tolerance,
+        )
+
+        point_indexes = selected.index.to_numpy(dtype=np.int64)
+        add_metadata = dict(metadata)
+        if store_selection_metadata:
+            for column in [
+                "selection_rank",
+                "selection_score",
+                "real_space_score",
+                "feature_space_score",
+                "energy_score",
+                "uncertainty_score",
+            ]:
+                if column in selected.columns and column not in add_metadata:
+                    add_metadata[column] = selected[column].to_numpy()
+
+        self.add_special_points(
+            point_indexes,
+            kind=kind,
+            iteration=iteration,
+            label_status=label_status,
+            replace_kind=replace_kind,
+            **add_metadata,
+        )
+
+        special = self.get_special_points(kind=kind)
+        special = special.loc[special["point_index"].isin(point_indexes)].copy()
+        if "selection_rank" in special.columns:
+            return special.sort_values("selection_rank").reset_index(drop=True)
+        return special.reset_index(drop=True)
 
     def get_special_points(
         self,
@@ -970,6 +1061,13 @@ class Maps:
         energy_weight: float = 0.0,
         uncertainty_weight: float = 0.0,
         scale_features: bool = True,
+        energy_selection_mode: str = "global_minimum",
+        gradient_columns: list[str] | None = None,
+        gradient_norm_column: str | None = None,
+        curvature_columns: list[str] | None = None,
+        stationary_orders: int | Sequence[int] = 0,
+        gradient_tolerance: float = 1.0e-6,
+        curvature_tolerance: float = 1.0e-8,
     ) -> pd.DataFrame:
         """
         Greedily select contact-space points with a weighted balance of diversity and utility.
@@ -977,7 +1075,7 @@ class Maps:
         The acquisition score combines:
             - real-space distance from existing centroids / already selected points
             - feature-space distance from existing centroids / already selected points
-            - low energy
+            - low energy or stationary-point preference
             - high uncertainty
         """
         if npoints <= 0:
@@ -1090,7 +1188,18 @@ class Maps:
                 else np.zeros(len(remaining), dtype=np.float64)
             )
             energy_component = (
-                self._normalize_component(-current_energy)
+                self._energy_component(
+                    candidate_frame.iloc[remaining],
+                    energy_values=current_energy,
+                    energy_column=energy_column,
+                    energy_selection_mode=energy_selection_mode,
+                    gradient_columns=gradient_columns,
+                    gradient_norm_column=gradient_norm_column,
+                    curvature_columns=curvature_columns,
+                    stationary_orders=stationary_orders,
+                    gradient_tolerance=gradient_tolerance,
+                    curvature_tolerance=curvature_tolerance,
+                )
                 if energy_weight > 0.0
                 else np.zeros(len(remaining), dtype=np.float64)
             )
@@ -1249,6 +1358,113 @@ class Maps:
         if uncertainty_column is not None:
             excluded.add(uncertainty_column)
         return [column for column in self.features if column not in excluded]
+
+    def _energy_component(
+        self,
+        frame: pd.DataFrame,
+        *,
+        energy_values: NDArrayF,
+        energy_column: str | None,
+        energy_selection_mode: str,
+        gradient_columns: list[str] | None,
+        gradient_norm_column: str | None,
+        curvature_columns: list[str] | None,
+        stationary_orders: int | Sequence[int],
+        gradient_tolerance: float,
+        curvature_tolerance: float,
+    ) -> NDArrayF:
+        if energy_column is None:
+            raise ValueError("energy_column is required when energy_weight > 0")
+
+        mode = energy_selection_mode.lower()
+        if mode == "global_minimum":
+            return self._normalize_component(-energy_values)
+        if mode != "stationary":
+            raise ValueError(
+                "energy_selection_mode must be 'global_minimum' or 'stationary', "
+                f"got {energy_selection_mode!r}."
+            )
+
+        stationary_mask = self._stationary_mask(
+            frame,
+            gradient_columns=gradient_columns,
+            gradient_norm_column=gradient_norm_column,
+            curvature_columns=curvature_columns,
+            stationary_orders=stationary_orders,
+            gradient_tolerance=gradient_tolerance,
+            curvature_tolerance=curvature_tolerance,
+        )
+        component = np.zeros(len(frame), dtype=np.float64)
+        if not np.any(stationary_mask):
+            return component
+
+        stationary_energies = energy_values[stationary_mask]
+        if stationary_energies.size == 1:
+            component[stationary_mask] = 1.0
+            return component
+
+        component[stationary_mask] = 0.5 + 0.5 * self._normalize_component(-stationary_energies)
+        return component
+
+    def _stationary_mask(
+        self,
+        frame: pd.DataFrame,
+        *,
+        gradient_columns: list[str] | None,
+        gradient_norm_column: str | None,
+        curvature_columns: list[str] | None,
+        stationary_orders: int | Sequence[int],
+        gradient_tolerance: float,
+        curvature_tolerance: float,
+    ) -> npt.NDArray[np.bool_]:
+        gradient_norm = self._gradient_norm(
+            frame,
+            gradient_columns=gradient_columns,
+            gradient_norm_column=gradient_norm_column,
+        )
+        curvature_values = self._curvature_values(frame, curvature_columns=curvature_columns)
+        negative_counts = np.sum(curvature_values < -curvature_tolerance, axis=1)
+        positive_counts = np.sum(curvature_values > curvature_tolerance, axis=1)
+        fully_classified = (negative_counts + positive_counts) == curvature_values.shape[1]
+
+        if isinstance(stationary_orders, int):
+            orders = {stationary_orders}
+        else:
+            orders = {int(order) for order in stationary_orders}
+        if any(order < 0 for order in orders):
+            raise ValueError("stationary_orders must be non-negative")
+
+        return (
+            (gradient_norm <= gradient_tolerance)
+            & fully_classified
+            & np.isin(negative_counts, list(orders))
+        )
+
+    @staticmethod
+    def _gradient_norm(
+        frame: pd.DataFrame,
+        *,
+        gradient_columns: list[str] | None,
+        gradient_norm_column: str | None,
+    ) -> NDArrayF:
+        if gradient_norm_column is not None:
+            return np.abs(frame[gradient_norm_column].to_numpy(dtype=np.float64))
+        if gradient_columns is not None:
+            gradient_values = frame.loc[:, gradient_columns].to_numpy(dtype=np.float64)
+            return np.linalg.norm(gradient_values, axis=1)
+        raise ValueError(
+            "Stationary-point energy selection requires gradient_norm_column or gradient_columns."
+        )
+
+    @staticmethod
+    def _curvature_values(
+        frame: pd.DataFrame,
+        *,
+        curvature_columns: list[str] | None,
+    ) -> NDArrayF:
+        if not curvature_columns:
+            raise ValueError("Stationary-point energy selection requires curvature_columns.")
+        return frame.loc[:, curvature_columns].to_numpy(dtype=np.float64)
 
     @staticmethod
     def _normalize_component(values: NDArrayF) -> NDArrayF:

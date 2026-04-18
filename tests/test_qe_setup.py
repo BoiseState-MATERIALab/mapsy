@@ -239,3 +239,63 @@ def test_qe_setup_generates_dynamic_scratch_outdir(tmp_path) -> None:
     assert metadata["qe_outdir"] == str(expected_outdir)
     assert f"mkdir -p {expected_outdir}" in script_text
     assert f"outdir = '{expected_outdir}'" in input_text
+
+
+def test_qe_setup_prepares_relax_retry_from_previous_attempt(tmp_path) -> None:
+    scratch_root = tmp_path / "scratch"
+    workdir = tmp_path / "qe_job_7"
+    workdir.mkdir()
+    setup = QuantumEspressoSetup(
+        runprefix="srun ",
+        qepath="/opt/qe/bin",
+        pseudodir="/opt/qe/pseudo",
+        pseudopotentials={"Co": "Co.UPF", "H": "H.UPF"},
+        input_data={"control": {"calculation": "relax", "prefix": "CoP"}},
+        outdir_root=str(scratch_root),
+    )
+    scheduler = SlurmTemplate(partition="debug", time="00:10:00", modules=["qe/7.2"])
+
+    (workdir / "espresso.pwi").write_text(
+        "\n".join(
+            [
+                "&CONTROL",
+                "   calculation = 'relax'",
+                "/",
+                "ATOMIC_POSITIONS (angstrom)",
+                "Co 0.0 0.0 1.0",
+                "H 0.1 0.2 2.0",
+            ]
+        )
+        + "\n"
+    )
+    (workdir / "espresso.pwo").write_text(
+        "\n".join(
+            [
+                "!    total energy              =   -123.4000 Ry",
+                "ATOMIC_POSITIONS (angstrom)",
+                "Co 0.0 0.0 1.1",
+                "H 0.3 0.4 2.2",
+            ]
+        )
+        + "\n"
+    )
+
+    metadata = setup.prepare_retry_from_previous_attempt(
+        7,
+        scheduler_template=scheduler,
+        workdir_root=tmp_path,
+        update_positions_from_output=True,
+    )
+
+    retry_input = workdir / "espresso.r001.pwi"
+    retry_script = workdir / "submit.r001.slurm"
+    retry_input_text = retry_input.read_text()
+    retry_script_text = retry_script.read_text()
+
+    assert metadata["label_file"] == str(workdir)
+    assert metadata["retry_attempt_index"] == 1
+    assert metadata["submit_script"] == str(retry_script)
+    assert "H 0.3 0.4 2.2" in retry_input_text
+    assert "espresso.r001.pwi > espresso.r001.pwo" in retry_script_text
+    assert "mkdir -p" in retry_script_text
+    assert "outdir = '" in retry_input_text

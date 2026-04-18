@@ -121,3 +121,107 @@ def test_select_points_balances_energy_and_uncertainty() -> None:
 
     assert selected.index.tolist() == [1]
     assert float(selected.iloc[0]["energy_score"]) > float(selected.iloc[0]["uncertainty_score"])
+
+
+def test_select_special_points_registers_selection_for_workflow_use() -> None:
+    frame = pd.DataFrame(
+        {
+            "x": [0.0, 1.0, 2.0],
+            "y": [0.0, 0.0, 0.0],
+            "z": [0.0, 0.0, 0.0],
+            "predicted_label": [0.0, -0.4, -0.1],
+            "uncertainty": [0.1, 0.2, 0.9],
+        }
+    )
+    maps = _build_maps(frame)
+
+    selected = maps.select_special_points(
+        npoints=1,
+        kind="adaptive",
+        iteration=3,
+        feature_columns=[],
+        energy_column="predicted_label",
+        uncertainty_column="uncertainty",
+        real_space_weight=0.0,
+        feature_space_weight=0.0,
+        energy_weight=2.0,
+        uncertainty_weight=1.0,
+    )
+
+    assert selected["point_index"].tolist() == [1]
+    assert selected["kind"].tolist() == ["adaptive"]
+    assert selected["iteration"].tolist() == [3]
+    assert selected["label_status"].tolist() == ["unlabeled"]
+    assert "selection_score" in selected.columns
+    assert "energy_score" in selected.columns
+
+    registry = maps.get_special_points(kind="adaptive")
+    assert registry["point_index"].tolist() == [1]
+
+
+def test_select_points_can_target_local_minima_instead_of_global_minimum() -> None:
+    frame = pd.DataFrame(
+        {
+            "x": [0.0, 1.0, 2.0],
+            "y": [0.0, 0.0, 0.0],
+            "z": [0.0, 0.0, 0.0],
+            "predicted_label": [-1.0, -0.5, -0.2],
+            "gx": [0.2, 0.0, 0.0],
+            "gy": [0.0, 0.0, 0.0],
+            "gz": [0.0, 0.0, 0.0],
+            "k1": [1.0, 2.0, -1.0],
+            "k2": [1.0, 3.0, 4.0],
+        }
+    )
+    maps = _build_maps(frame)
+
+    selected = maps.select_points(
+        npoints=1,
+        feature_columns=[],
+        energy_column="predicted_label",
+        real_space_weight=0.0,
+        feature_space_weight=0.0,
+        energy_weight=1.0,
+        uncertainty_weight=0.0,
+        energy_selection_mode="stationary",
+        gradient_columns=["gx", "gy", "gz"],
+        curvature_columns=["k1", "k2"],
+        stationary_orders=0,
+        gradient_tolerance=1.0e-8,
+        curvature_tolerance=1.0e-8,
+    )
+
+    assert selected.index.tolist() == [1]
+
+
+def test_select_points_can_target_minima_and_first_order_transition_states() -> None:
+    frame = pd.DataFrame(
+        {
+            "x": [0.0, 1.0, 2.0],
+            "y": [0.0, 0.0, 0.0],
+            "z": [0.0, 0.0, 0.0],
+            "predicted_label": [-1.0, -0.5, -0.4],
+            "grad_norm": [0.2, 0.0, 0.0],
+            "k1": [1.0, 2.0, -1.0],
+            "k2": [1.0, 3.0, 4.0],
+        }
+    )
+    maps = _build_maps(frame)
+
+    selected = maps.select_points(
+        npoints=2,
+        feature_columns=[],
+        energy_column="predicted_label",
+        real_space_weight=0.0,
+        feature_space_weight=0.0,
+        energy_weight=1.0,
+        uncertainty_weight=0.0,
+        energy_selection_mode="stationary",
+        gradient_norm_column="grad_norm",
+        curvature_columns=["k1", "k2"],
+        stationary_orders=[0, 1],
+        gradient_tolerance=1.0e-8,
+        curvature_tolerance=1.0e-8,
+    )
+
+    assert set(selected.index.tolist()) == {1, 2}

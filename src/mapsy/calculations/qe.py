@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import shlex
+from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
@@ -17,6 +18,26 @@ from .cluster import SlurmTemplate
 
 QE_RUNNER_RESULT = dict[str, Any]
 BOHR_TO_ANG = 0.529177210903
+ATTEMPT_PATTERN = re.compile(r"^(?P<stem>.+)\.r(?P<index>\d{3})(?P<suffix>\.[^.]+)$")
+
+
+def _with_attempt_suffix(filename: str, attempt_index: int) -> str:
+    if attempt_index <= 0:
+        return filename
+    path = Path(filename)
+    return f"{path.stem}.r{attempt_index:03d}{path.suffix}"
+
+
+def _attempt_index_from_name(filename: str, base_filename: str) -> int | None:
+    if filename == base_filename:
+        return 0
+    match = ATTEMPT_PATTERN.match(filename)
+    if match is None:
+        return None
+    base = Path(base_filename)
+    if match.group("stem") != base.stem or match.group("suffix") != base.suffix:
+        return None
+    return int(match.group("index"))
 
 
 @dataclass
@@ -188,6 +209,53 @@ class QuantumEspressoSetup:
         name_template = directory_template if template is None else template
         folder_name = name_template.format(point_index=point_index)
         return Path(root).expanduser() / folder_name
+
+    def attempt_filename(self, filename: str, attempt_index: int) -> str:
+        """Return the filename for a specific retry attempt."""
+        return _with_attempt_suffix(filename, attempt_index)
+
+    def attempt_path(self, directory: str | Path, filename: str, attempt_index: int) -> Path:
+        """Return the path for a specific retry attempt file."""
+        return Path(directory).expanduser() / self.attempt_filename(filename, attempt_index)
+
+    def attempt_outdir(self, qe_outdir: str | Path | None, attempt_index: int) -> Path | None:
+        """Return the attempt-specific QE outdir."""
+        if qe_outdir is None:
+            return None
+        path = Path(qe_outdir).expanduser()
+        if attempt_index <= 0:
+            return path
+        return path.with_name(_with_attempt_suffix(path.name, attempt_index))
+
+    def discover_attempt_indexes(
+        self,
+        directory: str | Path,
+        *,
+        output_filename: str | None = None,
+    ) -> list[int]:
+        """Return discovered attempt indexes for one job directory."""
+        directory_path = Path(directory).expanduser()
+        base_output = output_filename or self.output_filename
+        indexes: list[int] = []
+        for path in directory_path.iterdir() if directory_path.exists() else []:
+            if not path.is_file():
+                continue
+            index = _attempt_index_from_name(path.name, base_output)
+            if index is not None:
+                indexes.append(index)
+        return sorted(set(indexes))
+
+    def next_attempt_index(
+        self,
+        directory: str | Path,
+        *,
+        output_filename: str | None = None,
+    ) -> int:
+        """Return the next retry attempt index for one job directory."""
+        indexes = self.discover_attempt_indexes(directory, output_filename=output_filename)
+        if not indexes:
+            return 1
+        return max(indexes) + 1
 
     def add_single_atom_adsorbate(
         self,
@@ -374,6 +442,165 @@ class QuantumEspressoSetup:
 
         path.write_text("\n".join(output) + "\n")
 
+    def extract_last_atomic_positions_block(
+        self,
+        output_path: str | Path,
+    ) -> tuple[str, list[str]] | None:
+        """Extract the last ATOMIC_POSITIONS block from a QE output file."""
+        lines = Path(output_path).expanduser().read_text(errors="replace").splitlines()
+        atomic_re = re.compile(
+            r"^\s*ATOMIC_POSITIONS(?:\s*[\(\{]?\s*([A-Za-z_]+)\s*[\)\}]?)?",
+            re.IGNORECASE,
+        )
+        atom_re = re.compile(r"^\s*([A-Za-z]+)\s+([-\d.Ee+]+)\s+([-\d.Ee+]+)\s+([-\d.Ee+]+)")
+        blocks: list[tuple[str, list[str]]] = []
+        index = 0
+        while index < len(lines):
+            match = atomic_re.match(lines[index])
+            if match is None:
+                index += 1
+                continue
+            unit = (match.group(1) or "").strip().lower()
+            block_lines = [lines[index].strip()]
+            index += 1
+            while index < len(lines):
+                if atom_re.match(lines[index]) is None:
+                    break
+                block_lines.append(lines[index].strip())
+                index += 1
+            if len(block_lines) > 1:
+                blocks.append((unit, block_lines))
+        if not blocks:
+            return None
+        return blocks[-1]
+
+    def replace_atomic_positions_block(
+        self,
+        input_path: str | Path,
+        block_lines: Sequence[str],
+    ) -> None:
+        """Replace the first ATOMIC_POSITIONS block in a QE input file."""
+        path = Path(input_path).expanduser()
+        lines = path.read_text(errors="replace").splitlines()
+        atomic_re = re.compile(
+            r"^\s*ATOMIC_POSITIONS(?:\s*[\(\{]?\s*([A-Za-z_]+)\s*[\)\}]?)?",
+            re.IGNORECASE,
+        )
+        atom_re = re.compile(r"^\s*([A-Za-z]+)\s+([-\d.Ee+]+)\s+([-\d.Ee+]+)\s+([-\d.Ee+]+)")
+        output: list[str] = []
+        index = 0
+        replaced = False
+        while index < len(lines):
+            if not replaced and atomic_re.match(lines[index]) is not None:
+                output.extend(block_lines)
+                replaced = True
+                index += 1
+                while index < len(lines) and atom_re.match(lines[index]) is not None:
+                    index += 1
+                continue
+            output.append(lines[index])
+            index += 1
+        if not replaced:
+            output.extend(["", *block_lines])
+        path.write_text("\n".join(output) + "\n")
+
+    def prepare_retry_from_previous_attempt(
+        self,
+        point_index: int,
+        *,
+        scheduler_template: SlurmTemplate,
+        directory_template: str = "qe_job_{point_index}",
+        job_name_template: str = "qe-retry-{point_index}",
+        workdir_root: str | Path | None = None,
+        outdir_root: str | Path | None = None,
+        outdir_template: str | None = None,
+        submit: bool = False,
+        subprocess_run: Callable[..., Any] | None = None,
+        update_positions_from_output: bool = False,
+    ) -> QE_RUNNER_RESULT:
+        """Prepare a retry attempt from the latest attempt files in a job directory."""
+        workdir = self.resolve_workdir(
+            point_index,
+            directory_template=directory_template,
+            workdir_root=workdir_root,
+        )
+        workdir.mkdir(parents=True, exist_ok=True)
+        latest_indexes = self.discover_attempt_indexes(
+            workdir, output_filename=self.output_filename
+        )
+        if not latest_indexes:
+            raise FileNotFoundError(f"No previous QE output files found in {workdir}.")
+        latest_index = max(latest_indexes)
+        next_index = latest_index + 1
+
+        source_input = self.attempt_path(workdir, self.input_filename, latest_index)
+        source_output = self.attempt_path(workdir, self.output_filename, latest_index)
+        if not source_input.exists():
+            raise FileNotFoundError(f"Missing source QE input file {source_input}.")
+        if not source_output.exists():
+            raise FileNotFoundError(f"Missing source QE output file {source_output}.")
+
+        retry_input = self.attempt_path(workdir, self.input_filename, next_index)
+        retry_output = self.attempt_path(workdir, self.output_filename, next_index)
+        retry_script = self.attempt_path(workdir, scheduler_template.script_name, next_index)
+
+        retry_input.write_text(source_input.read_text(errors="replace"))
+
+        if update_positions_from_output:
+            block = self.extract_last_atomic_positions_block(source_output)
+            if block is None:
+                raise ValueError(f"No ATOMIC_POSITIONS block found in {source_output}.")
+            _, block_lines = block
+            self.replace_atomic_positions_block(retry_input, block_lines)
+
+        base_outdir = self.resolve_outdir(
+            point_index,
+            directory_template=directory_template,
+            outdir_root=outdir_root,
+            outdir_template=outdir_template,
+        )
+        retry_outdir = self.attempt_outdir(base_outdir, next_index)
+        if retry_outdir is not None:
+            retry_outdir.mkdir(parents=True, exist_ok=True)
+            self.ensure_input_outdir(retry_input, retry_outdir)
+
+        scheduler_for_job = scheduler_template
+        if retry_outdir is not None:
+            mkdir_outdir = f"mkdir -p {shlex.quote(str(retry_outdir))}"
+            if mkdir_outdir not in scheduler_template.setup_commands:
+                scheduler_for_job = replace(
+                    scheduler_template,
+                    setup_commands=[*scheduler_template.setup_commands, mkdir_outdir],
+                )
+        script_path = scheduler_for_job.write(
+            workdir,
+            self.run_command(
+                input_filename=retry_input.name,
+                output_filename=retry_output.name,
+            ),
+            job_name=job_name_template.format(point_index=point_index, attempt=next_index),
+            filename=retry_script.name,
+        )
+
+        metadata: QE_RUNNER_RESULT = {
+            "label_file": str(workdir),
+            "qe_outdir": str(retry_outdir) if retry_outdir is not None else None,
+            "submit_script": str(script_path),
+            "latest_output_file": str(retry_output),
+            "retry_attempt_index": next_index,
+            "label_status": "unlabeled",
+            "label_error": None,
+            "scheduler": "slurm",
+        }
+        if submit:
+            metadata.update(
+                scheduler_for_job.submit(
+                    script_path,
+                    subprocess_run=subprocess_run,
+                )
+            )
+        return metadata
+
     def prepare_single_calculation(
         self,
         point_index: int,
@@ -550,10 +777,67 @@ class QuantumEspressoSetup:
 
         return runner
 
+    def build_retry_runner(
+        self,
+        *,
+        scheduler_template: SlurmTemplate,
+        directory_template: str = "qe_job_{point_index}",
+        job_name_template: str = "qe-retry-{point_index}-r{attempt:03d}",
+        workdir_root: str | Path | None = None,
+        outdir_root: str | Path | None = None,
+        outdir_template: str | None = None,
+        submit: bool = False,
+        subprocess_run: Callable[..., Any] | None = None,
+        update_positions_from_output: bool = False,
+    ) -> Callable[..., QE_RUNNER_RESULT]:
+        """Build a CalculationWorkflow runner that prepares a retry from previous attempt files."""
+
+        def runner(*, maps: Any, workflow: Any, special_point: Any, **_: Any) -> QE_RUNNER_RESULT:
+            point_index = int(special_point["point_index"])
+            return self.prepare_retry_from_previous_attempt(
+                point_index,
+                scheduler_template=scheduler_template,
+                directory_template=directory_template,
+                job_name_template=job_name_template,
+                workdir_root=workdir_root,
+                outdir_root=outdir_root,
+                outdir_template=outdir_template,
+                submit=submit,
+                subprocess_run=subprocess_run,
+                update_positions_from_output=update_positions_from_output,
+            )
+
+        return runner
+
+    def build_relax_retry_runner(
+        self,
+        *,
+        scheduler_template: SlurmTemplate,
+        directory_template: str = "qe_job_{point_index}",
+        job_name_template: str = "qe-relax-retry-{point_index}-r{attempt:03d}",
+        workdir_root: str | Path | None = None,
+        outdir_root: str | Path | None = None,
+        outdir_template: str | None = None,
+        submit: bool = False,
+        subprocess_run: Callable[..., Any] | None = None,
+    ) -> Callable[..., QE_RUNNER_RESULT]:
+        """Build a retry runner that seeds the next input from the last relax geometry."""
+        return self.build_retry_runner(
+            scheduler_template=scheduler_template,
+            directory_template=directory_template,
+            job_name_template=job_name_template,
+            workdir_root=workdir_root,
+            outdir_root=outdir_root,
+            outdir_template=outdir_template,
+            submit=submit,
+            subprocess_run=subprocess_run,
+            update_positions_from_output=True,
+        )
+
 
 @dataclass
-class QuantumEspressoOutputParser:
-    """Parser for common QE output metrics, usable as a CalculationWorkflow parser."""
+class _QuantumEspressoParserBase(ABC):
+    """Shared QE parsing helpers for workflow-facing parser classes."""
 
     iteration: int = 1
     pwo_name: str = "espresso.pwo"
@@ -597,6 +881,21 @@ class QuantumEspressoOutputParser:
         init=False,
         default=re.compile(r"!\s+total energy\s*=\s*([-\d.]+)\s*Ry\b", re.IGNORECASE),
     )
+    re_total_force: re.Pattern[str] = field(
+        init=False,
+        default=re.compile(r"total force\s*=\s*([-\d.Ee+]+)", re.IGNORECASE),
+    )
+    re_force_header: re.Pattern[str] = field(
+        init=False,
+        default=re.compile(r"^\s*forces acting on atoms", re.IGNORECASE),
+    )
+    re_force_atom: re.Pattern[str] = field(
+        init=False,
+        default=re.compile(
+            r"^\s*atom\s+\d+\s+type\s+\d+\s+force\s*=\s*([-\d.Ee+]+)\s+([-\d.Ee+]+)\s+([-\d.Ee+]+)",
+            re.IGNORECASE,
+        ),
+    )
     re_celldm1: re.Pattern[str] = field(
         init=False,
         default=re.compile(r"celldm\s*\(\s*1\s*\)\s*=\s*([-\d.Ee+]+)", re.IGNORECASE),
@@ -616,44 +915,12 @@ class QuantumEspressoOutputParser:
         ),
     )
 
+    @abstractmethod
+    def parse(self, output_file: str | Path) -> dict[str, Any]:
+        """Parse one QE output directory/file into workflow metadata."""
+
     def __call__(self, output_file: str | Path, **_: Any) -> dict[str, Any]:
         return self.parse(output_file)
-
-    def parse(self, output_file: str | Path) -> dict[str, Any]:
-        """Parse one QE work directory or one QE output file into structured metrics."""
-        folder, pwi_path, pwo_path = self._resolve_paths(output_file)
-
-        energy_iter, accuracy_iter = self.scf_metrics_at_iteration(
-            pwo_path, iteration=self.iteration
-        )
-        energy_first, energy_last = self.converged_energies_first_last(pwo_path)
-        pwo_lines = self._read_lines(pwo_path)
-        alat_angstrom = self._extract_alat_angstrom_from_pwo(pwo_lines)
-
-        input_coordinates = self.last_atom_input_coordinates_from_pwi(
-            pwi_path,
-            fallback_alat_angstrom=alat_angstrom,
-        )
-        final_coordinates = self.last_atom_final_coordinates_from_pwo(pwo_path)
-        ionic_steps = self.ionic_steps_from_pwo(pwo_path)
-        relax_converged = self.relaxation_converged(pwo_path)
-
-        label = self.adsorbate_label
-        return {
-            "label_file": str(folder),
-            f"E_iter{self.iteration}_Ry": energy_iter,
-            f"acc_iter{self.iteration}_Ry": accuracy_iter,
-            "E_after_first_SCF_Ry": energy_first,
-            "E_end_BFGS_Ry": energy_last,
-            f"x_{label}_input_A": input_coordinates[0],
-            f"y_{label}_input_A": input_coordinates[1],
-            f"z_{label}_input_A": input_coordinates[2],
-            f"x_{label}_last_A": final_coordinates[0],
-            f"y_{label}_last_A": final_coordinates[1],
-            f"z_{label}_last_A": final_coordinates[2],
-            "n_ionic_steps": ionic_steps,
-            "relax_converged": relax_converged,
-        }
 
     def collect(
         self,
@@ -716,6 +983,44 @@ class QuantumEspressoOutputParser:
 
         return (energy, accuracy)
 
+    def scf_metrics_first_below_accuracy(
+        self,
+        pwo_path: Path,
+        *,
+        accuracy_threshold: float,
+    ) -> tuple[int | None, float, float]:
+        if not pwo_path.exists():
+            return (None, np.nan, np.nan)
+
+        current_iteration: int | None = None
+        current_energy = np.nan
+        current_accuracy = np.nan
+
+        with pwo_path.open("r", errors="replace") as handle:
+            for line in handle:
+                match_iteration = self.re_iter.match(line)
+                if match_iteration:
+                    current_iteration = int(match_iteration.group(1))
+                    current_energy = np.nan
+                    current_accuracy = np.nan
+                    continue
+
+                if current_iteration is None:
+                    continue
+
+                match_energy = self.re_energy.match(line)
+                if match_energy:
+                    current_energy = float(match_energy.group(1))
+                    continue
+
+                match_accuracy = self.re_accuracy.match(line)
+                if match_accuracy:
+                    current_accuracy = float(match_accuracy.group(1))
+                    if current_accuracy < accuracy_threshold:
+                        return (current_iteration, current_energy, current_accuracy)
+
+        return (None, np.nan, np.nan)
+
     def converged_energies_first_last(self, pwo_path: Path) -> tuple[float, float]:
         if not pwo_path.exists():
             return (np.nan, np.nan)
@@ -732,6 +1037,36 @@ class QuantumEspressoOutputParser:
                     energy_first = value
                 energy_last = value
         return (energy_first, energy_last)
+
+    def converged_energy_history(self, pwo_path: Path) -> np.ndarray:
+        if not pwo_path.exists():
+            return np.zeros(0, dtype=float)
+
+        energies: list[float] = []
+        with pwo_path.open("r", errors="replace") as handle:
+            for line in handle:
+                match = self.re_energy_converged.search(line)
+                if match:
+                    energies.append(float(match.group(1)))
+        return np.array(energies, dtype=float)
+
+    def scf_iteration_count(self, pwo_path: Path) -> int:
+        if not pwo_path.exists():
+            return 0
+        count = 0
+        with pwo_path.open("r", errors="replace") as handle:
+            for line in handle:
+                if self.re_iter.match(line):
+                    count += 1
+        return count
+
+    def total_forces_first_last(self, pwo_path: Path) -> tuple[float, float]:
+        if not pwo_path.exists():
+            return (np.nan, np.nan)
+        forces = self._parse_total_forces(self._read_lines(pwo_path))
+        if not forces:
+            return (np.nan, np.nan)
+        return (forces[0], forces[-1])
 
     def last_atom_input_coordinates_from_pwi(
         self,
@@ -784,16 +1119,66 @@ class QuantumEspressoOutputParser:
             alat_angstrom=alat_angstrom,
         )
 
+    def last_atom_coordinates_history_from_pwo(self, pwo_path: Path) -> np.ndarray:
+        if not pwo_path.exists():
+            return np.zeros((0, 3), dtype=float)
+
+        lines = self._read_lines(pwo_path)
+        alat_angstrom = self._extract_alat_angstrom_from_pwo(lines)
+        blocks = self._parse_atomic_positions_blocks(lines)
+        if not blocks:
+            return np.zeros((0, 3), dtype=float)
+
+        coordinates = [
+            self._last_atom_coordinates_from_block_angstrom(
+                block,
+                alat_angstrom=alat_angstrom,
+            )
+            for block in blocks
+        ]
+        return np.vstack(coordinates).astype(float)
+
     def ionic_steps_from_pwo(self, pwo_path: Path) -> int:
         if not pwo_path.exists():
             return 0
         return len(self._parse_atomic_positions_blocks(self._read_lines(pwo_path)))
+
+    def adsorbate_forces_first_last(
+        self,
+        pwo_path: Path,
+        pwi_path: Path,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if not pwo_path.exists():
+            nan_force = np.full(3, np.nan, dtype=float)
+            return (nan_force, nan_force.copy())
+
+        index = self.adsorbate_atom_index_from_pwi(pwi_path)
+        blocks = self._parse_force_blocks(self._read_lines(pwo_path))
+        if not blocks:
+            nan_force = np.full(3, np.nan, dtype=float)
+            return (nan_force, nan_force.copy())
+
+        first = self._adsorbate_force_from_block(blocks[0], index=index)
+        last = self._adsorbate_force_from_block(blocks[-1], index=index)
+        return (first, last)
 
     def relaxation_converged(self, pwo_path: Path) -> bool:
         if not pwo_path.exists():
             return False
         with pwo_path.open("r", errors="replace") as handle:
             return any(self.re_relax_converged.search(line) for line in handle)
+
+    def adsorbate_atom_index_from_pwi(self, pwi_path: Path) -> int:
+        if not pwi_path.exists():
+            return -1
+        block = self._parse_atomic_positions_first_block(self._read_lines(pwi_path))
+        if block is None:
+            return -1
+        symbols = list(block["symbols"])
+        matches = [index for index, symbol in enumerate(symbols) if symbol == self.adsorbate_label]
+        if matches:
+            return matches[-1]
+        return len(symbols) - 1
 
     def _resolve_paths(self, output_file: str | Path) -> tuple[Path, Path, Path]:
         path = Path(output_file).expanduser()
@@ -901,6 +1286,52 @@ class QuantumEspressoOutputParser:
                 )
         return blocks
 
+    def _parse_total_forces(self, lines: list[str]) -> list[float]:
+        forces = []
+        for line in lines:
+            match = self.re_total_force.search(line)
+            if match:
+                forces.append(float(match.group(1)))
+        return forces
+
+    def _parse_force_blocks(self, lines: list[str]) -> list[np.ndarray]:
+        blocks: list[np.ndarray] = []
+        index = 0
+        while index < len(lines):
+            if not self.re_force_header.match(lines[index]):
+                index += 1
+                continue
+
+            index += 1
+            forces: list[list[float]] = []
+            while index < len(lines):
+                match = self.re_force_atom.match(lines[index])
+                if match:
+                    forces.append(
+                        [
+                            float(match.group(1)),
+                            float(match.group(2)),
+                            float(match.group(3)),
+                        ]
+                    )
+                    index += 1
+                    continue
+                if forces:
+                    break
+                index += 1
+            if forces:
+                blocks.append(np.array(forces, dtype=float))
+        return blocks
+
+    @staticmethod
+    def _adsorbate_force_from_block(block: np.ndarray, *, index: int) -> np.ndarray:
+        if block.size == 0:
+            return np.full(3, np.nan, dtype=float)
+        resolved_index = index
+        if resolved_index < 0 or resolved_index >= block.shape[0]:
+            resolved_index = block.shape[0] - 1
+        return np.array(block[resolved_index], dtype=float)
+
     @staticmethod
     def _last_atom_coordinates_from_block_angstrom(
         block: dict[str, Any] | None,
@@ -928,3 +1359,194 @@ class QuantumEspressoOutputParser:
                 return np.full(3, np.nan, dtype=float)
             return cast(np.ndarray, coords @ cell_angstrom)
         return np.full(3, np.nan, dtype=float)
+
+
+@dataclass
+class QuantumEspressoScfParser(_QuantumEspressoParserBase):
+    """Parser for QE SCF-oriented outputs without geometry bookkeeping."""
+
+    accuracy_threshold: float | None = None
+
+    def parse(self, output_file: str | Path) -> dict[str, Any]:
+        folder, _, pwo_path = self._resolve_paths(output_file)
+        energy_first, energy_last = self.converged_energies_first_last(pwo_path)
+        parsed = {
+            "label_file": str(folder),
+            "E_converged_first_Ry": energy_first,
+            "E_converged_last_Ry": energy_last,
+            "n_scf_iterations": self.scf_iteration_count(pwo_path),
+        }
+        if self.accuracy_threshold is None:
+            energy_iter, accuracy_iter = self.scf_metrics_at_iteration(
+                pwo_path, iteration=self.iteration
+            )
+            parsed[f"E_iter{self.iteration}_Ry"] = energy_iter
+            parsed[f"acc_iter{self.iteration}_Ry"] = accuracy_iter
+        else:
+            match_iteration, match_energy, match_accuracy = self.scf_metrics_first_below_accuracy(
+                pwo_path,
+                accuracy_threshold=self.accuracy_threshold,
+            )
+            parsed["scf_accuracy_threshold_Ry"] = self.accuracy_threshold
+            parsed["first_iteration_below_accuracy_threshold"] = match_iteration
+            parsed["E_first_below_accuracy_threshold_Ry"] = match_energy
+            parsed["acc_first_below_accuracy_threshold_Ry"] = match_accuracy
+        return parsed
+
+
+@dataclass
+class QuantumEspressoRelaxParser(_QuantumEspressoParserBase):
+    """Parser for QE relax outputs focused on ionic-step energies, forces, and geometry."""
+
+    mark_unconverged_as_failed: bool = True
+
+    def parse(self, output_file: str | Path) -> dict[str, Any]:
+        folder, pwi_path, pwo_path = self._resolve_paths(output_file)
+        pwo_lines = self._read_lines(pwo_path)
+        alat_angstrom = self._extract_alat_angstrom_from_pwo(pwo_lines)
+        input_coordinates = self.last_atom_input_coordinates_from_pwi(
+            pwi_path,
+            fallback_alat_angstrom=alat_angstrom,
+        )
+        final_coordinates = self.last_atom_final_coordinates_from_pwo(pwo_path)
+        coordinates_history = self.last_atom_coordinates_history_from_pwo(pwo_path)
+        energy_first, energy_last = self.converged_energies_first_last(pwo_path)
+        energy_history = self.converged_energy_history(pwo_path)
+        total_force_first, total_force_last = self.total_forces_first_last(pwo_path)
+        adsorbate_force_first, adsorbate_force_last = self.adsorbate_forces_first_last(
+            pwo_path,
+            pwi_path,
+        )
+        relax_converged = self.relaxation_converged(pwo_path)
+        label = self.adsorbate_label
+        parsed = {
+            "label_file": str(folder),
+            "E_bfgs_initial_Ry": energy_first,
+            "E_bfgs_final_Ry": energy_last,
+            "E_bfgs_steps_Ry": energy_history,
+            "F_bfgs_initial_total_Ry_au": total_force_first,
+            "F_bfgs_final_total_Ry_au": total_force_last,
+            f"fx_{label}_initial_Ry_au": adsorbate_force_first[0],
+            f"fy_{label}_initial_Ry_au": adsorbate_force_first[1],
+            f"fz_{label}_initial_Ry_au": adsorbate_force_first[2],
+            f"f_{label}_initial_abs_Ry_au": float(np.linalg.norm(adsorbate_force_first)),
+            f"fx_{label}_final_Ry_au": adsorbate_force_last[0],
+            f"fy_{label}_final_Ry_au": adsorbate_force_last[1],
+            f"fz_{label}_final_Ry_au": adsorbate_force_last[2],
+            f"f_{label}_final_abs_Ry_au": float(np.linalg.norm(adsorbate_force_last)),
+            f"x_{label}_input_A": input_coordinates[0],
+            f"y_{label}_input_A": input_coordinates[1],
+            f"z_{label}_input_A": input_coordinates[2],
+            f"x_{label}_final_A": final_coordinates[0],
+            f"y_{label}_final_A": final_coordinates[1],
+            f"z_{label}_final_A": final_coordinates[2],
+            f"{label}_positions_bfgs_A": coordinates_history,
+            f"x_{label}_bfgs_steps_A": (
+                coordinates_history[:, 0] if coordinates_history.size else np.zeros(0, dtype=float)
+            ),
+            f"y_{label}_bfgs_steps_A": (
+                coordinates_history[:, 1] if coordinates_history.size else np.zeros(0, dtype=float)
+            ),
+            f"z_{label}_bfgs_steps_A": (
+                coordinates_history[:, 2] if coordinates_history.size else np.zeros(0, dtype=float)
+            ),
+            "n_ionic_steps": self.ionic_steps_from_pwo(pwo_path),
+            "relax_converged": relax_converged,
+        }
+        if self.mark_unconverged_as_failed and not relax_converged:
+            parsed["label_status"] = "failed"
+            parsed["label_error"] = (
+                "Relax calculation did not converge: missing 'End of BFGS Geometry Optimization' "
+                f"marker in {pwo_path.name}."
+            )
+        return parsed
+
+
+@dataclass
+class QuantumEspressoMultiRelaxParser(_QuantumEspressoParserBase):
+    """Retry-aware parser for relax jobs with one or more attempt files in one directory."""
+
+    mark_unconverged_as_failed: bool = True
+    include_attempt_summaries: bool = True
+
+    def parse(self, output_file: str | Path) -> dict[str, Any]:
+        folder, _, _ = self._resolve_paths(output_file)
+        attempt_indexes = self._attempt_indexes_from_folder(folder)
+        if not attempt_indexes:
+            attempt_indexes = [0]
+
+        attempt_results: list[tuple[int, dict[str, Any]]] = []
+        for attempt_index in attempt_indexes:
+            parser = QuantumEspressoRelaxParser(
+                iteration=self.iteration,
+                pwo_name=_with_attempt_suffix(self.pwo_name, attempt_index),
+                pwi_name=_with_attempt_suffix(self.pwi_name, attempt_index),
+                adsorbate_label=self.adsorbate_label,
+                mark_unconverged_as_failed=False,
+            )
+            attempt_results.append((attempt_index, parser.parse(folder)))
+
+        latest_attempt_index, latest_attempt = attempt_results[-1]
+        converged_attempts = [
+            (attempt_index, parsed)
+            for attempt_index, parsed in attempt_results
+            if bool(parsed.get("relax_converged"))
+        ]
+        if converged_attempts:
+            selected_attempt_index, selected_attempt = converged_attempts[-1]
+        else:
+            selected_attempt_index, selected_attempt = latest_attempt_index, latest_attempt
+
+        parsed = dict(selected_attempt)
+        parsed["label_file"] = str(folder)
+        parsed["n_relax_attempts"] = len(attempt_results)
+        parsed["latest_attempt_index"] = latest_attempt_index
+        parsed["selected_attempt_index"] = selected_attempt_index
+        parsed["selected_output_file"] = str(
+            folder / _with_attempt_suffix(self.pwo_name, selected_attempt_index)
+        )
+        parsed["selected_input_file"] = str(
+            folder / _with_attempt_suffix(self.pwi_name, selected_attempt_index)
+        )
+
+        if self.include_attempt_summaries:
+            for attempt_index, attempt_parsed in attempt_results:
+                prefix = f"attempt_{attempt_index:03d}"
+                parsed[f"{prefix}_output_file"] = str(
+                    folder / _with_attempt_suffix(self.pwo_name, attempt_index)
+                )
+                parsed[f"{prefix}_input_file"] = str(
+                    folder / _with_attempt_suffix(self.pwi_name, attempt_index)
+                )
+                parsed[f"{prefix}_relax_converged"] = bool(
+                    attempt_parsed.get("relax_converged", False)
+                )
+                parsed[f"{prefix}_n_ionic_steps"] = attempt_parsed.get("n_ionic_steps")
+                parsed[f"{prefix}_E_bfgs_final_Ry"] = attempt_parsed.get("E_bfgs_final_Ry")
+                if "label_error" in attempt_parsed:
+                    parsed[f"{prefix}_label_error"] = attempt_parsed["label_error"]
+
+        if self.mark_unconverged_as_failed and not converged_attempts:
+            latest_output_name = _with_attempt_suffix(self.pwo_name, latest_attempt_index)
+            parsed["label_status"] = "failed"
+            parsed["label_error"] = (
+                "Relax calculation did not converge in any attempt: missing "
+                f"'End of BFGS Geometry Optimization' marker through {latest_output_name}."
+            )
+        else:
+            parsed.pop("label_status", None)
+            parsed.pop("label_error", None)
+
+        return parsed
+
+    def _attempt_indexes_from_folder(self, folder: Path) -> list[int]:
+        indexes: list[int] = []
+        if not folder.exists():
+            return indexes
+        for path in folder.iterdir():
+            if not path.is_file():
+                continue
+            attempt_index = _attempt_index_from_name(path.name, self.pwo_name)
+            if attempt_index is not None:
+                indexes.append(attempt_index)
+        return sorted(set(indexes))
