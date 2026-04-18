@@ -84,7 +84,12 @@ class SpecialPointRegistry:
                 continue
 
             if indexes.size == 1:
-                rows.loc[:, key] = pd.Series([value], dtype=object)
+                values = np.asarray(value, dtype=object).reshape(-1)
+                if values.size != 1:
+                    raise ValueError(
+                        f"Metadata column {key!r} has length {values.size}, expected {indexes.size}."
+                    )
+                rows.loc[:, key] = values[0]
                 continue
 
             values = np.asarray(value)
@@ -155,9 +160,12 @@ class SpecialPointRegistry:
                 continue
 
             if count == 1:
-                self._data.loc[mask, key] = pd.Series(
-                    [value], index=self._data.index[mask], dtype=object
-                )
+                values = np.asarray(value, dtype=object).reshape(-1)
+                if values.size != 1:
+                    raise ValueError(
+                        f"Metadata column {key!r} has length {values.size}, expected {count}."
+                    )
+                self._data.loc[mask, key] = values[0]
                 continue
 
             values = np.asarray(value, dtype=object).reshape(-1)
