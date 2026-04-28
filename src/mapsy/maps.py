@@ -13,15 +13,15 @@ from matplotlib.axes import Axes
 from matplotlib.figure import Figure
 from matplotlib.gridspec import GridSpec
 from matplotlib.ticker import MultipleLocator
-from sklearn.cluster import SpectralClustering
-from sklearn.decomposition import PCA
-from sklearn.metrics import davies_bouldin_score, silhouette_score
 from sklearn.preprocessing import StandardScaler
 from yaml import SafeLoader, load
 
+from mapsy.analysis import fit_clusters, fit_pca_analysis, project_pca, screen_clusters
 from mapsy.boundaries import ContactSpace
 from mapsy.boundaries.ionic import IonicGeometry
+from mapsy.clustering import clustering_uses_random_state, normalize_cluster_method
 from mapsy.data import ScalarField, System
+from mapsy.results import ClusterResult, ClusterScreeningResult, PCAAnalysisResult, PCAResult
 from mapsy.symfunc.symmetryfunction import SymmetryFunction
 from mapsy.utils import full2chunk, multiproc
 
@@ -84,12 +84,7 @@ class SpecialPointRegistry:
                 continue
 
             if indexes.size == 1:
-                values = np.asarray(value, dtype=object).reshape(-1)
-                if values.size != 1:
-                    raise ValueError(
-                        f"Metadata column {key!r} has length {values.size}, expected {indexes.size}."
-                    )
-                rows.loc[:, key] = values[0]
+                rows.loc[:, key] = pd.Series([value], dtype=object)
                 continue
 
             values = np.asarray(value)
@@ -160,12 +155,11 @@ class SpecialPointRegistry:
                 continue
 
             if count == 1:
-                values = np.asarray(value, dtype=object).reshape(-1)
-                if values.size != 1:
-                    raise ValueError(
-                        f"Metadata column {key!r} has length {values.size}, expected {count}."
-                    )
-                self._data.loc[mask, key] = values[0]
+                self._data.loc[mask, key] = pd.Series(
+                    [value],
+                    index=self._data.index[mask],
+                    dtype=object,
+                )
                 continue
 
             values = np.asarray(value, dtype=object).reshape(-1)
@@ -235,8 +229,13 @@ class Maps:
     features: list[str] = []
 
     npca: int | None = None
+    pca_analysis_result: PCAAnalysisResult | None = None
+    pca_result: PCAResult | None = None
 
     nclusters: int = 0
+    cluster_method: str = "spectral"
+    cluster_screening_method: str | None = None
+    cluster_result: ClusterResult | None = None
     cluster_centers: npt.NDArray[np.float64] | None = None
     cluster_graph: npt.NDArray[np.int64] | None = None
     cluster_edges: npt.NDArray[np.int64] | None = None
@@ -816,48 +815,30 @@ class Maps:
         data[self.contactspace.mask] = f
         return ScalarField(self.contactspace.grid, data=data)
 
-    def reduce(
-        self, npca: int | None = None, scale: bool = False
-    ) -> tuple[Figure, AxesLike, AxesLike] | None:
+    def analyze_pca(self, scale: bool = False) -> PCAAnalysisResult:
         # Check that contact space exists
         if self.contactspace is None:
-            raise RuntimeError("Trying to use maps.reduce() without contact space")
+            raise RuntimeError("Trying to use maps.analyze_pca() without contact space")
         # Check that contact space maps have been generated
         if self.data is None:
             raise RuntimeError("No contact space data available.")
-        features = self.data[self.features].values.astype(np.float64)
-        if scale:
-            features = StandardScaler().fit_transform(features)
-        # Initialize PCA
-        if npca is not None:
-            self.npca = npca
-            pca = PCA(npca)
-            # Generate labels for the PCA features
-            pca_features = [f"pca{i:1d}" for i in range(npca)]
-            # Perform PCA on the data
-            self.data[pca_features] = pca.fit_transform(features)
-            return None
-        else:
-            pca = PCA()
-            pca.fit(features)
-            explained_variance = np.cumsum(pca.explained_variance_ratio_)
-            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
-            ax1.plot(range(1, len(explained_variance) + 1), explained_variance, marker="o")
-            ax1.set_xlabel("Number of Components")
-            ax1.set_ylabel("Cumulative Explained Variance")
-            ax1.grid(True)
-            ax1.set_title("Optimal Number of Components in PCA")
-            ax1.axhline(y=0.98, color="r", linestyle="--")  # Optional: line at 90% variance
-            ax2.plot(
-                range(1, len(pca.explained_variance_ratio_) + 1),
-                pca.explained_variance_ratio_,
-                marker="o",
-            )
-            ax2.set_xlabel("Number of Components")
-            ax2.set_ylabel("Explained Variance Ratio")
-            ax2.set_title("Scree Plot")
-            ax2.grid(True)
-            return fig, ax1, ax2
+        X = self.data[self.features].values.astype(np.float64)
+        result = fit_pca_analysis(X, feature_columns=list(self.features), scale=scale)
+        self.pca_analysis_result = result
+        return result
+
+    def reduce(self, npca: int | None = None, scale: bool = False) -> PCAAnalysisResult | PCAResult:
+        if npca is None:
+            return self.analyze_pca(scale=scale)
+        if self.data is None:
+            raise RuntimeError("No contact space data available.")
+        analysis = self.analyze_pca(scale=scale)
+        data = self.data
+        result = project_pca(analysis, data[self.features].values.astype(np.float64), npca=npca)
+        self.npca = npca
+        self.pca_result = result
+        data.loc[:, result.transformed_columns] = result.transformed_values
+        return result
 
     def graph(self, clusters: npt.NDArray[np.int64]) -> npt.NDArray[np.int64]:
         # Check that contact space exists
@@ -880,11 +861,12 @@ class Maps:
         self,
         nclusters: int | None = None,
         features: list[str] | None = None,
+        method: str = "spectral",
         maxclusters: int = 20,
         ntries: int = 1,
         random_state: int | None = None,
         scale: bool = False,
-    ) -> tuple[Figure, AxesLike, AxesLike] | None:
+    ) -> ClusterResult | ClusterScreeningResult:
         """ """
         # Check that contact space exists
         if self.contactspace is None:
@@ -897,13 +879,18 @@ class Maps:
             self.cluster_features = self.features
         else:
             self.cluster_features = features
+        self.cluster_method = normalize_cluster_method(method)
         X = self.data[self.cluster_features].values.astype(np.float64)
-        if scale:
-            X = StandardScaler().fit_transform(X)
         if nclusters is not None:
-            if random_state is None:
+            if not clustering_uses_random_state(self.cluster_method):
+                self.random_state = 0
+            elif random_state is None:
                 # If we performed a screening, use the best random state
-                if self.best_clusters is not None:
+                if (
+                    self.best_clusters is not None
+                    and self.cluster_screening_method == self.cluster_method
+                    and clustering_uses_random_state(self.cluster_method)
+                ):
                     if nclusters in self.best_clusters["nclusters"].values:
                         self.random_state = self.best_clusters[
                             self.best_clusters["nclusters"] == nclusters
@@ -919,93 +906,65 @@ class Maps:
             else:
                 self.random_state = random_state
                 logger.info(f"Use given random state = {self.random_state}")
-            labels = SpectralClustering(
-                n_clusters=nclusters, random_state=self.random_state
-            ).fit_predict(X)
-            self.data["Cluster"] = labels
+            effective_random_state = (
+                int(self.random_state)
+                if clustering_uses_random_state(self.cluster_method)
+                else None
+            )
+            screening_result = (
+                ClusterScreeningResult(
+                    method=self.cluster_method,
+                    feature_columns=list(self.cluster_features),
+                    scale=scale,
+                    table=self.cluster_screening.copy(),
+                    best_by_db=self.best_clusters.copy(),
+                    best_by_silhouette=self.cluster_screening.loc[
+                        self.cluster_screening.groupby("nclusters")["silhouette_score"].idxmax()
+                    ].copy(),
+                )
+                if self.cluster_screening is not None
+                and self.best_clusters is not None
+                and self.cluster_screening_method == self.cluster_method
+                else None
+            )
+            result = fit_clusters(
+                X,
+                feature_columns=list(self.cluster_features),
+                nclusters=nclusters,
+                method=self.cluster_method,
+                random_state=effective_random_state,
+                scale=scale,
+                screening=screening_result,
+            )
+            self.data["Cluster"] = result.labels
             # Store number of clusters
             self.nclusters = nclusters
+            self.cluster_result = result
             # Compute the cluster centers in features space
-            self.cluster_centers = (
-                self.data.groupby("Cluster")[self.cluster_features].mean().values.astype(np.float64)
-            )
+            self.cluster_centers = result.centers
             # Compute the number of points in each cluster
-            self.cluster_sizes = self.data.groupby("Cluster").size().values
+            self.cluster_sizes = result.sizes
             # Generate clusters connectivity matrix
-            self.cluster_graph = self.graph(self.data["Cluster"])
+            self.cluster_graph = self.graph(result.labels)
             self.cluster_edges = self.cluster_graph.copy()
             for i in range(nclusters):
                 self.cluster_edges[i, i] = 0
-            return None
+            result.graph = self.cluster_graph
+            result.edges = self.cluster_edges
+            return result
         else:
-            cluster_range = range(2, maxclusters)
-            cluster_random_states = []
-            cluster_sizes = []
-            silhouette_scores = []
-            db_indexes = []
-            # Loop over different numbers of clusters
-            for nclusters in cluster_range:
-                random_states = np.random.randint(0, 1000, ntries)
-                for random_state in random_states:
-                    cluster_random_states.append(random_state)
-                    labels = SpectralClustering(
-                        n_clusters=nclusters, random_state=random_state
-                    ).fit_predict(X)
-                    actual_nclusters = len(np.unique(labels))
-                    cluster_sizes.append(actual_nclusters)
-                    score = silhouette_score(X, labels)
-                    silhouette_scores.append(score)
-                    index = davies_bouldin_score(X, labels)
-                    db_indexes.append(index)
-            # Store all clusters data
-            self.cluster_screening = pd.DataFrame(
-                {
-                    "nclusters": cluster_sizes,
-                    "random_state": cluster_random_states,
-                    "silhouette_score": silhouette_scores,
-                    "db_index": db_indexes,
-                }
+            screening = screen_clusters(
+                X,
+                feature_columns=list(self.cluster_features),
+                method=self.cluster_method,
+                maxclusters=maxclusters,
+                ntries=ntries,
+                scale=scale,
             )
-            # Find the best clusters according to Silhouette Score
-            best_db = self.cluster_screening.loc[
-                self.cluster_screening.groupby("nclusters")["db_index"].idxmin()
-            ]
-            best_sil = self.cluster_screening.loc[
-                self.cluster_screening.groupby("nclusters")["silhouette_score"].idxmax()
-            ]
-            self.best_clusters = best_db
-            # Plot Silhouette Scores
-            fig, ax1 = plt.subplots()
-            # Plot Silhouette Scores on the left y-axis
-            ax1.scatter(
-                cluster_sizes,
-                silhouette_scores,
-                color="b",
-                marker="o",
-                label="Silhouette Score",
-            )
-            ax1.plot(best_db["nclusters"], best_db["silhouette_score"], "-", color="b")
-            ax1.plot(best_sil["nclusters"], best_sil["silhouette_score"], ":", color="b")
-            ax1.set_xlabel("Number of Clusters")
-            ax1.set_ylabel("Silhouette Score", color="b")
-            ax1.tick_params(axis="y", labelcolor="b")
-            # Create a second y-axis to the right for Davies-Bouldin Index
-            ax2 = ax1.twinx()
-            ax2.scatter(
-                cluster_sizes,
-                db_indexes,
-                color="r",
-                marker="s",
-                label="Davies-Bouldin Index",
-            )
-            ax2.plot(best_db["nclusters"], best_db["db_index"], "-", color="r")
-            ax2.plot(best_sil["nclusters"], best_sil["db_index"], ":", color="r")
-            ax2.set_ylabel("Davies-Bouldin Index", color="r")
-            ax2.tick_params(axis="y", labelcolor="r")
-            # Title and grid
-            ax1.set_title("Silhouette Score and Davies-Bouldin Index vs. Number of Clusters")
-            ax1.grid(True)
-            return fig, ax1, ax2
+            self.cluster_screening = screening.table.copy()
+            self.cluster_screening_method = screening.method
+            self.best_clusters = screening.best_by_db.copy()
+            return screening
 
     def sites(self, region: int = 0) -> None:
         # Check that contact space exists

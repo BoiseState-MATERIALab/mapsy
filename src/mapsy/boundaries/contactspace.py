@@ -3,6 +3,7 @@ import numpy.typing as npt
 import pandas as pd
 
 from mapsy.boundaries import Boundary
+from mapsy.data import GradientField, ScalarField
 
 
 class ContactSpace:
@@ -35,16 +36,18 @@ class ContactSpace:
 
         self._get_regions()
 
-        self.data = pd.DataFrame(
-            {
-                "probability": boundary.gradient.modulus[self.mask],
-                "x": self.grid.coordinates[0, self.mask],
-                "y": self.grid.coordinates[1, self.mask],
-                "z": self.grid.coordinates[2, self.mask],
-                "nn": self.neighbors,
-                "region": self.regions,
-            }
-        )
+        data = {
+            "probability": boundary.gradient.modulus[self.mask],
+            "x": self.grid.coordinates[0, self.mask],
+            "y": self.grid.coordinates[1, self.mask],
+            "z": self.grid.coordinates[2, self.mask],
+            "nn": self.neighbors,
+            "region": self.regions,
+        }
+        boundary_columns = self._extract_boundary_columns()
+        data.update(boundary_columns)
+        self.data = pd.DataFrame(data)
+        self._annotation_columns.extend(boundary_columns)
 
     @property
     def annotation_columns(self) -> list[str]:
@@ -138,3 +141,19 @@ class ContactSpace:
         # -- Save regions for each contact space point (counting from 0)
         self.regions = visited - 1
         self.nregions = np.max(visited)
+
+    def _extract_boundary_columns(self) -> dict[str, npt.NDArray[np.float64]]:
+        """Copy pointwise boundary-derived fields onto the sampled contact-space points."""
+        columns: dict[str, npt.NDArray[np.float64]] = {}
+        for name, value in vars(self.boundary).items():
+            if isinstance(value, GradientField):
+                columns[f"boundary_{name}_x"] = np.asarray(value[0, self.mask], dtype=np.float64)
+                columns[f"boundary_{name}_y"] = np.asarray(value[1, self.mask], dtype=np.float64)
+                columns[f"boundary_{name}_z"] = np.asarray(value[2, self.mask], dtype=np.float64)
+                columns[f"boundary_{name}_modulus"] = np.asarray(
+                    value.modulus[self.mask],
+                    dtype=np.float64,
+                )
+            elif isinstance(value, ScalarField):
+                columns[f"boundary_{name}"] = np.asarray(value[self.mask], dtype=np.float64)
+        return columns

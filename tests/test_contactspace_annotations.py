@@ -71,6 +71,31 @@ def test_maps_atcontactspace_includes_contactspace_feature_annotations() -> None
     np.testing.assert_allclose(data["ionic_distance"].to_numpy(), annotation)
 
 
+def test_contactspace_data_includes_boundary_derived_columns() -> None:
+    system = _build_system()
+    csmodel = SimpleNamespace(
+        mode="system",
+        cutoff=2,
+        threshold=-1.0,
+        side=1,
+        spread=0.5,
+        distance=1.0,
+    )
+    contactspace = ContactSpaceGenerator(csmodel).generate(system)
+
+    expected = {
+        "boundary_switch",
+        "boundary_gradient_x",
+        "boundary_gradient_y",
+        "boundary_gradient_z",
+        "boundary_gradient_modulus",
+    }
+
+    assert expected.issubset(contactspace.data.columns)
+    assert expected.issubset(contactspace.annotation_columns)
+    assert set(contactspace.feature_columns).isdisjoint(expected)
+
+
 def test_maps_annotate_ionic_distance_updates_contactspace_and_maps_data() -> None:
     system = _build_system()
     metric = IonicGeometry(mode="muff", alpha=1.0, system=system)

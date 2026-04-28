@@ -30,12 +30,26 @@ __all__ = [
     "MapsFromFile",
     "MultiMaps",
     "MultiMapsFromFile",
+    "PCAAnalysisResult",
+    "PCAResult",
+    "ClusterResult",
+    "ClusterScreeningResult",
     "CalculationWorkflow",
+    "AdaptiveWorkflow",
+    "ModelSuite",
+    "ModelTrainingSpec",
+    "PointPropertyDatasetBuilder",
     "QuantumEspressoMultiRelaxParser",
     "QuantumEspressoRelaxParser",
     "QuantumEspressoScfParser",
     "QuantumEspressoSetup",
+    "RelaxStepDatasetBuilder",
+    "RobustGaussianProcessSurrogate",
     "SlurmTemplate",
+    "SupervisedDataset",
+    "WarmStartProfile",
+    "plot_cluster_screening",
+    "plot_pca_scree",
 ]
 
 
@@ -50,10 +64,52 @@ def __getattr__(name: str) -> Any:
 
         exports = {"MultiMaps": MultiMaps, "MultiMapsFromFile": MultiMapsFromFile}
         return exports[name]
+    if name in {"PCAAnalysisResult", "PCAResult", "ClusterResult", "ClusterScreeningResult"}:
+        from .results import ClusterResult, ClusterScreeningResult, PCAAnalysisResult, PCAResult
+
+        exports = {
+            "PCAAnalysisResult": PCAAnalysisResult,
+            "PCAResult": PCAResult,
+            "ClusterResult": ClusterResult,
+            "ClusterScreeningResult": ClusterScreeningResult,
+        }
+        return exports[name]
     if name in {"CalculationWorkflow"}:
         from .workflows import CalculationWorkflow
 
         return CalculationWorkflow
+    if name in {
+        "AdaptiveWorkflow",
+        "ModelTrainingSpec",
+        "SupervisedDataset",
+        "PointPropertyDatasetBuilder",
+        "RelaxStepDatasetBuilder",
+        "WarmStartProfile",
+        "RobustGaussianProcessSurrogate",
+        "ModelSuite",
+    }:
+        from .learning import (
+            AdaptiveWorkflow,
+            ModelSuite,
+            ModelTrainingSpec,
+            PointPropertyDatasetBuilder,
+            RelaxStepDatasetBuilder,
+            RobustGaussianProcessSurrogate,
+            SupervisedDataset,
+            WarmStartProfile,
+        )
+
+        exports = {
+            "AdaptiveWorkflow": AdaptiveWorkflow,
+            "ModelTrainingSpec": ModelTrainingSpec,
+            "SupervisedDataset": SupervisedDataset,
+            "PointPropertyDatasetBuilder": PointPropertyDatasetBuilder,
+            "RelaxStepDatasetBuilder": RelaxStepDatasetBuilder,
+            "WarmStartProfile": WarmStartProfile,
+            "RobustGaussianProcessSurrogate": RobustGaussianProcessSurrogate,
+            "ModelSuite": ModelSuite,
+        }
+        return exports[name]
     if name in {"QuantumEspressoSetup"}:
         from .calculations import QuantumEspressoSetup
 
@@ -74,4 +130,12 @@ def __getattr__(name: str) -> Any:
         from .calculations import SlurmTemplate
 
         return SlurmTemplate
+    if name == "plot_cluster_screening":
+        from .plotting import plot_cluster_screening, plot_pca_scree
+
+        return plot_cluster_screening
+    if name == "plot_pca_scree":
+        from .plotting import plot_cluster_screening, plot_pca_scree
+
+        return plot_pca_scree
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
