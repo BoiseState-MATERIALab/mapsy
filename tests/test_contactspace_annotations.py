@@ -88,7 +88,6 @@ def test_contactspace_data_includes_boundary_derived_columns() -> None:
         "boundary_gradient_x",
         "boundary_gradient_y",
         "boundary_gradient_z",
-        "boundary_gradient_modulus",
     }
 
     assert expected.issubset(contactspace.data.columns)

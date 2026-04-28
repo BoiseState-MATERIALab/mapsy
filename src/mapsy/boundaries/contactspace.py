@@ -150,10 +150,6 @@ class ContactSpace:
                 columns[f"boundary_{name}_x"] = np.asarray(value[0, self.mask], dtype=np.float64)
                 columns[f"boundary_{name}_y"] = np.asarray(value[1, self.mask], dtype=np.float64)
                 columns[f"boundary_{name}_z"] = np.asarray(value[2, self.mask], dtype=np.float64)
-                columns[f"boundary_{name}_modulus"] = np.asarray(
-                    value.modulus[self.mask],
-                    dtype=np.float64,
-                )
             elif isinstance(value, ScalarField):
                 columns[f"boundary_{name}"] = np.asarray(value[self.mask], dtype=np.float64)
         return columns
