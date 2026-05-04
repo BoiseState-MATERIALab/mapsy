@@ -123,3 +123,18 @@ def _cluster_centers(
 def _cluster_sizes(labels: npt.NDArray[np.int64]) -> npt.NDArray[np.int64]:
     _, counts = np.unique(labels, return_counts=True)
     return counts.astype(np.int64, copy=False)
+
+
+def aggregate_cluster_graph(
+    labels: npt.NDArray[np.int64],
+    neighbors: list[npt.NDArray[np.int64]] | npt.NDArray[np.int64],
+) -> npt.NDArray[np.int64]:
+    nclusters = int(np.max(labels)) + 1
+    graph = np.zeros((nclusters, nclusters), dtype=np.int64)
+    for i, ci in enumerate(labels):
+        local_neighbors = np.asarray(neighbors[i], dtype=np.int64).reshape(-1)
+        for j in local_neighbors[local_neighbors >= 0]:
+            cj = labels[int(j)]
+            graph[int(ci), int(cj)] += 1
+            graph[int(cj), int(ci)] += 1
+    return graph // 2

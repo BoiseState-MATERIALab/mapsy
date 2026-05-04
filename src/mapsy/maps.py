@@ -16,7 +16,13 @@ from matplotlib.ticker import MultipleLocator
 from sklearn.preprocessing import StandardScaler
 from yaml import SafeLoader, load
 
-from mapsy.analysis import fit_clusters, fit_pca_analysis, project_pca, screen_clusters
+from mapsy.analysis import (
+    aggregate_cluster_graph,
+    fit_clusters,
+    fit_pca_analysis,
+    project_pca,
+    screen_clusters,
+)
 from mapsy.boundaries import ContactSpace
 from mapsy.boundaries.ionic import IonicGeometry
 from mapsy.clustering import clustering_uses_random_state, normalize_cluster_method
@@ -840,23 +846,6 @@ class Maps:
         data.loc[:, result.transformed_columns] = result.transformed_values
         return result
 
-    def graph(self, clusters: npt.NDArray[np.int64]) -> npt.NDArray[np.int64]:
-        # Check that contact space exists
-        if self.contactspace is None:
-            raise RuntimeError("Trying to use maps.graph() without contact space")
-        nclusters: np.int64 = np.max(clusters) + 1
-        graph: npt.NDArray[np.int64] = np.zeros((nclusters, nclusters), dtype=np.int64)
-        for i in range(self.contactspace.nm):
-            ci: np.int64 = clusters[i]
-            for j in np.delete(
-                self.contactspace.neighbors[i],
-                np.where(self.contactspace.neighbors[i] < 0),
-            ):
-                cj: np.int64 = clusters[j]
-                graph[ci, cj] += 1
-                graph[cj, ci] += 1
-        return graph // 2
-
     def cluster(
         self,
         nclusters: int | None = None,
@@ -945,7 +934,9 @@ class Maps:
             # Compute the number of points in each cluster
             self.cluster_sizes = result.sizes
             # Generate clusters connectivity matrix
-            self.cluster_graph = self.graph(result.labels)
+            if self.contactspace is None:
+                raise RuntimeError("Trying to use maps.cluster() without contact space")
+            self.cluster_graph = aggregate_cluster_graph(result.labels, self.contactspace.neighbors)
             self.cluster_edges = self.cluster_graph.copy()
             for i in range(nclusters):
                 self.cluster_edges[i, i] = 0

@@ -6,7 +6,13 @@ import numpy as np
 import pandas as pd
 from yaml import SafeLoader, load
 
-from mapsy.analysis import fit_clusters, fit_pca_analysis, project_pca, screen_clusters
+from mapsy.analysis import (
+    aggregate_cluster_graph,
+    fit_clusters,
+    fit_pca_analysis,
+    project_pca,
+    screen_clusters,
+)
 from mapsy.clustering import (
     clustering_uses_random_state,
     normalize_cluster_method,
@@ -211,7 +217,9 @@ class MultiMaps:
         graph = np.zeros((self.nclusters, self.nclusters), dtype=np.int64)
         for maps, data_slice in zip(self.maps, self._slices, strict=False):
             local_labels = labels[data_slice]
-            local_graph = maps.graph(local_labels)
+            if maps.contactspace is None:
+                raise RuntimeError("Each Maps instance must define a contact space")
+            local_graph = aggregate_cluster_graph(local_labels, maps.contactspace.neighbors)
             nrows, ncols = local_graph.shape
             graph[:nrows, :ncols] += local_graph
         return graph

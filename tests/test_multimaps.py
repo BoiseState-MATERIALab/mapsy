@@ -23,7 +23,8 @@ from mapsy.io.parser import resolve_file_model
 class FakeMaps:
     def __init__(self, frame: pd.DataFrame) -> None:
         self._frame = frame
-        self.contactspace = object()
+        nneighbors = np.full((len(frame), 6), -1, dtype=np.int64)
+        self.contactspace = SimpleNamespace(nm=len(frame), neighbors=nneighbors)
         self.data: pd.DataFrame | None = None
         self.features: list[str] = []
 
@@ -31,10 +32,6 @@ class FakeMaps:
         self.data = self._frame.copy()
         self.features = self.data.columns.drop(["x", "y", "z"]).tolist()
         return self.data
-
-    def graph(self, clusters: np.ndarray) -> np.ndarray:
-        nclusters = int(np.max(clusters)) + 1
-        return np.zeros((nclusters, nclusters), dtype=np.int64)
 
 
 def _write_xyz(path: Path, x: float) -> None:
