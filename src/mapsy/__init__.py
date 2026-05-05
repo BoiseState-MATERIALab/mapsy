@@ -32,8 +32,11 @@ __all__ = [
     "MultiMapsFromFile",
     "PCAAnalysisResult",
     "PCAResult",
+    "ArchetypeSelectionResult",
+    "ArchetypePropagationResult",
     "ClusterResult",
     "ClusterScreeningResult",
+    "GraphResult",
     "CalculationWorkflow",
     "AdaptiveWorkflow",
     "ModelSuite",
@@ -64,14 +67,33 @@ def __getattr__(name: str) -> Any:
 
         exports = {"MultiMaps": MultiMaps, "MultiMapsFromFile": MultiMapsFromFile}
         return exports[name]
-    if name in {"PCAAnalysisResult", "PCAResult", "ClusterResult", "ClusterScreeningResult"}:
-        from .results import ClusterResult, ClusterScreeningResult, PCAAnalysisResult, PCAResult
+    if name in {
+        "PCAAnalysisResult",
+        "PCAResult",
+        "ArchetypeSelectionResult",
+        "ArchetypePropagationResult",
+        "ClusterResult",
+        "ClusterScreeningResult",
+        "GraphResult",
+    }:
+        from .results import (
+            ArchetypePropagationResult,
+            ArchetypeSelectionResult,
+            ClusterResult,
+            ClusterScreeningResult,
+            GraphResult,
+            PCAAnalysisResult,
+            PCAResult,
+        )
 
         exports = {
             "PCAAnalysisResult": PCAAnalysisResult,
             "PCAResult": PCAResult,
+            "ArchetypeSelectionResult": ArchetypeSelectionResult,
+            "ArchetypePropagationResult": ArchetypePropagationResult,
             "ClusterResult": ClusterResult,
             "ClusterScreeningResult": ClusterScreeningResult,
+            "GraphResult": GraphResult,
         }
         return exports[name]
     if name in {"CalculationWorkflow"}:

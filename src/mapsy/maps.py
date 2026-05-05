@@ -17,17 +17,33 @@ from sklearn.preprocessing import StandardScaler
 from yaml import SafeLoader, load
 
 from mapsy.analysis import (
+    GraphMode,
     aggregate_cluster_graph,
+    build_point_graph,
     fit_clusters,
     fit_pca_analysis,
     project_pca,
     screen_clusters,
 )
+from mapsy.analysis import (
+    propagate_archetypes as propagate_archetypes_on_graph,
+)
+from mapsy.analysis import (
+    select_archetypes as select_feature_archetypes,
+)
 from mapsy.boundaries import ContactSpace
 from mapsy.boundaries.ionic import IonicGeometry
 from mapsy.clustering import clustering_uses_random_state, normalize_cluster_method
 from mapsy.data import ScalarField, System
-from mapsy.results import ClusterResult, ClusterScreeningResult, PCAAnalysisResult, PCAResult
+from mapsy.results import (
+    ArchetypePropagationResult,
+    ArchetypeSelectionResult,
+    ClusterResult,
+    ClusterScreeningResult,
+    GraphResult,
+    PCAAnalysisResult,
+    PCAResult,
+)
 from mapsy.symfunc.symmetryfunction import SymmetryFunction
 from mapsy.utils import full2chunk, multiproc
 
@@ -237,6 +253,9 @@ class Maps:
     npca: int | None = None
     pca_analysis_result: PCAAnalysisResult | None = None
     pca_result: PCAResult | None = None
+    graph_result: GraphResult | None = None
+    archetype_selection_result: ArchetypeSelectionResult | None = None
+    archetype_propagation_result: ArchetypePropagationResult | None = None
 
     nclusters: int = 0
     cluster_method: str = "spectral"
@@ -855,6 +874,7 @@ class Maps:
         ntries: int = 1,
         random_state: int | None = None,
         scale: bool = False,
+        graph: GraphResult | None = None,
     ) -> ClusterResult | ClusterScreeningResult:
         """ """
         # Check that contact space exists
@@ -870,6 +890,10 @@ class Maps:
             self.cluster_features = features
         self.cluster_method = normalize_cluster_method(method)
         X = self.data[self.cluster_features].values.astype(np.float64)
+        if graph is not None and graph.matrix.shape[0] != len(X):
+            raise ValueError(
+                f"graph has {graph.matrix.shape[0]} nodes, expected {len(X)} to match maps.data."
+            )
         if nclusters is not None:
             if not clustering_uses_random_state(self.cluster_method):
                 self.random_state = 0
@@ -924,6 +948,7 @@ class Maps:
                 random_state=effective_random_state,
                 scale=scale,
                 screening=screening_result,
+                graph=graph,
             )
             self.data["Cluster"] = result.labels
             # Store number of clusters
@@ -951,11 +976,252 @@ class Maps:
                 maxclusters=maxclusters,
                 ntries=ntries,
                 scale=scale,
+                graph=graph,
             )
             self.cluster_screening = screening.table.copy()
             self.cluster_screening_method = screening.method
             self.best_clusters = screening.best_by_db.copy()
             return screening
+
+    def build_graph(
+        self,
+        *,
+        mode: GraphMode = "hybrid",
+        feature_columns: list[str] | None = None,
+        node_weight_column: str = "probability",
+        feature_k: int = 8,
+        sigma_feature: float | None = None,
+        realspace_weight: float = 1.0,
+        feature_weight: float = 1.0,
+        normalize_node_weights: bool = True,
+        use_node_weights_in_edges: bool = True,
+        direction_columns: tuple[str, str, str] | None = None,
+        directional_weight: float = 0.0,
+        directional_power: float = 1.0,
+    ) -> GraphResult:
+        if self.contactspace is None:
+            raise RuntimeError("Trying to use maps.build_graph() without contact space")
+        if self.data is None:
+            raise RuntimeError("No contact space data available.")
+
+        selected_features = (
+            list(feature_columns) if feature_columns is not None else list(self.features)
+        )
+        node_table = self.data.loc[:, ["x", "y", "z", *selected_features]].copy()
+        required_columns = [node_weight_column]
+        if directional_weight > 0.0:
+            required_columns.extend(
+                list(
+                    direction_columns
+                    or (
+                        "boundary_gradient_x",
+                        "boundary_gradient_y",
+                        "boundary_gradient_z",
+                    )
+                )
+            )
+        for column in required_columns:
+            if column in node_table.columns:
+                continue
+            if column in self.data.columns:
+                node_table.loc[:, column] = self.data[column].to_numpy()
+            elif column in self.contactspace.data.columns:
+                node_table.loc[:, column] = self.contactspace.data[column].to_numpy()
+            else:
+                raise ValueError(
+                    f"required graph column {column!r} not present in maps.data or contactspace.data."
+                )
+
+        node_table.insert(0, "point_index", self.data.index.to_numpy(dtype=np.int64))
+        result = build_point_graph(
+            node_table,
+            mode=mode,
+            feature_columns=selected_features,
+            neighbors=self.contactspace.neighbors,
+            node_weight_column=node_weight_column,
+            feature_k=feature_k,
+            sigma_feature=sigma_feature,
+            realspace_weight=realspace_weight,
+            feature_weight=feature_weight,
+            normalize_node_weights=normalize_node_weights,
+            use_node_weights_in_edges=use_node_weights_in_edges,
+            direction_columns=direction_columns,
+            directional_weight=directional_weight,
+            directional_power=directional_power,
+        )
+        self.graph_result = result
+        return result
+
+    def select_archetypes(
+        self,
+        n_archetypes: int,
+        *,
+        feature_columns: list[str] | None = None,
+        probability_column: str = "probability",
+        region: int | None = None,
+        min_probability: float | None = None,
+        min_probability_quantile: float | None = 0.75,
+        scale_features: bool = True,
+        probability_weight: float = 1.0,
+        extremeness_weight: float = 1.0,
+        diversity_weight: float = 1.0,
+        register: bool = True,
+        kind: str = "archetype",
+        iteration: int | None = 0,
+        label_status: str = "unlabeled",
+        replace_kind: bool = True,
+    ) -> ArchetypeSelectionResult:
+        if self.data is None:
+            raise RuntimeError("No contact space data available.")
+
+        resolved_feature_columns = (
+            list(feature_columns) if feature_columns is not None else list(self.features)
+        )
+        point_table = self.data.copy()
+        point_table.loc[:, "point_index"] = point_table.index.to_numpy(dtype=np.int64)
+        if probability_column not in point_table.columns:
+            if (
+                self.contactspace is None
+                or probability_column not in self.contactspace.data.columns
+            ):
+                raise ValueError(
+                    f"probability_column {probability_column!r} not present in maps.data "
+                    "or contactspace.data."
+                )
+            point_table.loc[:, probability_column] = self.contactspace.data[
+                probability_column
+            ].to_numpy()
+
+        candidate_mask: npt.NDArray[np.bool_] | None = None
+        if region is not None:
+            if self.contactspace is None:
+                raise RuntimeError("Trying to filter archetypes by region without contact space")
+            region_values = self.contactspace.data["region"].to_numpy(dtype=np.int64)
+            candidate_mask = region_values == region
+
+        result = select_feature_archetypes(
+            point_table,
+            n_archetypes=n_archetypes,
+            feature_columns=resolved_feature_columns,
+            probability_column=probability_column,
+            candidate_mask=candidate_mask,
+            min_probability=min_probability,
+            min_probability_quantile=min_probability_quantile,
+            scale_features=scale_features,
+            probability_weight=probability_weight,
+            extremeness_weight=extremeness_weight,
+            diversity_weight=diversity_weight,
+        )
+        self.archetype_selection_result = result
+
+        if register:
+            archetype_table = result.archetype_table.sort_values("selection_rank").reset_index(
+                drop=True
+            )
+            self.add_special_points(
+                result.selected_indexes,
+                kind=kind,
+                iteration=iteration,
+                label_status=label_status,
+                replace_kind=replace_kind,
+                selection_rank=archetype_table["selection_rank"].to_numpy(dtype=np.int64),
+                selection_score=archetype_table["selection_score"].to_numpy(dtype=np.float64),
+                probability_score=archetype_table["probability_score"].to_numpy(dtype=np.float64),
+                extremeness_score=archetype_table["extremeness_score"].to_numpy(dtype=np.float64),
+                diversity_score=archetype_table["diversity_score"].to_numpy(dtype=np.float64),
+            )
+
+        return result
+
+    def propagate_archetypes(
+        self,
+        *,
+        graph: GraphResult | None = None,
+        selected_indexes: npt.ArrayLike | None = None,
+        kind: str = "archetype",
+        alpha: float = 0.9,
+        max_iter: int = 500,
+        tol: float = 1.0e-8,
+        confidence_threshold: float = 0.5,
+        margin_threshold: float = 0.0,
+        update_data: bool = True,
+    ) -> ArchetypePropagationResult:
+        if self.data is None:
+            raise RuntimeError("No contact space data available.")
+
+        if selected_indexes is None:
+            selected = self.special_points.indexes(kind=kind)
+        else:
+            selected = np.asarray(selected_indexes, dtype=np.int64).reshape(-1)
+        if selected.size == 0:
+            raise RuntimeError(
+                "No archetype seeds available. Call maps.select_archetypes(...) first "
+                "or pass selected_indexes explicitly."
+            )
+
+        selected_graph = graph if graph is not None else self.graph_result
+        if selected_graph is None:
+            raise RuntimeError(
+                "No graph available for propagation. Call maps.build_graph(...) first "
+                "or pass graph explicitly."
+            )
+
+        result = propagate_archetypes_on_graph(
+            selected_graph,
+            selected_indexes=selected,
+            alpha=alpha,
+            max_iter=max_iter,
+            tol=tol,
+            confidence_threshold=confidence_threshold,
+            margin_threshold=margin_threshold,
+        )
+        self.archetype_propagation_result = result
+
+        if update_data:
+            assignment = result.assignment_table.set_index("point_index")
+            columns = [
+                "assigned_archetype_rank",
+                "assigned_archetype_index",
+                "archetype_confidence",
+                "archetype_margin",
+                "is_ambiguous",
+            ]
+            self.data.loc[assignment.index, columns] = assignment.loc[:, columns]
+
+        valid_assignments = result.assigned_archetype_indexes[
+            result.assigned_archetype_indexes >= 0
+        ]
+        assignment_counts: dict[int, int] = {
+            int(point_index): int(np.count_nonzero(valid_assignments == point_index))
+            for point_index in selected
+        }
+        mean_confidences: dict[int, float] = {}
+        assignment_table = result.assignment_table
+        for point_index in selected:
+            point_mask = assignment_table["assigned_archetype_index"].to_numpy(
+                dtype=np.int64
+            ) == int(point_index)
+            if np.any(point_mask):
+                mean_confidences[int(point_index)] = float(
+                    assignment_table.loc[point_mask, "archetype_confidence"].mean()
+                )
+            else:
+                mean_confidences[int(point_index)] = 0.0
+
+        self.update_special_points(
+            kind=kind,
+            point_indexes=selected,
+            assigned_point_count=np.array(
+                [assignment_counts[int(point_index)] for point_index in selected],
+                dtype=np.int64,
+            ),
+            mean_assignment_confidence=np.array(
+                [mean_confidences[int(point_index)] for point_index in selected],
+                dtype=np.float64,
+            ),
+        )
+
+        return result
 
     def sites(self, region: int = 0) -> None:
         # Check that contact space exists

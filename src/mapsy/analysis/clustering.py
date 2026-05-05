@@ -9,7 +9,7 @@ from mapsy.clustering import (
     fit_predict_clusters,
     normalize_cluster_method,
 )
-from mapsy.results import ClusterResult, ClusterScreeningResult
+from mapsy.results import ClusterResult, ClusterScreeningResult, GraphResult
 
 
 def fit_clusters(
@@ -21,6 +21,7 @@ def fit_clusters(
     random_state: int | None = None,
     scale: bool = False,
     screening: ClusterScreeningResult | None = None,
+    graph: GraphResult | None = None,
 ) -> ClusterResult:
     normalized_method = normalize_cluster_method(method)
     scaler = StandardScaler() if scale else None
@@ -33,6 +34,7 @@ def fit_clusters(
         method=normalized_method,
         nclusters=nclusters,
         random_state=effective_random_state,
+        graph_matrix=graph.matrix if graph is not None else None,
     )
     centers = _cluster_centers(X, labels, feature_columns)
     sizes = _cluster_sizes(labels)
@@ -46,7 +48,7 @@ def fit_clusters(
         sizes=sizes,
         random_state=effective_random_state,
         screening=screening,
-        metadata={"scaler": scaler},
+        metadata={"scaler": scaler, "graph_mode": None if graph is None else graph.mode},
     )
 
 
@@ -58,6 +60,7 @@ def screen_clusters(
     maxclusters: int = 20,
     ntries: int = 1,
     scale: bool = False,
+    graph: GraphResult | None = None,
 ) -> ClusterScreeningResult:
     normalized_method = normalize_cluster_method(method)
     scaler = StandardScaler() if scale else None
@@ -82,6 +85,7 @@ def screen_clusters(
                 method=normalized_method,
                 nclusters=nclusters,
                 random_state=effective_random_state,
+                graph_matrix=graph.matrix if graph is not None else None,
             )
             actual_nclusters = int(len(np.unique(labels)))
             cluster_random_states.append(int(random_state))
