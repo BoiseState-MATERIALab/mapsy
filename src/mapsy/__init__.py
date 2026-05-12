@@ -38,14 +38,22 @@ __all__ = [
     "ClusterScreeningResult",
     "GraphResult",
     "CalculationWorkflow",
+    "WorkflowReferenceSpec",
     "AdaptiveWorkflow",
     "ModelSuite",
     "ModelTrainingSpec",
     "PointPropertyDatasetBuilder",
+    "AdsorptionEnergyParser",
+    "CHEAdsorptionEnergyParser",
+    "build_che_adsorption_energy_parser",
+    "build_relax_adsorption_parser",
+    "QuantumEspressoEnergyParser",
     "QuantumEspressoMultiRelaxParser",
     "QuantumEspressoRelaxParser",
     "QuantumEspressoScfParser",
     "QuantumEspressoSetup",
+    "X2RelaxFrequencyParser",
+    "build_adsorption_energy_parser",
     "RelaxStepDatasetBuilder",
     "RobustGaussianProcessSurrogate",
     "SlurmTemplate",
@@ -96,10 +104,14 @@ def __getattr__(name: str) -> Any:
             "GraphResult": GraphResult,
         }
         return exports[name]
-    if name in {"CalculationWorkflow"}:
-        from .workflows import CalculationWorkflow
+    if name in {"CalculationWorkflow", "WorkflowReferenceSpec"}:
+        from .workflows import CalculationWorkflow, WorkflowReferenceSpec
 
-        return CalculationWorkflow
+        exports = {
+            "CalculationWorkflow": CalculationWorkflow,
+            "WorkflowReferenceSpec": WorkflowReferenceSpec,
+        }
+        return exports[name]
     if name in {
         "AdaptiveWorkflow",
         "ModelTrainingSpec",
@@ -132,10 +144,41 @@ def __getattr__(name: str) -> Any:
             "ModelSuite": ModelSuite,
         }
         return exports[name]
-    if name in {"QuantumEspressoSetup"}:
-        from .calculations import QuantumEspressoSetup
+    if name in {
+        "AdsorptionEnergyParser",
+        "CHEAdsorptionEnergyParser",
+        "QuantumEspressoSetup",
+        "QuantumEspressoEnergyParser",
+        "X2RelaxFrequencyParser",
+    }:
+        from .calculations import (
+            AdsorptionEnergyParser,
+            CHEAdsorptionEnergyParser,
+            QuantumEspressoEnergyParser,
+            QuantumEspressoSetup,
+            X2RelaxFrequencyParser,
+        )
 
-        return QuantumEspressoSetup
+        exports = {
+            "AdsorptionEnergyParser": AdsorptionEnergyParser,
+            "CHEAdsorptionEnergyParser": CHEAdsorptionEnergyParser,
+            "QuantumEspressoSetup": QuantumEspressoSetup,
+            "QuantumEspressoEnergyParser": QuantumEspressoEnergyParser,
+            "X2RelaxFrequencyParser": X2RelaxFrequencyParser,
+        }
+        return exports[name]
+    if name == "build_adsorption_energy_parser":
+        from .calculations import build_adsorption_energy_parser
+
+        return build_adsorption_energy_parser
+    if name == "build_che_adsorption_energy_parser":
+        from .calculations import build_che_adsorption_energy_parser
+
+        return build_che_adsorption_energy_parser
+    if name == "build_relax_adsorption_parser":
+        from .calculations import build_relax_adsorption_parser
+
+        return build_relax_adsorption_parser
     if name in {"QuantumEspressoMultiRelaxParser"}:
         from .calculations import QuantumEspressoMultiRelaxParser
 

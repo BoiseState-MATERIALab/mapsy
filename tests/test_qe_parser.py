@@ -1,9 +1,11 @@
 import numpy as np
 
 from mapsy import (
+    QuantumEspressoEnergyParser,
     QuantumEspressoMultiRelaxParser,
     QuantumEspressoRelaxParser,
     QuantumEspressoScfParser,
+    X2RelaxFrequencyParser,
 )
 
 
@@ -143,6 +145,138 @@ def test_qe_scf_parser_can_target_accuracy_threshold(tmp_path) -> None:
     assert np.isclose(parsed["acc_first_below_accuracy_threshold_Ry"], 5.0e-06)
     assert np.isclose(parsed["scf_accuracy_threshold_Ry"], 1.0e-05)
     assert "E_iter1_Ry" not in parsed
+
+
+def test_qe_energy_parser_extracts_final_converged_energy(tmp_path) -> None:
+    jobdir = tmp_path / "reference_h2"
+    jobdir.mkdir()
+    (jobdir / "espresso.pwo").write_text(
+        "\n".join(
+            [
+                "     iteration #  1",
+                "     total energy              =   -10.0000 Ry",
+                "!    total energy              =   -10.6000 Ry",
+            ]
+        )
+        + "\n"
+    )
+
+    parsed = QuantumEspressoEnergyParser().parse(jobdir)
+
+    assert parsed["label_file"] == str(jobdir)
+    assert np.isclose(parsed["reference_energy_Ry"], -10.6)
+    assert parsed["reference_converged"] is True
+    assert parsed["n_scf_iterations"] == 1
+
+
+def test_qe_energy_parser_marks_missing_converged_energy_as_failed(tmp_path) -> None:
+    jobdir = tmp_path / "reference_slab"
+    jobdir.mkdir()
+    (jobdir / "espresso.pwo").write_text("     total energy              =   -10.0000 Ry\n")
+
+    parsed = QuantumEspressoEnergyParser().parse(jobdir)
+
+    assert parsed["reference_converged"] is False
+    assert parsed["label_status"] == "failed"
+    assert "could not find a converged" in parsed["label_error"]
+
+
+def test_x2_relax_frequency_parser_estimates_curvature_and_frequency(tmp_path) -> None:
+    jobdir = tmp_path / "reference_h2_relax"
+    jobdir.mkdir()
+    (jobdir / "espresso.pwi").write_text(
+        "ATOMIC_POSITIONS (angstrom)\nH 0.0 0.0 0.0\nH 0.0 0.0 0.80\n"
+    )
+
+    distances = np.array([0.80, 0.74, 0.70, 0.76], dtype=float)
+    curvature_eV_A2 = 36.0
+    e0_ev = -20.0
+    energies_ry = (e0_ev + 0.5 * curvature_eV_A2 * (distances - 0.74) ** 2) / 13.605693122994
+    lines: list[str] = []
+    for distance, energy in zip(distances, energies_ry, strict=True):
+        lines.extend(
+            [
+                "ATOMIC_POSITIONS (angstrom)",
+                "H 0.0 0.0 0.0",
+                f"H 0.0 0.0 {distance:.6f}",
+                f"!    total energy              =   {energy:.10f} Ry",
+            ]
+        )
+    lines.append("End of BFGS Geometry Optimization")
+    (jobdir / "espresso.pwo").write_text("\n".join(lines) + "\n")
+
+    parsed = X2RelaxFrequencyParser(fit_window=4).parse(jobdir)
+
+    np.testing.assert_allclose(parsed["bond_length_bfgs_steps_A"], distances, atol=1e-8)
+    assert parsed["relax_converged"] is True
+    assert np.isclose(parsed["bond_length_eq_A"], 0.74, atol=1e-6)
+    assert np.isclose(parsed["curvature_eV_A2"], curvature_eV_A2, atol=1e-5)
+    assert np.isclose(parsed["reduced_mass_amu"], 0.50391, atol=1e-3)
+    assert np.isclose(parsed["vibrational_frequency_cm1"], 4406.1, rtol=2e-2)
+    assert np.isclose(parsed["zpe_eV"], 0.2731, rtol=2e-2)
+
+
+def test_x2_relax_frequency_parser_fails_on_too_few_steps(tmp_path) -> None:
+    jobdir = tmp_path / "reference_h2_short"
+    jobdir.mkdir()
+    (jobdir / "espresso.pwi").write_text(
+        "ATOMIC_POSITIONS (angstrom)\nH 0.0 0.0 0.0\nH 0.0 0.0 0.90\n"
+    )
+    (jobdir / "espresso.pwo").write_text(
+        "\n".join(
+            [
+                "!    total energy              =   -1.0000000000 Ry",
+                "ATOMIC_POSITIONS (angstrom)",
+                "H 0.0 0.0 0.0",
+                "H 0.0 0.0 0.80",
+                "!    total energy              =   -1.1000000000 Ry",
+                "ATOMIC_POSITIONS (angstrom)",
+                "H 0.0 0.0 0.0",
+                "H 0.0 0.0 0.74",
+                "End of BFGS Geometry Optimization",
+            ]
+        )
+        + "\n"
+    )
+
+    parsed = X2RelaxFrequencyParser().parse(jobdir)
+
+    assert parsed["label_status"] == "failed"
+    assert "at least three ionic steps" in parsed["label_error"]
+
+
+def test_x2_relax_frequency_parser_uses_input_geometry_for_extra_initial_energy(tmp_path) -> None:
+    jobdir = tmp_path / "reference_h2_extra_initial"
+    jobdir.mkdir()
+    (jobdir / "espresso.pwi").write_text(
+        "ATOMIC_POSITIONS (angstrom)\nH 0.0 0.0 0.0\nH 0.0 0.0 0.80\n"
+    )
+
+    distances = np.array([0.80, 0.74, 0.70], dtype=float)
+    curvature_eV_A2 = 36.0
+    e0_ev = -20.0
+    energies_ry = (e0_ev + 0.5 * curvature_eV_A2 * (distances - 0.74) ** 2) / 13.605693122994
+
+    lines = [
+        f"!    total energy              =   {energies_ry[0]:.10f} Ry",
+        "ATOMIC_POSITIONS (angstrom)",
+        "H 0.0 0.0 0.0",
+        "H 0.0 0.0 0.74",
+        f"!    total energy              =   {energies_ry[1]:.10f} Ry",
+        "ATOMIC_POSITIONS (angstrom)",
+        "H 0.0 0.0 0.0",
+        "H 0.0 0.0 0.70",
+        f"!    total energy              =   {energies_ry[2]:.10f} Ry",
+        "End of BFGS Geometry Optimization",
+    ]
+    (jobdir / "espresso.pwo").write_text("\n".join(lines) + "\n")
+
+    parsed = X2RelaxFrequencyParser(fit_window=3).parse(jobdir)
+
+    np.testing.assert_allclose(parsed["bond_length_bfgs_steps_A"], distances, atol=1e-8)
+    np.testing.assert_allclose(parsed["bond_length_fit_steps_A"], distances, atol=1e-8)
+    np.testing.assert_allclose(parsed["E_fit_steps_Ry"], energies_ry, atol=1e-10)
+    assert np.isclose(parsed["bond_length_eq_A"], 0.74, atol=1e-6)
 
 
 def test_qe_relax_parser_extracts_force_and_geometry_metrics(tmp_path) -> None:
