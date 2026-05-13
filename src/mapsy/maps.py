@@ -677,7 +677,8 @@ class Maps:
             fig, axs = plt.subplots(nsplit, 1, figsize=(8, 4 * nsplit))
             axslist = [axs]
         if categorical:
-            nf = np.unique(f).size
+            category_values = np.unique(f)
+            nf = category_values.size
             colors = plt.cm.tab20(np.linspace(0, 1, nf, endpoint=False)).tolist()
         else:
             fmin = np.min(f)
@@ -706,12 +707,15 @@ class Maps:
                 else:
                     scatter = ax.scatter(x1m, x2m, c=fm, vmin=fmin, vmax=fmax, **kwargs)
             else:
-                for i, fvalue in enumerate(np.unique(f)):
+                for i, fvalue in enumerate(category_values):
+                    label_value = (
+                        str(int(fvalue)) if np.isclose(fvalue, int(fvalue)) else str(fvalue)
+                    )
                     scatter = ax.scatter(
                         x1m[fm == fvalue],
                         x2m[fm == fvalue],
                         color=colors[i],
-                        label=f"{feature} = {i:2}",
+                        label=f"{feature} = {label_value}",
                         **kwargs,
                     )
             if centroids:
