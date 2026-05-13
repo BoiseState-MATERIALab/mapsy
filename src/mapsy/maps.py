@@ -72,6 +72,24 @@ class SpecialPointRegistry:
     def __init__(self) -> None:
         self._data = pd.DataFrame(columns=self._BASE_COLUMNS)
 
+    @staticmethod
+    def _normalize_single_metadata_value(value: Any) -> Any:
+        if isinstance(value, np.ndarray):
+            if value.ndim == 0:
+                return value.item()
+            if value.ndim == 1 and value.size == 1:
+                return value.reshape(-1)[0]
+            return value
+        if isinstance(value, pd.Series):
+            if len(value) == 1:
+                return value.iloc[0]
+            return value.to_numpy()
+        if isinstance(value, (list, tuple)):
+            if len(value) == 1:
+                return value[0]
+            return value
+        return value
+
     def add(
         self,
         point_indexes: npt.ArrayLike,
@@ -106,12 +124,9 @@ class SpecialPointRegistry:
                 continue
 
             if indexes.size == 1:
-                values = np.asarray(value, dtype=object).reshape(-1)
-                if values.size != 1:
-                    raise ValueError(
-                        f"Metadata column {key!r} has length {values.size}, expected {indexes.size}."
-                    )
-                rows.loc[:, key] = values[0]
+                if key not in rows.columns:
+                    rows[key] = pd.Series([None] * len(rows), dtype=object)
+                rows.at[rows.index[0], key] = self._normalize_single_metadata_value(value)
                 continue
 
             values = np.asarray(value)
@@ -182,12 +197,11 @@ class SpecialPointRegistry:
                 continue
 
             if count == 1:
-                values = np.asarray(value, dtype=object).reshape(-1)
-                if values.size != 1:
-                    raise ValueError(
-                        f"Metadata column {key!r} has length {values.size}, expected {count}."
-                    )
-                self._data.loc[mask, key] = values[0]
+                if key not in self._data.columns:
+                    self._data[key] = pd.Series([None] * len(self._data), dtype=object)
+                self._data.at[self._data.index[mask][0], key] = (
+                    self._normalize_single_metadata_value(value)
+                )
                 continue
 
             values = np.asarray(value, dtype=object).reshape(-1)
