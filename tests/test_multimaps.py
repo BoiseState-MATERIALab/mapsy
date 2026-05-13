@@ -2,18 +2,29 @@ from pathlib import Path
 from textwrap import dedent
 from types import SimpleNamespace
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import pytest
 
-from mapsy import MultiMaps, MultiMapsFromFile
+from mapsy import (
+    ClusterResult,
+    ClusterScreeningResult,
+    MultiMaps,
+    MultiMapsFromFile,
+    PCAAnalysisResult,
+    PCAResult,
+    plot_cluster_screening,
+    plot_pca_scree,
+)
 from mapsy.io.parser import resolve_file_model
 
 
 class FakeMaps:
     def __init__(self, frame: pd.DataFrame) -> None:
         self._frame = frame
-        self.contactspace = object()
+        nneighbors = np.full((len(frame), 6), -1, dtype=np.int64)
+        self.contactspace = SimpleNamespace(nm=len(frame), neighbors=nneighbors)
         self.data: pd.DataFrame | None = None
         self.features: list[str] = []
 
@@ -21,10 +32,6 @@ class FakeMaps:
         self.data = self._frame.copy()
         self.features = self.data.columns.drop(["x", "y", "z"]).tolist()
         return self.data
-
-    def graph(self, clusters: np.ndarray) -> np.ndarray:
-        nclusters = int(np.max(clusters)) + 1
-        return np.zeros((nclusters, nclusters), dtype=np.int64)
 
 
 def _write_xyz(path: Path, x: float) -> None:
@@ -125,17 +132,23 @@ def test_multimaps_reduce_propagates_pca_columns() -> None:
 
     multimaps = MultiMaps([map_a, map_b])
     multimaps.atcontactspace()
-    multimaps.reduce(npca=2)
+    result = multimaps.reduce(npca=2)
 
     assert multimaps.data is not None
     assert {"pca0", "pca1"}.issubset(multimaps.data.columns)
+    assert isinstance(result, PCAResult)
+    assert result.transformed_columns == ["pca0", "pca1"]
     assert map_a.data is not None
     assert map_b.data is not None
     assert {"pca0", "pca1"}.issubset(map_a.data.columns)
     assert {"pca0", "pca1"}.issubset(map_b.data.columns)
 
 
-def test_multimaps_cluster_propagates_labels() -> None:
+@pytest.mark.parametrize(
+    "method",
+    ["spectral", "gaussian_mixture", "kmeans", "agglomerative"],
+)
+def test_multimaps_cluster_propagates_labels(method: str) -> None:
     map_a = FakeMaps(
         pd.DataFrame(
             {
@@ -161,17 +174,90 @@ def test_multimaps_cluster_propagates_labels() -> None:
 
     multimaps = MultiMaps([map_a, map_b])
     multimaps.atcontactspace()
-    multimaps.cluster(nclusters=2, random_state=0)
+    result = multimaps.cluster(nclusters=2, random_state=0, method=method)
 
     assert multimaps.data is not None
     assert "Cluster" in multimaps.data.columns
     assert multimaps.nclusters == 2
+    assert multimaps.cluster_method == method
+    assert isinstance(result, ClusterResult)
     assert multimaps.cluster_graph is not None
     assert multimaps.cluster_graph.shape == (2, 2)
     assert map_a.data is not None
     assert map_b.data is not None
     assert "Cluster" in map_a.data.columns
     assert "Cluster" in map_b.data.columns
+
+
+def test_multimaps_cluster_screening_tracks_method() -> None:
+    plt.switch_backend("Agg")
+    map_a = FakeMaps(
+        pd.DataFrame(
+            {
+                "x": [0.0, 0.1, 0.2],
+                "y": [0.0, 0.1, 0.2],
+                "z": [0.0, 0.0, 0.0],
+                "f1": [0.0, 0.1, 0.2],
+                "f2": [0.0, 0.1, 0.2],
+            }
+        )
+    )
+    map_b = FakeMaps(
+        pd.DataFrame(
+            {
+                "x": [2.0, 2.1, 2.2],
+                "y": [2.0, 2.1, 2.2],
+                "z": [0.0, 0.0, 0.0],
+                "f1": [5.0, 5.1, 5.2],
+                "f2": [5.0, 5.1, 5.2],
+            }
+        )
+    )
+
+    multimaps = MultiMaps([map_a, map_b])
+    multimaps.atcontactspace()
+    result = multimaps.cluster(method="gaussian_mixture", maxclusters=4, ntries=2)
+
+    assert isinstance(result, ClusterScreeningResult)
+    assert multimaps.cluster_screening is not None
+    assert set(multimaps.cluster_screening["method"]) == {"gaussian_mixture"}
+    assert multimaps.cluster_screening_method == "gaussian_mixture"
+    fig, _, _ = plot_cluster_screening(result)
+    assert fig is not None
+
+
+def test_multimaps_reduce_screening_plot_helper() -> None:
+    plt.switch_backend("Agg")
+    map_a = FakeMaps(
+        pd.DataFrame(
+            {
+                "x": [0.0, 0.1, 0.2],
+                "y": [0.0, 0.1, 0.2],
+                "z": [0.0, 0.0, 0.0],
+                "f1": [0.0, 0.1, 0.2],
+                "f2": [1.0, 1.1, 1.2],
+            }
+        )
+    )
+    map_b = FakeMaps(
+        pd.DataFrame(
+            {
+                "x": [1.0, 1.1, 1.2],
+                "y": [1.0, 1.1, 1.2],
+                "z": [0.0, 0.0, 0.0],
+                "f1": [2.0, 2.1, 2.2],
+                "f2": [3.0, 3.1, 3.2],
+            }
+        )
+    )
+
+    multimaps = MultiMaps([map_a, map_b])
+    multimaps.atcontactspace()
+    result = multimaps.analyze_pca(scale=True)
+
+    assert isinstance(result, PCAAnalysisResult)
+    fig, _, _ = plot_pca_scree(result)
+    assert fig is not None
 
 
 def test_resolve_file_model_supports_folder_and_root(tmp_path: Path) -> None:

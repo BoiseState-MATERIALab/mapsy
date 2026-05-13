@@ -1,23 +1,43 @@
 from collections.abc import Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, TypeAlias
+from typing import TYPE_CHECKING, Any
 
-import matplotlib.pyplot as plt
 import numpy as np
 import numpy.typing as npt
 import pandas as pd
-from matplotlib.axes import Axes
-from matplotlib.figure import Figure
-from sklearn.cluster import SpectralClustering
-from sklearn.decomposition import PCA
-from sklearn.metrics import davies_bouldin_score, silhouette_score
-from sklearn.preprocessing import StandardScaler
 from yaml import SafeLoader, load
+
+from mapsy.analysis import (
+    GraphMode,
+    aggregate_cluster_graph,
+    build_point_graph,
+    fit_clusters,
+    fit_pca_analysis,
+    project_pca,
+    screen_clusters,
+)
+from mapsy.analysis import (
+    propagate_archetypes as propagate_archetypes_on_graph,
+)
+from mapsy.analysis import (
+    select_archetypes as select_feature_archetypes,
+)
+from mapsy.clustering import (
+    clustering_uses_random_state,
+    normalize_cluster_method,
+)
+from mapsy.results import (
+    ArchetypePropagationResult,
+    ArchetypeSelectionResult,
+    ClusterResult,
+    ClusterScreeningResult,
+    GraphResult,
+    PCAAnalysisResult,
+    PCAResult,
+)
 
 if TYPE_CHECKING:
     from .maps import Maps
-
-AxesLike: TypeAlias = Axes | npt.NDArray[np.object_]
 
 
 class MultiMaps:
@@ -41,8 +61,16 @@ class MultiMaps:
         self.data: pd.DataFrame | None = None
         self.features: list[str] = []
         self.npca: int | None = None
+        self.pca_analysis_result: PCAAnalysisResult | None = None
+        self.pca_result: PCAResult | None = None
+        self.graph_result: GraphResult | None = None
+        self.archetype_selection_result: ArchetypeSelectionResult | None = None
+        self.archetype_propagation_result: ArchetypePropagationResult | None = None
 
         self.nclusters: int = 0
+        self.cluster_method: str = "spectral"
+        self.cluster_screening_method: str | None = None
+        self.cluster_result: ClusterResult | None = None
         self.cluster_features: list[str] = []
         self.cluster_centers: np.ndarray[Any, np.dtype[np.float64]] | None = None
         self.cluster_graph: np.ndarray[Any, np.dtype[np.int64]] | None = None
@@ -55,139 +83,321 @@ class MultiMaps:
     def atcontactspace(self) -> pd.DataFrame:
         return self._build_dataset(recompute=True)
 
-    def reduce(
-        self, npca: int | None = None, scale: bool = False
-    ) -> tuple[Figure, AxesLike, AxesLike] | None:
+    def analyze_pca(self, scale: bool = False) -> PCAAnalysisResult:
         data = self._ensure_data()
-        features = data[self.features].values.astype(np.float64)
-        if scale:
-            features = StandardScaler().fit_transform(features)
+        X = data[self.features].values.astype(np.float64)
+        result = fit_pca_analysis(X, feature_columns=list(self.features), scale=scale)
+        self.pca_analysis_result = result
+        return result
 
-        if npca is not None:
-            self.npca = npca
-            pca = PCA(npca)
-            pca_features = [f"pca{i:1d}" for i in range(npca)]
-            data.loc[:, pca_features] = pca.fit_transform(features)
-            self._propagate_columns(pca_features)
-            return None
-
-        pca = PCA()
-        pca.fit(features)
-        explained_variance = np.cumsum(pca.explained_variance_ratio_)
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
-        ax1.plot(range(1, len(explained_variance) + 1), explained_variance, marker="o")
-        ax1.set_xlabel("Number of Components")
-        ax1.set_ylabel("Cumulative Explained Variance")
-        ax1.grid(True)
-        ax1.set_title("Optimal Number of Components in PCA")
-        ax1.axhline(y=0.98, color="r", linestyle="--")
-        ax2.plot(
-            range(1, len(pca.explained_variance_ratio_) + 1),
-            pca.explained_variance_ratio_,
-            marker="o",
-        )
-        ax2.set_xlabel("Number of Components")
-        ax2.set_ylabel("Explained Variance Ratio")
-        ax2.set_title("Scree Plot")
-        ax2.grid(True)
-        return fig, ax1, ax2
+    def reduce(self, npca: int | None = None, scale: bool = False) -> PCAAnalysisResult | PCAResult:
+        if npca is None:
+            return self.analyze_pca(scale=scale)
+        data = self._ensure_data()
+        analysis = self.analyze_pca(scale=scale)
+        result = project_pca(analysis, data[self.features].values.astype(np.float64), npca=npca)
+        self.npca = npca
+        self.pca_result = result
+        data.loc[:, result.transformed_columns] = result.transformed_values
+        self._propagate_columns(result.transformed_columns)
+        return result
 
     def cluster(
         self,
         nclusters: int | None = None,
         features: list[str] | None = None,
+        method: str = "spectral",
         maxclusters: int = 20,
         ntries: int = 1,
         random_state: int | None = None,
         scale: bool = False,
-    ) -> tuple[Figure, AxesLike, AxesLike] | None:
+        graph: GraphResult | None = None,
+    ) -> ClusterResult | ClusterScreeningResult:
         data = self._ensure_data()
         self.cluster_features = list(features) if features is not None else list(self.features)
+        self.cluster_method = normalize_cluster_method(method)
         X = data[self.cluster_features].values.astype(np.float64)
-        if scale:
-            X = StandardScaler().fit_transform(X)
+        if graph is not None and graph.matrix.shape[0] != len(X):
+            raise ValueError(
+                f"graph has {graph.matrix.shape[0]} nodes, expected {len(X)} to match multimaps.data."
+            )
 
         if nclusters is not None:
             chosen_random_state = self._select_random_state(nclusters, random_state)
-            labels = SpectralClustering(
-                n_clusters=nclusters, random_state=chosen_random_state
-            ).fit_predict(X)
-            data.loc[:, "Cluster"] = labels
-            self.nclusters = nclusters
-            self.cluster_centers = (
-                data.groupby("Cluster")[self.cluster_features].mean().values.astype(np.float64)
+            screening_result = (
+                ClusterScreeningResult(
+                    method=self.cluster_method,
+                    feature_columns=list(self.cluster_features),
+                    scale=scale,
+                    table=self.cluster_screening.copy(),
+                    best_by_db=self.best_clusters.copy(),
+                    best_by_silhouette=self.cluster_screening.loc[
+                        self.cluster_screening.groupby("nclusters")["silhouette_score"].idxmax()
+                    ].copy(),
+                )
+                if self.cluster_screening is not None
+                and self.best_clusters is not None
+                and self.cluster_screening_method == self.cluster_method
+                else None
             )
-            self.cluster_graph = self._aggregate_graph(labels.astype(np.int64))
+            result = fit_clusters(
+                X,
+                feature_columns=list(self.cluster_features),
+                nclusters=nclusters,
+                method=self.cluster_method,
+                random_state=chosen_random_state,
+                scale=scale,
+                screening=screening_result,
+                graph=graph,
+            )
+            data.loc[:, "Cluster"] = result.labels
+            self.nclusters = nclusters
+            self.cluster_result = result
+            self.cluster_centers = result.centers
+            self.cluster_graph = self._aggregate_graph(result.labels.astype(np.int64))
             self.cluster_edges = self.cluster_graph.copy()
             for i in range(nclusters):
                 self.cluster_edges[i, i] = 0
+            result.graph = self.cluster_graph
+            result.edges = self.cluster_edges
             self._propagate_columns(["Cluster"])
-            return None
+            return result
 
-        cluster_range = range(2, maxclusters)
-        cluster_random_states: list[int] = []
-        cluster_sizes: list[int] = []
-        silhouette_scores: list[float] = []
-        db_indexes: list[float] = []
-
-        for candidate_nclusters in cluster_range:
-            random_states = np.random.randint(0, 1000, ntries)
-            for candidate_random_state in random_states:
-                cluster_random_states.append(int(candidate_random_state))
-                labels = SpectralClustering(
-                    n_clusters=candidate_nclusters,
-                    random_state=int(candidate_random_state),
-                ).fit_predict(X)
-                actual_nclusters = len(np.unique(labels))
-                cluster_sizes.append(actual_nclusters)
-                silhouette_scores.append(silhouette_score(X, labels))
-                db_indexes.append(davies_bouldin_score(X, labels))
-
-        self.cluster_screening = pd.DataFrame(
-            {
-                "nclusters": cluster_sizes,
-                "random_state": cluster_random_states,
-                "silhouette_score": silhouette_scores,
-                "db_index": db_indexes,
-            }
+        screening = screen_clusters(
+            X,
+            feature_columns=list(self.cluster_features),
+            method=self.cluster_method,
+            maxclusters=maxclusters,
+            ntries=ntries,
+            scale=scale,
+            graph=graph,
         )
-        best_db = self.cluster_screening.loc[
-            self.cluster_screening.groupby("nclusters")["db_index"].idxmin()
+        self.cluster_screening = screening.table.copy()
+        self.cluster_screening_method = screening.method
+        self.best_clusters = screening.best_by_db.copy()
+        return screening
+
+    def build_graph(
+        self,
+        *,
+        mode: GraphMode = "hybrid",
+        feature_columns: list[str] | None = None,
+        node_weight_column: str = "probability",
+        feature_k: int = 8,
+        sigma_feature: float | None = None,
+        realspace_weight: float = 1.0,
+        feature_weight: float = 1.0,
+        connect_systems: bool = False,
+        normalize_node_weights: bool = True,
+        use_node_weights_in_edges: bool = True,
+        direction_columns: tuple[str, str, str] | None = None,
+        directional_weight: float = 0.0,
+        directional_power: float = 1.0,
+    ) -> GraphResult:
+        data = self._ensure_data()
+        selected_features = (
+            list(feature_columns) if feature_columns is not None else list(self.features)
+        )
+        node_table = data.loc[
+            :, ["system", "map_index", "point_index", "x", "y", "z", *selected_features]
+        ].copy()
+        node_table.insert(0, "global_point_index", data.index.to_numpy(dtype=np.int64))
+        required_columns = [node_weight_column]
+        if directional_weight > 0.0:
+            required_columns.extend(
+                list(
+                    direction_columns
+                    or (
+                        "boundary_gradient_x",
+                        "boundary_gradient_y",
+                        "boundary_gradient_z",
+                    )
+                )
+            )
+        for column in required_columns:
+            if column in node_table.columns:
+                continue
+            if column in data.columns:
+                node_table.loc[:, column] = data[column].to_numpy()
+            else:
+                node_table.loc[:, column] = self._collect_contactspace_column(column)
+
+        neighbors = self._combine_contactspace_neighbors()
+        result = build_point_graph(
+            node_table,
+            mode=mode,
+            feature_columns=selected_features,
+            neighbors=neighbors,
+            node_weight_column=node_weight_column,
+            feature_k=feature_k,
+            sigma_feature=sigma_feature,
+            realspace_weight=realspace_weight,
+            feature_weight=feature_weight,
+            connect_systems=connect_systems,
+            system_ids=node_table["map_index"].to_numpy(dtype=np.int64),
+            normalize_node_weights=normalize_node_weights,
+            use_node_weights_in_edges=use_node_weights_in_edges,
+            direction_columns=direction_columns,
+            directional_weight=directional_weight,
+            directional_power=directional_power,
+        )
+        self.graph_result = result
+        return result
+
+    def select_archetypes(
+        self,
+        n_archetypes: int,
+        *,
+        feature_columns: list[str] | None = None,
+        probability_column: str = "probability",
+        region: int | None = None,
+        min_probability: float | None = None,
+        min_probability_quantile: float | None = 0.75,
+        scale_features: bool = True,
+        probability_weight: float = 1.0,
+        extremeness_weight: float = 1.0,
+        diversity_weight: float = 1.0,
+        register: bool = True,
+        kind: str = "archetype",
+        iteration: int | None = 0,
+        label_status: str = "unlabeled",
+        replace_kind: bool = True,
+    ) -> ArchetypeSelectionResult:
+        data = self._ensure_data()
+        resolved_feature_columns = (
+            list(feature_columns) if feature_columns is not None else list(self.features)
+        )
+        point_table = data.copy()
+        point_table.loc[:, "global_point_index"] = data.index.to_numpy(dtype=np.int64)
+        if probability_column not in point_table.columns:
+            point_table.loc[:, probability_column] = self._collect_contactspace_column(
+                probability_column
+            )
+
+        candidate_mask: np.ndarray[Any, np.dtype[np.bool_]] | None = None
+        if region is not None:
+            candidate_mask = self._collect_contactspace_column("region").astype(np.int64) == region
+
+        result = select_feature_archetypes(
+            point_table,
+            n_archetypes=n_archetypes,
+            feature_columns=resolved_feature_columns,
+            probability_column=probability_column,
+            point_index_column="global_point_index",
+            candidate_mask=candidate_mask,
+            min_probability=min_probability,
+            min_probability_quantile=min_probability_quantile,
+            scale_features=scale_features,
+            probability_weight=probability_weight,
+            extremeness_weight=extremeness_weight,
+            diversity_weight=diversity_weight,
+        )
+        self.archetype_selection_result = result
+
+        if register:
+            if replace_kind:
+                for maps in self.maps:
+                    maps.special_points.remove(kind=kind)
+            self._register_archetypes_on_children(
+                result.archetype_table,
+                kind=kind,
+                iteration=iteration,
+                label_status=label_status,
+            )
+
+        return result
+
+    def propagate_archetypes(
+        self,
+        *,
+        graph: GraphResult | None = None,
+        selected_indexes: npt.ArrayLike | None = None,
+        alpha: float = 0.9,
+        max_iter: int = 500,
+        tol: float = 1.0e-8,
+        confidence_threshold: float = 0.5,
+        margin_threshold: float = 0.0,
+        kind: str = "archetype",
+        update_data: bool = True,
+    ) -> ArchetypePropagationResult:
+        data = self._ensure_data()
+        if selected_indexes is None:
+            if self.archetype_selection_result is None:
+                raise RuntimeError(
+                    "No archetype seeds available. Call multimaps.select_archetypes(...) first "
+                    "or pass selected_indexes explicitly."
+                )
+            selected = self.archetype_selection_result.selected_indexes
+        else:
+            selected = np.asarray(selected_indexes, dtype=np.int64).reshape(-1)
+        if selected.size == 0:
+            raise RuntimeError("No archetype seeds available for propagation.")
+
+        selected_graph = graph if graph is not None else self.graph_result
+        if selected_graph is None:
+            raise RuntimeError(
+                "No graph available for propagation. Call multimaps.build_graph(...) first "
+                "or pass graph explicitly."
+            )
+        if "global_point_index" not in selected_graph.node_table.columns:
+            selected_graph.node_table.loc[:, "global_point_index"] = np.arange(
+                len(selected_graph.node_table), dtype=np.int64
+            )
+
+        result = propagate_archetypes_on_graph(
+            selected_graph,
+            selected_indexes=selected,
+            point_index_column="global_point_index",
+            alpha=alpha,
+            max_iter=max_iter,
+            tol=tol,
+            confidence_threshold=confidence_threshold,
+            margin_threshold=margin_threshold,
+        )
+        self.archetype_propagation_result = result
+
+        if update_data:
+            assignment = result.assignment_table.set_index("global_point_index")
+            columns = [
+                "assigned_archetype_rank",
+                "assigned_archetype_index",
+                "archetype_confidence",
+                "archetype_margin",
+                "is_ambiguous",
+            ]
+            data.loc[assignment.index, columns] = assignment.loc[:, columns]
+            self._propagate_columns(columns)
+
+        valid_assignments = result.assigned_archetype_indexes[
+            result.assigned_archetype_indexes >= 0
         ]
-        best_sil = self.cluster_screening.loc[
-            self.cluster_screening.groupby("nclusters")["silhouette_score"].idxmax()
-        ]
-        self.best_clusters = best_db
+        assignment_table = result.assignment_table
+        seed_rows = data.loc[selected, ["map_index", "point_index"]].copy()
+        for map_index, group in seed_rows.groupby("map_index"):
+            local_point_indexes = group["point_index"].to_numpy(dtype=np.int64)
+            global_ids = group.index.to_numpy(dtype=np.int64)
+            assigned_counts = np.array(
+                [int(np.count_nonzero(valid_assignments == global_id)) for global_id in global_ids],
+                dtype=np.int64,
+            )
+            mean_confidences = []
+            for global_id in global_ids:
+                point_mask = assignment_table["assigned_archetype_index"].to_numpy(
+                    dtype=np.int64
+                ) == int(global_id)
+                mean_confidences.append(
+                    float(assignment_table.loc[point_mask, "archetype_confidence"].mean())
+                    if np.any(point_mask)
+                    else 0.0
+                )
+            self.maps[int(map_index)].update_special_points(
+                kind=kind,
+                point_indexes=local_point_indexes,
+                assigned_point_count=assigned_counts,
+                mean_assignment_confidence=np.asarray(mean_confidences, dtype=np.float64),
+            )
 
-        fig, ax1 = plt.subplots()
-        ax1.scatter(
-            cluster_sizes,
-            silhouette_scores,
-            color="b",
-            marker="o",
-            label="Silhouette Score",
-        )
-        ax1.plot(best_db["nclusters"], best_db["silhouette_score"], "-", color="b")
-        ax1.plot(best_sil["nclusters"], best_sil["silhouette_score"], ":", color="b")
-        ax1.set_xlabel("Number of Clusters")
-        ax1.set_ylabel("Silhouette Score", color="b")
-        ax1.tick_params(axis="y", labelcolor="b")
-
-        ax2 = ax1.twinx()
-        ax2.scatter(
-            cluster_sizes,
-            db_indexes,
-            color="r",
-            marker="s",
-            label="Davies-Bouldin Index",
-        )
-        ax2.plot(best_db["nclusters"], best_db["db_index"], "-", color="r")
-        ax2.plot(best_sil["nclusters"], best_sil["db_index"], ":", color="r")
-        ax2.set_ylabel("Davies-Bouldin Index", color="r")
-        ax2.tick_params(axis="y", labelcolor="r")
-        ax1.set_title("Silhouette Score and Davies-Bouldin Index vs. Number of Clusters")
-        ax1.grid(True)
-        return fig, ax1, ax2
+        return result
 
     def _build_dataset(self, recompute: bool) -> pd.DataFrame:
         frames: list[pd.DataFrame] = []
@@ -256,15 +466,72 @@ class MultiMaps:
         graph = np.zeros((self.nclusters, self.nclusters), dtype=np.int64)
         for maps, data_slice in zip(self.maps, self._slices, strict=False):
             local_labels = labels[data_slice]
-            local_graph = maps.graph(local_labels)
+            if maps.contactspace is None:
+                raise RuntimeError("Each Maps instance must define a contact space")
+            local_graph = aggregate_cluster_graph(local_labels, maps.contactspace.neighbors)
             nrows, ncols = local_graph.shape
             graph[:nrows, :ncols] += local_graph
         return graph
 
+    def _collect_contactspace_column(self, column: str) -> np.ndarray[Any, np.dtype[np.float64]]:
+        values: list[np.ndarray[Any, np.dtype[np.float64]]] = []
+        for maps in self.maps:
+            if maps.contactspace is None:
+                raise RuntimeError("Each Maps instance must define a contact space")
+            if column not in maps.contactspace.data.columns:
+                raise ValueError(
+                    f"node_weight_column {column!r} not present in child contactspace.data."
+                )
+            values.append(maps.contactspace.data[column].to_numpy(dtype=np.float64))
+        return np.concatenate(values).astype(np.float64, copy=False)
+
+    def _register_archetypes_on_children(
+        self,
+        archetype_table: pd.DataFrame,
+        *,
+        kind: str,
+        iteration: int | None,
+        label_status: str,
+    ) -> None:
+        for map_index, group in archetype_table.groupby("map_index", sort=False):
+            ordered = group.sort_values("selection_rank").reset_index(drop=True)
+            self.maps[int(map_index)].add_special_points(
+                ordered["point_index"].to_numpy(dtype=np.int64),
+                kind=kind,
+                iteration=iteration,
+                label_status=label_status,
+                replace_kind=False,
+                selection_rank=ordered["selection_rank"].to_numpy(dtype=np.int64),
+                selection_score=ordered["selection_score"].to_numpy(dtype=np.float64),
+                probability_score=ordered["probability_score"].to_numpy(dtype=np.float64),
+                extremeness_score=ordered["extremeness_score"].to_numpy(dtype=np.float64),
+                diversity_score=ordered["diversity_score"].to_numpy(dtype=np.float64),
+            )
+
+    def _combine_contactspace_neighbors(self) -> list[np.ndarray[Any, np.dtype[np.int64]]]:
+        combined: list[np.ndarray[Any, np.dtype[np.int64]]] = []
+        offset = 0
+        for maps in self.maps:
+            if maps.contactspace is None:
+                raise RuntimeError("Each Maps instance must define a contact space")
+            for row in maps.contactspace.neighbors:
+                local_neighbors = np.asarray(row, dtype=np.int64).reshape(-1).copy()
+                mask = local_neighbors >= 0
+                local_neighbors[mask] += offset
+                combined.append(local_neighbors)
+            offset += len(maps.contactspace.neighbors)
+        return combined
+
     def _select_random_state(self, nclusters: int, random_state: int | None) -> int:
+        if not clustering_uses_random_state(self.cluster_method):
+            return 0
         if random_state is not None:
             return random_state
-        if self.best_clusters is not None and nclusters in self.best_clusters["nclusters"].values:
+        if (
+            self.best_clusters is not None
+            and self.cluster_screening_method == self.cluster_method
+            and nclusters in self.best_clusters["nclusters"].values
+        ):
             return int(
                 self.best_clusters[self.best_clusters["nclusters"] == nclusters][
                     "random_state"

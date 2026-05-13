@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 import shlex
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -13,11 +13,18 @@ import numpy as np
 import pandas as pd
 from ase import Atoms
 from ase.constraints import FixAtoms, FixCartesian
+from ase.data import atomic_masses, atomic_numbers
 
 from .cluster import SlurmTemplate
 
 QE_RUNNER_RESULT = dict[str, Any]
 BOHR_TO_ANG = 0.529177210903
+RY_TO_EV = 13.605693122994
+EV_TO_J = 1.602176634e-19
+ANG_TO_M = 1.0e-10
+AMU_TO_KG = 1.66053906660e-27
+LIGHT_SPEED_M_S = 299792458.0
+PLANCK_EV_S = 4.135667696e-15
 ATTEMPT_PATTERN = re.compile(r"^(?P<stem>.+)\.r(?P<index>\d{3})(?P<suffix>\.[^.]+)$")
 
 
@@ -38,6 +45,254 @@ def _attempt_index_from_name(filename: str, base_filename: str) -> int | None:
     if match.group("stem") != base.stem or match.group("suffix") != base.suffix:
         return None
     return int(match.group("index"))
+
+
+def _default_reference_map_index(
+    *,
+    maps: Any,
+    special_point: Any,
+    explicit_map_index: int | None = None,
+) -> int | None:
+    if explicit_map_index is not None:
+        return int(explicit_map_index)
+    if isinstance(special_point, Mapping) and "map_index" in special_point:
+        value = special_point["map_index"]
+        if value is not None and not pd.isna(value):
+            return int(value)
+    return 0
+
+
+@dataclass
+class AdsorptionEnergyParser:
+    """Wrap a point parser and append adsorption-energy metadata from workflow references."""
+
+    base_parser: Callable[..., dict[str, Any]]
+    adsorbed_energy_column: str = "E_bfgs_final_Ry"
+    adsorption_energy_column: str = "E_ads_Ry"
+    slab_reference_name: str = "clean_slab"
+    slab_reference_column: str = "reference_energy_Ry"
+    gas_reference_name: str | None = "H2"
+    gas_reference_column: str = "reference_energy_Ry"
+    gas_multiplier: float = 0.5
+    include_reference_metadata: bool = True
+    map_index_resolver: Callable[..., int | None] | None = None
+
+    def parse(
+        self,
+        *,
+        output_file: str | Path,
+        maps: Any,
+        workflow: Any,
+        special_point: Any,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        parsed = dict(
+            self.base_parser(
+                output_file=output_file,
+                maps=maps,
+                workflow=workflow,
+                special_point=special_point,
+                **kwargs,
+            )
+        )
+        adsorbed_energy = float(parsed[self.adsorbed_energy_column])
+
+        explicit_map_index = kwargs.get("map_index")
+        resolved_map_index = (
+            self.map_index_resolver(
+                maps=maps,
+                workflow=workflow,
+                special_point=special_point,
+                output_file=output_file,
+                parsed=parsed,
+                map_index=explicit_map_index,
+                **kwargs,
+            )
+            if self.map_index_resolver is not None
+            else _default_reference_map_index(
+                maps=maps,
+                special_point=special_point,
+                explicit_map_index=explicit_map_index,
+            )
+        )
+
+        slab_reference = workflow.get_reference(
+            self.slab_reference_name,
+            map_index=resolved_map_index,
+        )
+        slab_energy = float(slab_reference[self.slab_reference_column])
+
+        gas_energy = 0.0
+        if self.gas_reference_name is not None:
+            gas_reference = workflow.get_reference(self.gas_reference_name)
+            gas_energy = float(gas_reference[self.gas_reference_column])
+
+        adsorption_energy = adsorbed_energy - slab_energy - float(self.gas_multiplier) * gas_energy
+        parsed[self.adsorption_energy_column] = adsorption_energy
+
+        if self.include_reference_metadata:
+            parsed[f"{self.slab_reference_name}_{self.slab_reference_column}"] = slab_energy
+            if self.gas_reference_name is not None:
+                parsed[f"{self.gas_reference_name}_{self.gas_reference_column}"] = gas_energy
+                parsed[f"{self.gas_reference_name}_multiplier"] = float(self.gas_multiplier)
+            if resolved_map_index is not None:
+                parsed["reference_map_index"] = int(resolved_map_index)
+
+        return parsed
+
+    def __call__(
+        self,
+        output_file: str | Path,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        return self.parse(output_file=output_file, **kwargs)
+
+
+@dataclass
+class CHEAdsorptionEnergyParser:
+    """Wrap an adsorption-energy parser and append a constant CHE free-energy shift."""
+
+    base_parser: Callable[..., dict[str, Any]]
+    free_energy_shift_eV: float = 0.24
+    adsorption_energy_column: str = "E_ads_Ry"
+    free_energy_column_ry: str = "G_ads_CHE_Ry"
+    free_energy_column_ev: str = "G_ads_CHE_eV"
+    shift_column_ev: str = "G_ads_CHE_shift_eV"
+
+    def parse(
+        self,
+        *,
+        output_file: str | Path,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        parsed = dict(self.base_parser(output_file=output_file, **kwargs))
+        shift_ry = float(self.free_energy_shift_eV) / RY_TO_EV
+        parsed[self.free_energy_column_ry] = float(parsed[self.adsorption_energy_column]) + shift_ry
+        parsed[self.free_energy_column_ev] = parsed[self.free_energy_column_ry] * RY_TO_EV
+        parsed[self.shift_column_ev] = float(self.free_energy_shift_eV)
+        return parsed
+
+    def __call__(
+        self,
+        output_file: str | Path,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        return self.parse(output_file=output_file, **kwargs)
+
+
+def build_adsorption_energy_parser(
+    base_parser: Callable[..., dict[str, Any]],
+    *,
+    adsorbed_energy_column: str = "E_bfgs_final_Ry",
+    adsorption_energy_column: str = "E_ads_Ry",
+    slab_reference_name: str = "clean_slab",
+    slab_reference_column: str = "reference_energy_Ry",
+    gas_reference_name: str | None = "H2",
+    gas_reference_column: str = "reference_energy_Ry",
+    gas_multiplier: float = 0.5,
+    include_reference_metadata: bool = True,
+    map_index_resolver: Callable[..., int | None] | None = None,
+) -> AdsorptionEnergyParser:
+    """Return an AdsorptionEnergyParser wrapper."""
+    return AdsorptionEnergyParser(
+        base_parser=base_parser,
+        adsorbed_energy_column=adsorbed_energy_column,
+        adsorption_energy_column=adsorption_energy_column,
+        slab_reference_name=slab_reference_name,
+        slab_reference_column=slab_reference_column,
+        gas_reference_name=gas_reference_name,
+        gas_reference_column=gas_reference_column,
+        gas_multiplier=gas_multiplier,
+        include_reference_metadata=include_reference_metadata,
+        map_index_resolver=map_index_resolver,
+    )
+
+
+def build_che_adsorption_energy_parser(
+    base_parser: Callable[..., dict[str, Any]],
+    *,
+    free_energy_shift_eV: float = 0.24,
+    adsorbed_energy_column: str = "E_bfgs_final_Ry",
+    adsorption_energy_column: str = "E_ads_Ry",
+    slab_reference_name: str = "clean_slab",
+    slab_reference_column: str = "reference_energy_Ry",
+    gas_reference_name: str | None = "H2",
+    gas_reference_column: str = "reference_energy_Ry",
+    gas_multiplier: float = 0.5,
+    include_reference_metadata: bool = True,
+    map_index_resolver: Callable[..., int | None] | None = None,
+    free_energy_column_ry: str = "G_ads_CHE_Ry",
+    free_energy_column_ev: str = "G_ads_CHE_eV",
+    shift_column_ev: str = "G_ads_CHE_shift_eV",
+) -> CHEAdsorptionEnergyParser:
+    """Return a CHEAdsorptionEnergyParser wrapper."""
+    return CHEAdsorptionEnergyParser(
+        base_parser=AdsorptionEnergyParser(
+            base_parser=base_parser,
+            adsorbed_energy_column=adsorbed_energy_column,
+            adsorption_energy_column=adsorption_energy_column,
+            slab_reference_name=slab_reference_name,
+            slab_reference_column=slab_reference_column,
+            gas_reference_name=gas_reference_name,
+            gas_reference_column=gas_reference_column,
+            gas_multiplier=gas_multiplier,
+            include_reference_metadata=include_reference_metadata,
+            map_index_resolver=map_index_resolver,
+        ),
+        free_energy_shift_eV=free_energy_shift_eV,
+        adsorption_energy_column=adsorption_energy_column,
+        free_energy_column_ry=free_energy_column_ry,
+        free_energy_column_ev=free_energy_column_ev,
+        shift_column_ev=shift_column_ev,
+    )
+
+
+def build_relax_adsorption_parser(
+    *,
+    adsorbate_label: str = "last_atom",
+    iteration: int = 1,
+    mark_unconverged_as_failed: bool = True,
+    adsorbed_energy_column: str = "E_bfgs_final_Ry",
+    adsorption_energy_column: str = "E_ads_Ry",
+    slab_reference_name: str = "clean_slab",
+    slab_reference_column: str = "reference_energy_Ry",
+    gas_reference_name: str | None = "H2",
+    gas_reference_column: str = "reference_energy_Ry",
+    gas_multiplier: float = 0.5,
+    include_reference_metadata: bool = True,
+    map_index_resolver: Callable[..., int | None] | None = None,
+    che_shift_eV: float | None = None,
+    free_energy_column_ry: str = "G_ads_CHE_Ry",
+    free_energy_column_ev: str = "G_ads_CHE_eV",
+    shift_column_ev: str = "G_ads_CHE_shift_eV",
+) -> Callable[..., dict[str, Any]]:
+    """Build a QE relax parser that also computes adsorption energy and optional CHE shift."""
+    adsorption_parser = AdsorptionEnergyParser(
+        base_parser=QuantumEspressoRelaxParser(
+            iteration=iteration,
+            adsorbate_label=adsorbate_label,
+            mark_unconverged_as_failed=mark_unconverged_as_failed,
+        ),
+        adsorbed_energy_column=adsorbed_energy_column,
+        adsorption_energy_column=adsorption_energy_column,
+        slab_reference_name=slab_reference_name,
+        slab_reference_column=slab_reference_column,
+        gas_reference_name=gas_reference_name,
+        gas_reference_column=gas_reference_column,
+        gas_multiplier=gas_multiplier,
+        include_reference_metadata=include_reference_metadata,
+        map_index_resolver=map_index_resolver,
+    )
+    if che_shift_eV is None:
+        return adsorption_parser
+    return CHEAdsorptionEnergyParser(
+        base_parser=adsorption_parser,
+        free_energy_shift_eV=che_shift_eV,
+        adsorption_energy_column=adsorption_energy_column,
+        free_energy_column_ry=free_energy_column_ry,
+        free_energy_column_ev=free_energy_column_ev,
+        shift_column_ev=shift_column_ev,
+    )
 
 
 @dataclass
@@ -210,6 +465,77 @@ class QuantumEspressoSetup:
         folder_name = name_template.format(point_index=point_index)
         return Path(root).expanduser() / folder_name
 
+    def resolve_reference_subpath(
+        self,
+        reference_name: str,
+        *,
+        scope: str,
+        map_index: int | None = None,
+        system_name: str | None = None,
+        directory_template: str | None = None,
+    ) -> Path:
+        """Resolve the relative directory used for a reference calculation."""
+        template = directory_template
+        if template is None:
+            if scope == "global":
+                template = "global/{reference_name}"
+            elif scope == "per_map":
+                template = "map_{map_index}/{reference_name}"
+            else:
+                raise ValueError(f"Unsupported reference scope {scope!r}.")
+        return Path(
+            template.format(
+                reference_name=reference_name,
+                map_index=0 if map_index is None else int(map_index),
+                system_name="" if system_name is None else str(system_name),
+            )
+        )
+
+    def resolve_reference_workdir(
+        self,
+        reference_name: str,
+        *,
+        scope: str,
+        map_index: int | None = None,
+        system_name: str | None = None,
+        reference_root: str | Path | None = "references",
+        directory_template: str | None = None,
+    ) -> Path:
+        """Resolve the work directory for a workflow reference calculation."""
+        subpath = self.resolve_reference_subpath(
+            reference_name,
+            scope=scope,
+            map_index=map_index,
+            system_name=system_name,
+            directory_template=directory_template,
+        )
+        if reference_root is None:
+            return subpath
+        return Path(reference_root).expanduser() / subpath
+
+    def resolve_reference_outdir(
+        self,
+        reference_name: str,
+        *,
+        scope: str,
+        map_index: int | None = None,
+        system_name: str | None = None,
+        outdir_root: str | Path | None = None,
+        outdir_template: str | None = None,
+    ) -> Path | None:
+        """Resolve the QE outdir for a workflow reference calculation, if configured."""
+        root = self.outdir_root if outdir_root is None else outdir_root
+        if root is None:
+            return None
+        subpath = self.resolve_reference_subpath(
+            reference_name,
+            scope=scope,
+            map_index=map_index,
+            system_name=system_name,
+            directory_template=outdir_template,
+        )
+        return Path(root).expanduser() / subpath
+
     def attempt_filename(self, filename: str, attempt_index: int) -> str:
         """Return the filename for a specific retry attempt."""
         return _with_attempt_suffix(filename, attempt_index)
@@ -322,6 +648,62 @@ class QuantumEspressoSetup:
         energy = atoms_to_run.get_potential_energy()
 
         return {
+            "label_file": str(workdir),
+            "qe_outdir": str(qe_outdir) if qe_outdir is not None else None,
+            energy_key: energy,
+        }
+
+    def run_reference_calculation(
+        self,
+        reference_name: str,
+        atoms: Atoms,
+        *,
+        scope: str,
+        reference_file_column: str = "reference_file",
+        map_index: int | None = None,
+        system_name: str | None = None,
+        reference_root: str | Path | None = "references",
+        directory_template: str | None = None,
+        outdir_root: str | Path | None = None,
+        outdir_template: str | None = None,
+        calculator_overrides: dict[str, Any] | None = None,
+        espresso_cls: type[Any] | None = None,
+        profile_cls: type[Any] | None = None,
+        energy_key: str = "reference_runner_energy_Ry",
+    ) -> QE_RUNNER_RESULT:
+        """Run one QE reference job in a deterministic reference directory."""
+        workdir = self.resolve_reference_workdir(
+            reference_name,
+            scope=scope,
+            map_index=map_index,
+            system_name=system_name,
+            reference_root=reference_root,
+            directory_template=directory_template,
+        )
+        workdir.mkdir(parents=True, exist_ok=True)
+        qe_outdir = self.resolve_reference_outdir(
+            reference_name,
+            scope=scope,
+            map_index=map_index,
+            system_name=system_name,
+            outdir_root=outdir_root,
+            outdir_template=outdir_template,
+        )
+        if qe_outdir is not None:
+            qe_outdir.mkdir(parents=True, exist_ok=True)
+
+        atoms_to_run = atoms.copy()
+        atoms_to_run.calc = self.make_calculator(
+            directory=workdir,
+            qe_outdir=qe_outdir,
+            espresso_cls=espresso_cls,
+            profile_cls=profile_cls,
+            calculator_overrides=calculator_overrides,
+        )
+        energy = atoms_to_run.get_potential_energy()
+
+        return {
+            reference_file_column: str(workdir),
             "label_file": str(workdir),
             "qe_outdir": str(qe_outdir) if qe_outdir is not None else None,
             energy_key: energy,
@@ -681,6 +1063,108 @@ class QuantumEspressoSetup:
             )
         return metadata
 
+    def prepare_reference_calculation(
+        self,
+        reference_name: str,
+        atoms: Atoms,
+        *,
+        scope: str,
+        scheduler_template: SlurmTemplate,
+        reference_file_column: str = "reference_file",
+        map_index: int | None = None,
+        system_name: str | None = None,
+        reference_root: str | Path | None = "references",
+        directory_template: str | None = None,
+        job_name_template: str | None = None,
+        outdir_root: str | Path | None = None,
+        outdir_template: str | None = None,
+        calculator_overrides: dict[str, Any] | None = None,
+        espresso_cls: type[Any] | None = None,
+        profile_cls: type[Any] | None = None,
+        input_writer: Callable[..., Any] | None = None,
+        submit: bool = False,
+        subprocess_run: Callable[..., Any] | None = None,
+    ) -> QE_RUNNER_RESULT:
+        """Prepare one QE reference job directory and Slurm script."""
+        workdir = self.resolve_reference_workdir(
+            reference_name,
+            scope=scope,
+            map_index=map_index,
+            system_name=system_name,
+            reference_root=reference_root,
+            directory_template=directory_template,
+        )
+        workdir.mkdir(parents=True, exist_ok=True)
+        qe_outdir = self.resolve_reference_outdir(
+            reference_name,
+            scope=scope,
+            map_index=map_index,
+            system_name=system_name,
+            outdir_root=outdir_root,
+            outdir_template=outdir_template,
+        )
+        if qe_outdir is not None:
+            qe_outdir.mkdir(parents=True, exist_ok=True)
+
+        atoms_to_write = atoms.copy()
+        calculator = self.make_calculator(
+            directory=workdir,
+            qe_outdir=qe_outdir,
+            espresso_cls=espresso_cls,
+            profile_cls=profile_cls,
+            calculator_overrides=calculator_overrides,
+        )
+        atoms_to_write.calc = calculator
+        self.write_inputs(
+            atoms_to_write,
+            calculator,
+            qe_outdir=qe_outdir,
+            directory=workdir,
+            input_writer=input_writer,
+        )
+
+        scheduler_for_job = scheduler_template
+        if qe_outdir is not None:
+            mkdir_outdir = f"mkdir -p {shlex.quote(str(qe_outdir))}"
+            if mkdir_outdir not in scheduler_template.setup_commands:
+                scheduler_for_job = replace(
+                    scheduler_template,
+                    setup_commands=[*scheduler_template.setup_commands, mkdir_outdir],
+                )
+
+        if job_name_template is None:
+            job_name_template = (
+                "qe-ref-{reference_name}"
+                if scope == "global"
+                else "qe-ref-{reference_name}-map{map_index}"
+            )
+        job_name = job_name_template.format(
+            reference_name=reference_name,
+            map_index=0 if map_index is None else int(map_index),
+            system_name="" if system_name is None else str(system_name),
+        )
+        script_path = scheduler_for_job.write(
+            workdir,
+            self.run_command(),
+            job_name=job_name,
+        )
+
+        metadata: QE_RUNNER_RESULT = {
+            reference_file_column: str(workdir),
+            "label_file": str(workdir),
+            "qe_outdir": str(qe_outdir) if qe_outdir is not None else None,
+            "submit_script": str(script_path),
+            "scheduler": "slurm",
+        }
+        if submit:
+            metadata.update(
+                scheduler_for_job.submit(
+                    script_path,
+                    subprocess_run=subprocess_run,
+                )
+            )
+        return metadata
+
     def build_single_adsorbate_runner(
         self,
         substrate: Atoms,
@@ -833,6 +1317,166 @@ class QuantumEspressoSetup:
             subprocess_run=subprocess_run,
             update_positions_from_output=True,
         )
+
+    def build_clean_slab_reference_runner(
+        self,
+        *,
+        reference_name: str = "clean_slab",
+        reference_root: str | Path | None = "references",
+        directory_template: str | None = None,
+        scheduler_template: SlurmTemplate | None = None,
+        job_name_template: str | None = None,
+        outdir_root: str | Path | None = None,
+        outdir_template: str | None = None,
+        calculator_overrides: dict[str, Any] | None = None,
+        espresso_cls: type[Any] | None = None,
+        profile_cls: type[Any] | None = None,
+        input_writer: Callable[..., Any] | None = None,
+        submit: bool = False,
+        subprocess_run: Callable[..., Any] | None = None,
+        energy_key: str = "reference_runner_energy_Ry",
+    ) -> Callable[..., QE_RUNNER_RESULT]:
+        """Build a workflow reference runner for the clean substrate of each map."""
+
+        def runner(
+            *,
+            maps: Any,
+            workflow: Any,
+            reference: Any,
+            map_index: int | None = None,
+            system_name: str | None = None,
+            **_: Any,
+        ) -> QE_RUNNER_RESULT:
+            atoms = cast(Atoms, maps.system.atoms.copy())
+            scope = getattr(reference, "scope", "per_map")
+            file_column = getattr(reference, "file_column", "reference_file")
+            actual_name = str(getattr(reference, "name", reference_name))
+            if scheduler_template is None:
+                return self.run_reference_calculation(
+                    actual_name,
+                    atoms,
+                    scope=scope,
+                    reference_file_column=file_column,
+                    map_index=map_index,
+                    system_name=system_name,
+                    reference_root=reference_root,
+                    directory_template=directory_template,
+                    outdir_root=outdir_root,
+                    outdir_template=outdir_template,
+                    calculator_overrides=calculator_overrides,
+                    espresso_cls=espresso_cls,
+                    profile_cls=profile_cls,
+                    energy_key=energy_key,
+                )
+            return self.prepare_reference_calculation(
+                actual_name,
+                atoms,
+                scope=scope,
+                scheduler_template=scheduler_template,
+                reference_file_column=file_column,
+                map_index=map_index,
+                system_name=system_name,
+                reference_root=reference_root,
+                directory_template=directory_template,
+                job_name_template=job_name_template,
+                outdir_root=outdir_root,
+                outdir_template=outdir_template,
+                calculator_overrides=calculator_overrides,
+                espresso_cls=espresso_cls,
+                profile_cls=profile_cls,
+                input_writer=input_writer,
+                submit=submit,
+                subprocess_run=subprocess_run,
+            )
+
+        return runner
+
+    def build_h2_reference_runner(
+        self,
+        *,
+        reference_name: str = "H2",
+        reference_root: str | Path | None = "references",
+        directory_template: str | None = None,
+        scheduler_template: SlurmTemplate | None = None,
+        job_name_template: str | None = None,
+        outdir_root: str | Path | None = None,
+        outdir_template: str | None = None,
+        calculator_overrides: dict[str, Any] | None = None,
+        espresso_cls: type[Any] | None = None,
+        profile_cls: type[Any] | None = None,
+        input_writer: Callable[..., Any] | None = None,
+        submit: bool = False,
+        subprocess_run: Callable[..., Any] | None = None,
+        energy_key: str = "reference_runner_energy_Ry",
+        bond_length: float = 0.74,
+        vacuum: float = 8.0,
+        cell: Sequence[float] | np.ndarray | None = None,
+        pbc: bool | Sequence[bool] = False,
+        axis: str = "z",
+    ) -> Callable[..., QE_RUNNER_RESULT]:
+        """Build a workflow reference runner for an isolated H2 molecule."""
+
+        def runner(
+            *,
+            maps: Any,
+            workflow: Any,
+            reference: Any,
+            map_index: int | None = None,
+            system_name: str | None = None,
+            **_: Any,
+        ) -> QE_RUNNER_RESULT:
+            box = (
+                np.array(cell, dtype=float)
+                if cell is not None
+                else np.full(3, 2.0 * float(vacuum) + float(bond_length), dtype=float)
+            )
+            positions = np.zeros((2, 3), dtype=float)
+            axis_index = {"x": 0, "y": 1, "z": 2}[axis.lower()]
+            positions[1, axis_index] = float(bond_length)
+            atoms = Atoms("H2", positions=positions, cell=box, pbc=pbc)
+            atoms.center()
+            scope = getattr(reference, "scope", "global")
+            file_column = getattr(reference, "file_column", "reference_file")
+            actual_name = str(getattr(reference, "name", reference_name))
+            if scheduler_template is None:
+                return self.run_reference_calculation(
+                    actual_name,
+                    atoms,
+                    scope=scope,
+                    reference_file_column=file_column,
+                    map_index=map_index,
+                    system_name=system_name,
+                    reference_root=reference_root,
+                    directory_template=directory_template,
+                    outdir_root=outdir_root,
+                    outdir_template=outdir_template,
+                    calculator_overrides=calculator_overrides,
+                    espresso_cls=espresso_cls,
+                    profile_cls=profile_cls,
+                    energy_key=energy_key,
+                )
+            return self.prepare_reference_calculation(
+                actual_name,
+                atoms,
+                scope=scope,
+                scheduler_template=scheduler_template,
+                reference_file_column=file_column,
+                map_index=map_index,
+                system_name=system_name,
+                reference_root=reference_root,
+                directory_template=directory_template,
+                job_name_template=job_name_template,
+                outdir_root=outdir_root,
+                outdir_template=outdir_template,
+                calculator_overrides=calculator_overrides,
+                espresso_cls=espresso_cls,
+                profile_cls=profile_cls,
+                input_writer=input_writer,
+                submit=submit,
+                subprocess_run=subprocess_run,
+            )
+
+        return runner
 
 
 @dataclass
@@ -1360,6 +2004,32 @@ class _QuantumEspressoParserBase(ABC):
             return cast(np.ndarray, coords @ cell_angstrom)
         return np.full(3, np.nan, dtype=float)
 
+    @staticmethod
+    def _block_positions_angstrom(
+        block: dict[str, Any] | None,
+        *,
+        alat_angstrom: float = np.nan,
+        cell_angstrom: np.ndarray | None = None,
+    ) -> np.ndarray:
+        if block is None:
+            return np.zeros((0, 3), dtype=float)
+
+        unit = str(block["unit"])
+        coords = np.array(block["pos"], dtype=float)
+        if "ang" in unit:
+            return coords
+        if "bohr" in unit:
+            return coords * BOHR_TO_ANG
+        if "alat" in unit:
+            if np.isfinite(alat_angstrom):
+                return coords * alat_angstrom
+            return np.full(coords.shape, np.nan, dtype=float)
+        if "crystal" in unit:
+            if cell_angstrom is None:
+                return np.full(coords.shape, np.nan, dtype=float)
+            return cast(np.ndarray, coords @ cell_angstrom)
+        return np.full(coords.shape, np.nan, dtype=float)
+
 
 @dataclass
 class QuantumEspressoScfParser(_QuantumEspressoParserBase):
@@ -1392,6 +2062,348 @@ class QuantumEspressoScfParser(_QuantumEspressoParserBase):
             parsed["E_first_below_accuracy_threshold_Ry"] = match_energy
             parsed["acc_first_below_accuracy_threshold_Ry"] = match_accuracy
         return parsed
+
+
+@dataclass
+class QuantumEspressoEnergyParser(_QuantumEspressoParserBase):
+    """Minimal parser for final converged QE total energies."""
+
+    energy_column: str = "reference_energy_Ry"
+    require_converged_energy: bool = True
+
+    def parse(self, output_file: str | Path) -> dict[str, Any]:
+        folder, _, pwo_path = self._resolve_paths(output_file)
+        _, energy_last = self.converged_energies_first_last(pwo_path)
+        converged = bool(np.isfinite(energy_last))
+        parsed = {
+            "label_file": str(folder),
+            self.energy_column: energy_last,
+            "reference_converged": converged,
+            "n_scf_iterations": self.scf_iteration_count(pwo_path),
+        }
+        if self.require_converged_energy and not converged:
+            parsed["label_status"] = "failed"
+            parsed["label_error"] = (
+                "Quantum ESPRESSO energy parser could not find a converged "
+                f"'! total energy' line in {pwo_path.name}."
+            )
+        return parsed
+
+
+@dataclass
+class X2RelaxFrequencyParser(_QuantumEspressoParserBase):
+    """Estimate diatomic stretch curvature and vibrational frequency from a relax trajectory."""
+
+    atom_indices: tuple[int, int] = (0, 1)
+    fit_window: int = 5
+    mark_unconverged_as_failed: bool = True
+
+    def parse(self, output_file: str | Path) -> dict[str, Any]:
+        folder, pwi_path, pwo_path = self._resolve_paths(output_file)
+        pwo_lines = self._read_lines(pwo_path)
+        pwi_lines = self._read_lines(pwi_path)
+        alat_angstrom = self._extract_alat_angstrom_from_pwo(pwo_lines)
+        cell_pwi, cell_unit_pwi = self._parse_cell_parameters_from_lines(pwi_lines)
+        cell_angstrom_pwi = self._cell_to_angstrom(
+            cell_pwi,
+            unit=cell_unit_pwi,
+            alat_angstrom=alat_angstrom,
+        )
+
+        blocks = self._parse_atomic_positions_blocks(pwo_lines)
+        input_bond_length = self._bond_length_from_input(
+            pwi_lines,
+            alat_angstrom=alat_angstrom,
+            cell_angstrom=cell_angstrom_pwi,
+        )
+        output_bond_history = self._bond_length_history_from_blocks(
+            blocks,
+            alat_angstrom=alat_angstrom,
+            cell_angstrom=cell_angstrom_pwi,
+        )
+        energy_history_ry, bond_history = self._ordered_energy_and_bond_history_from_output(
+            pwo_lines,
+            input_bond_length=input_bond_length,
+            alat_angstrom=alat_angstrom,
+            cell_angstrom=cell_angstrom_pwi,
+        )
+        relax_converged = self.relaxation_converged(pwo_path)
+
+        parsed: dict[str, Any] = {
+            "label_file": str(folder),
+            "E_bfgs_steps_Ry": energy_history_ry,
+            "bond_length_bfgs_steps_A": bond_history,
+            "n_ionic_steps": int(output_bond_history.size),
+            "relax_converged": relax_converged,
+        }
+
+        if bond_history.size:
+            parsed["bond_length_final_A"] = float(bond_history[-1])
+        else:
+            parsed["bond_length_final_A"] = np.nan
+
+        symbols = self._diatomic_symbols(blocks, pwi_lines)
+        reduced_mass_amu = self._reduced_mass_amu(symbols)
+        parsed["reduced_mass_amu"] = reduced_mass_amu
+        if symbols is not None:
+            parsed["diatomic_symbols"] = tuple(symbols)
+
+        try:
+            fit = self._fit_diatomic_curvature(
+                bond_history,
+                energy_history_ry,
+                reduced_mass_amu=reduced_mass_amu,
+            )
+            parsed.update(fit)
+        except Exception as exc:
+            parsed["label_status"] = "failed"
+            parsed["label_error"] = str(exc)
+
+        if self.mark_unconverged_as_failed and not relax_converged:
+            parsed["label_status"] = "failed"
+            parsed["label_error"] = (
+                "Relax calculation did not converge: missing 'End of BFGS Geometry Optimization' "
+                f"marker in {pwo_path.name}."
+            )
+        return parsed
+
+    def _bond_length_history_from_blocks(
+        self,
+        blocks: list[dict[str, Any]],
+        *,
+        alat_angstrom: float,
+        cell_angstrom: np.ndarray | None,
+    ) -> np.ndarray:
+        distances: list[float] = []
+        for block in blocks:
+            positions = self._block_positions_angstrom(
+                block,
+                alat_angstrom=alat_angstrom,
+                cell_angstrom=cell_angstrom,
+            )
+            if positions.shape[0] <= max(self.atom_indices):
+                continue
+            pos_a = positions[self.atom_indices[0]]
+            pos_b = positions[self.atom_indices[1]]
+            distances.append(float(np.linalg.norm(pos_b - pos_a)))
+        return np.array(distances, dtype=float)
+
+    def _bond_length_from_input(
+        self,
+        pwi_lines: list[str],
+        *,
+        alat_angstrom: float,
+        cell_angstrom: np.ndarray | None,
+    ) -> float:
+        block = self._parse_atomic_positions_first_block(pwi_lines)
+        positions = self._block_positions_angstrom(
+            block,
+            alat_angstrom=alat_angstrom,
+            cell_angstrom=cell_angstrom,
+        )
+        if positions.shape[0] <= max(self.atom_indices):
+            return float("nan")
+        pos_a = positions[self.atom_indices[0]]
+        pos_b = positions[self.atom_indices[1]]
+        return float(np.linalg.norm(pos_b - pos_a))
+
+    def _bond_length_from_block(
+        self,
+        block: dict[str, Any] | None,
+        *,
+        alat_angstrom: float,
+        cell_angstrom: np.ndarray | None,
+    ) -> float:
+        positions = self._block_positions_angstrom(
+            block,
+            alat_angstrom=alat_angstrom,
+            cell_angstrom=cell_angstrom,
+        )
+        if positions.shape[0] <= max(self.atom_indices):
+            return float("nan")
+        pos_a = positions[self.atom_indices[0]]
+        pos_b = positions[self.atom_indices[1]]
+        return float(np.linalg.norm(pos_b - pos_a))
+
+    def _ordered_energy_and_bond_history_from_output(
+        self,
+        lines: list[str],
+        *,
+        input_bond_length: float,
+        alat_angstrom: float,
+        cell_angstrom: np.ndarray | None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        current_bond_length = float(input_bond_length)
+        energies: list[float] = []
+        bond_lengths: list[float] = []
+        index = 0
+        while index < len(lines):
+            energy_match = self.re_energy_converged.search(lines[index])
+            if energy_match is not None:
+                energies.append(float(energy_match.group(1)))
+                bond_lengths.append(current_bond_length)
+                index += 1
+                continue
+
+            atomic_match = self.re_atomic.match(lines[index])
+            if atomic_match is None:
+                index += 1
+                continue
+
+            unit = (atomic_match.group(1) or "").strip().lower()
+            index += 1
+            symbols: list[str] = []
+            positions: list[list[float]] = []
+            while index < len(lines):
+                atom_match = self.re_atom.match(lines[index])
+                if atom_match is None:
+                    break
+                symbols.append(atom_match.group(1))
+                positions.append(
+                    [
+                        float(atom_match.group(2)),
+                        float(atom_match.group(3)),
+                        float(atom_match.group(4)),
+                    ]
+                )
+                index += 1
+            if positions:
+                current_bond_length = self._bond_length_from_block(
+                    {
+                        "unit": unit,
+                        "symbols": symbols,
+                        "pos": np.array(positions, dtype=float),
+                    },
+                    alat_angstrom=alat_angstrom,
+                    cell_angstrom=cell_angstrom,
+                )
+            continue
+
+        return np.array(energies, dtype=float), np.array(bond_lengths, dtype=float)
+
+    def _diatomic_symbols(
+        self,
+        blocks: list[dict[str, Any]],
+        pwi_lines: list[str],
+    ) -> tuple[str, str] | None:
+        symbols: list[str] | None = None
+        if blocks:
+            symbols = list(blocks[0]["symbols"])
+        else:
+            block = self._parse_atomic_positions_first_block(pwi_lines)
+            if block is not None:
+                symbols = list(block["symbols"])
+        if symbols is None or len(symbols) <= max(self.atom_indices):
+            return None
+        return (symbols[self.atom_indices[0]], symbols[self.atom_indices[1]])
+
+    @staticmethod
+    def _reduced_mass_amu(symbols: tuple[str, str] | None) -> float:
+        if symbols is None:
+            return float("nan")
+        mass_a = float(atomic_masses[atomic_numbers[symbols[0]]])
+        mass_b = float(atomic_masses[atomic_numbers[symbols[1]]])
+        return (mass_a * mass_b) / (mass_a + mass_b)
+
+    @staticmethod
+    def _cell_to_angstrom(
+        cell: np.ndarray | None,
+        *,
+        unit: str,
+        alat_angstrom: float,
+    ) -> np.ndarray | None:
+        if cell is None:
+            return None
+        if "ang" in unit:
+            return cell
+        if "bohr" in unit:
+            return cell * BOHR_TO_ANG
+        if "alat" in unit and np.isfinite(alat_angstrom):
+            return cell * alat_angstrom
+        return None
+
+    def _fit_diatomic_curvature(
+        self,
+        bond_history: np.ndarray,
+        energy_history_ry: np.ndarray,
+        *,
+        reduced_mass_amu: float,
+    ) -> dict[str, Any]:
+        if bond_history.size < 3 or energy_history_ry.size < 3:
+            raise ValueError("Need at least three ionic steps to estimate diatomic curvature.")
+        if bond_history.size != energy_history_ry.size:
+            raise ValueError(
+                f"Bond-length history has length {bond_history.size}, "
+                f"but energy history has length {energy_history_ry.size}."
+            )
+        if not np.isfinite(reduced_mass_amu) or reduced_mass_amu <= 0.0:
+            raise ValueError("Could not determine a valid reduced mass for the diatomic molecule.")
+
+        fit_bond_history, fit_energy_history_ry = self._collapse_duplicate_bond_lengths(
+            bond_history,
+            energy_history_ry,
+        )
+        if fit_bond_history.size < 3:
+            raise ValueError("Need at least three distinct bond lengths to fit a local quadratic.")
+
+        min_index = int(np.nanargmin(fit_energy_history_ry))
+        order = np.argsort(np.abs(fit_bond_history - fit_bond_history[min_index]))
+        fit_count = min(max(int(self.fit_window), 3), fit_bond_history.size)
+        fit_indexes = np.sort(order[:fit_count])
+        fit_r = fit_bond_history[fit_indexes]
+        fit_e_ev = fit_energy_history_ry[fit_indexes] * RY_TO_EV
+
+        coeffs = np.polyfit(fit_r, fit_e_ev, 2)
+        a, b, c = [float(value) for value in coeffs]
+        curvature_eV_A2 = 2.0 * a
+        if curvature_eV_A2 <= 0.0:
+            raise ValueError(
+                f"Estimated curvature is non-positive ({curvature_eV_A2}); "
+                "relax trajectory does not define a stable local minimum."
+            )
+
+        bond_length_eq = -b / (2.0 * a)
+        energy_eq_ev = a * bond_length_eq**2 + b * bond_length_eq + c
+        force_constant_n_m = curvature_eV_A2 * EV_TO_J / (ANG_TO_M**2)
+        reduced_mass_kg = reduced_mass_amu * AMU_TO_KG
+        omega = float(np.sqrt(force_constant_n_m / reduced_mass_kg))
+        frequency_cm1 = omega / (2.0 * np.pi * LIGHT_SPEED_M_S * 100.0)
+        zpe_eV = 0.5 * PLANCK_EV_S * LIGHT_SPEED_M_S * 100.0 * frequency_cm1
+
+        return {
+            "quadratic_fit_indexes": fit_indexes.astype(np.int64),
+            "bond_length_fit_steps_A": fit_bond_history,
+            "E_fit_steps_Ry": fit_energy_history_ry,
+            "bond_length_eq_A": float(bond_length_eq),
+            "curvature_eV_A2": float(curvature_eV_A2),
+            "vibrational_frequency_cm1": float(frequency_cm1),
+            "zpe_eV": float(zpe_eV),
+            "E_eq_fit_eV": float(energy_eq_ev),
+            "E_eq_fit_Ry": float(energy_eq_ev / RY_TO_EV),
+        }
+
+    @staticmethod
+    def _collapse_duplicate_bond_lengths(
+        bond_history: np.ndarray,
+        energy_history_ry: np.ndarray,
+        *,
+        tolerance: float = 1.0e-8,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if bond_history.size != energy_history_ry.size:
+            raise ValueError("Bond and energy histories must have the same length.")
+        collapsed_r: list[float] = []
+        collapsed_e: list[float] = []
+        for bond_length, energy in zip(bond_history, energy_history_ry, strict=True):
+            if not collapsed_r:
+                collapsed_r.append(float(bond_length))
+                collapsed_e.append(float(energy))
+                continue
+            if abs(float(bond_length) - collapsed_r[-1]) <= tolerance:
+                collapsed_e[-1] = min(collapsed_e[-1], float(energy))
+                continue
+            collapsed_r.append(float(bond_length))
+            collapsed_e.append(float(energy))
+        return np.array(collapsed_r, dtype=float), np.array(collapsed_e, dtype=float)
 
 
 @dataclass

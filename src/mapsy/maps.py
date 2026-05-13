@@ -13,15 +13,37 @@ from matplotlib.axes import Axes
 from matplotlib.figure import Figure
 from matplotlib.gridspec import GridSpec
 from matplotlib.ticker import MultipleLocator
-from sklearn.cluster import SpectralClustering
-from sklearn.decomposition import PCA
-from sklearn.metrics import davies_bouldin_score, silhouette_score
 from sklearn.preprocessing import StandardScaler
 from yaml import SafeLoader, load
 
+from mapsy.analysis import (
+    GraphMode,
+    aggregate_cluster_graph,
+    build_point_graph,
+    fit_clusters,
+    fit_pca_analysis,
+    project_pca,
+    screen_clusters,
+)
+from mapsy.analysis import (
+    propagate_archetypes as propagate_archetypes_on_graph,
+)
+from mapsy.analysis import (
+    select_archetypes as select_feature_archetypes,
+)
 from mapsy.boundaries import ContactSpace
 from mapsy.boundaries.ionic import IonicGeometry
+from mapsy.clustering import clustering_uses_random_state, normalize_cluster_method
 from mapsy.data import ScalarField, System
+from mapsy.results import (
+    ArchetypePropagationResult,
+    ArchetypeSelectionResult,
+    ClusterResult,
+    ClusterScreeningResult,
+    GraphResult,
+    PCAAnalysisResult,
+    PCAResult,
+)
 from mapsy.symfunc.symmetryfunction import SymmetryFunction
 from mapsy.utils import full2chunk, multiproc
 
@@ -84,12 +106,7 @@ class SpecialPointRegistry:
                 continue
 
             if indexes.size == 1:
-                values = np.asarray(value, dtype=object).reshape(-1)
-                if values.size != 1:
-                    raise ValueError(
-                        f"Metadata column {key!r} has length {values.size}, expected {indexes.size}."
-                    )
-                rows.loc[:, key] = values[0]
+                rows.loc[:, key] = pd.Series([value], dtype=object)
                 continue
 
             values = np.asarray(value)
@@ -160,12 +177,11 @@ class SpecialPointRegistry:
                 continue
 
             if count == 1:
-                values = np.asarray(value, dtype=object).reshape(-1)
-                if values.size != 1:
-                    raise ValueError(
-                        f"Metadata column {key!r} has length {values.size}, expected {count}."
-                    )
-                self._data.loc[mask, key] = values[0]
+                self._data.loc[mask, key] = pd.Series(
+                    [value],
+                    index=self._data.index[mask],
+                    dtype=object,
+                )
                 continue
 
             values = np.asarray(value, dtype=object).reshape(-1)
@@ -235,8 +251,16 @@ class Maps:
     features: list[str] = []
 
     npca: int | None = None
+    pca_analysis_result: PCAAnalysisResult | None = None
+    pca_result: PCAResult | None = None
+    graph_result: GraphResult | None = None
+    archetype_selection_result: ArchetypeSelectionResult | None = None
+    archetype_propagation_result: ArchetypePropagationResult | None = None
 
     nclusters: int = 0
+    cluster_method: str = "spectral"
+    cluster_screening_method: str | None = None
+    cluster_result: ClusterResult | None = None
     cluster_centers: npt.NDArray[np.float64] | None = None
     cluster_graph: npt.NDArray[np.int64] | None = None
     cluster_edges: npt.NDArray[np.int64] | None = None
@@ -816,75 +840,42 @@ class Maps:
         data[self.contactspace.mask] = f
         return ScalarField(self.contactspace.grid, data=data)
 
-    def reduce(
-        self, npca: int | None = None, scale: bool = False
-    ) -> tuple[Figure, AxesLike, AxesLike] | None:
+    def analyze_pca(self, scale: bool = False) -> PCAAnalysisResult:
         # Check that contact space exists
         if self.contactspace is None:
-            raise RuntimeError("Trying to use maps.reduce() without contact space")
+            raise RuntimeError("Trying to use maps.analyze_pca() without contact space")
         # Check that contact space maps have been generated
         if self.data is None:
             raise RuntimeError("No contact space data available.")
-        features = self.data[self.features].values.astype(np.float64)
-        if scale:
-            features = StandardScaler().fit_transform(features)
-        # Initialize PCA
-        if npca is not None:
-            self.npca = npca
-            pca = PCA(npca)
-            # Generate labels for the PCA features
-            pca_features = [f"pca{i:1d}" for i in range(npca)]
-            # Perform PCA on the data
-            self.data[pca_features] = pca.fit_transform(features)
-            return None
-        else:
-            pca = PCA()
-            pca.fit(features)
-            explained_variance = np.cumsum(pca.explained_variance_ratio_)
-            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
-            ax1.plot(range(1, len(explained_variance) + 1), explained_variance, marker="o")
-            ax1.set_xlabel("Number of Components")
-            ax1.set_ylabel("Cumulative Explained Variance")
-            ax1.grid(True)
-            ax1.set_title("Optimal Number of Components in PCA")
-            ax1.axhline(y=0.98, color="r", linestyle="--")  # Optional: line at 90% variance
-            ax2.plot(
-                range(1, len(pca.explained_variance_ratio_) + 1),
-                pca.explained_variance_ratio_,
-                marker="o",
-            )
-            ax2.set_xlabel("Number of Components")
-            ax2.set_ylabel("Explained Variance Ratio")
-            ax2.set_title("Scree Plot")
-            ax2.grid(True)
-            return fig, ax1, ax2
+        X = self.data[self.features].values.astype(np.float64)
+        result = fit_pca_analysis(X, feature_columns=list(self.features), scale=scale)
+        self.pca_analysis_result = result
+        return result
 
-    def graph(self, clusters: npt.NDArray[np.int64]) -> npt.NDArray[np.int64]:
-        # Check that contact space exists
-        if self.contactspace is None:
-            raise RuntimeError("Trying to use maps.graph() without contact space")
-        nclusters: np.int64 = np.max(clusters) + 1
-        graph: npt.NDArray[np.int64] = np.zeros((nclusters, nclusters), dtype=np.int64)
-        for i in range(self.contactspace.nm):
-            ci: np.int64 = clusters[i]
-            for j in np.delete(
-                self.contactspace.neighbors[i],
-                np.where(self.contactspace.neighbors[i] < 0),
-            ):
-                cj: np.int64 = clusters[j]
-                graph[ci, cj] += 1
-                graph[cj, ci] += 1
-        return graph // 2
+    def reduce(self, npca: int | None = None, scale: bool = False) -> PCAAnalysisResult | PCAResult:
+        if npca is None:
+            return self.analyze_pca(scale=scale)
+        if self.data is None:
+            raise RuntimeError("No contact space data available.")
+        analysis = self.analyze_pca(scale=scale)
+        data = self.data
+        result = project_pca(analysis, data[self.features].values.astype(np.float64), npca=npca)
+        self.npca = npca
+        self.pca_result = result
+        data.loc[:, result.transformed_columns] = result.transformed_values
+        return result
 
     def cluster(
         self,
         nclusters: int | None = None,
         features: list[str] | None = None,
+        method: str = "spectral",
         maxclusters: int = 20,
         ntries: int = 1,
         random_state: int | None = None,
         scale: bool = False,
-    ) -> tuple[Figure, AxesLike, AxesLike] | None:
+        graph: GraphResult | None = None,
+    ) -> ClusterResult | ClusterScreeningResult:
         """ """
         # Check that contact space exists
         if self.contactspace is None:
@@ -897,13 +888,22 @@ class Maps:
             self.cluster_features = self.features
         else:
             self.cluster_features = features
+        self.cluster_method = normalize_cluster_method(method)
         X = self.data[self.cluster_features].values.astype(np.float64)
-        if scale:
-            X = StandardScaler().fit_transform(X)
+        if graph is not None and graph.matrix.shape[0] != len(X):
+            raise ValueError(
+                f"graph has {graph.matrix.shape[0]} nodes, expected {len(X)} to match maps.data."
+            )
         if nclusters is not None:
-            if random_state is None:
+            if not clustering_uses_random_state(self.cluster_method):
+                self.random_state = 0
+            elif random_state is None:
                 # If we performed a screening, use the best random state
-                if self.best_clusters is not None:
+                if (
+                    self.best_clusters is not None
+                    and self.cluster_screening_method == self.cluster_method
+                    and clustering_uses_random_state(self.cluster_method)
+                ):
                     if nclusters in self.best_clusters["nclusters"].values:
                         self.random_state = self.best_clusters[
                             self.best_clusters["nclusters"] == nclusters
@@ -919,93 +919,309 @@ class Maps:
             else:
                 self.random_state = random_state
                 logger.info(f"Use given random state = {self.random_state}")
-            labels = SpectralClustering(
-                n_clusters=nclusters, random_state=self.random_state
-            ).fit_predict(X)
-            self.data["Cluster"] = labels
+            effective_random_state = (
+                int(self.random_state)
+                if clustering_uses_random_state(self.cluster_method)
+                else None
+            )
+            screening_result = (
+                ClusterScreeningResult(
+                    method=self.cluster_method,
+                    feature_columns=list(self.cluster_features),
+                    scale=scale,
+                    table=self.cluster_screening.copy(),
+                    best_by_db=self.best_clusters.copy(),
+                    best_by_silhouette=self.cluster_screening.loc[
+                        self.cluster_screening.groupby("nclusters")["silhouette_score"].idxmax()
+                    ].copy(),
+                )
+                if self.cluster_screening is not None
+                and self.best_clusters is not None
+                and self.cluster_screening_method == self.cluster_method
+                else None
+            )
+            result = fit_clusters(
+                X,
+                feature_columns=list(self.cluster_features),
+                nclusters=nclusters,
+                method=self.cluster_method,
+                random_state=effective_random_state,
+                scale=scale,
+                screening=screening_result,
+                graph=graph,
+            )
+            self.data["Cluster"] = result.labels
             # Store number of clusters
             self.nclusters = nclusters
+            self.cluster_result = result
             # Compute the cluster centers in features space
-            self.cluster_centers = (
-                self.data.groupby("Cluster")[self.cluster_features].mean().values.astype(np.float64)
-            )
+            self.cluster_centers = result.centers
             # Compute the number of points in each cluster
-            self.cluster_sizes = self.data.groupby("Cluster").size().values
+            self.cluster_sizes = result.sizes
             # Generate clusters connectivity matrix
-            self.cluster_graph = self.graph(self.data["Cluster"])
+            if self.contactspace is None:
+                raise RuntimeError("Trying to use maps.cluster() without contact space")
+            self.cluster_graph = aggregate_cluster_graph(result.labels, self.contactspace.neighbors)
             self.cluster_edges = self.cluster_graph.copy()
             for i in range(nclusters):
                 self.cluster_edges[i, i] = 0
-            return None
+            result.graph = self.cluster_graph
+            result.edges = self.cluster_edges
+            return result
         else:
-            cluster_range = range(2, maxclusters)
-            cluster_random_states = []
-            cluster_sizes = []
-            silhouette_scores = []
-            db_indexes = []
-            # Loop over different numbers of clusters
-            for nclusters in cluster_range:
-                random_states = np.random.randint(0, 1000, ntries)
-                for random_state in random_states:
-                    cluster_random_states.append(random_state)
-                    labels = SpectralClustering(
-                        n_clusters=nclusters, random_state=random_state
-                    ).fit_predict(X)
-                    actual_nclusters = len(np.unique(labels))
-                    cluster_sizes.append(actual_nclusters)
-                    score = silhouette_score(X, labels)
-                    silhouette_scores.append(score)
-                    index = davies_bouldin_score(X, labels)
-                    db_indexes.append(index)
-            # Store all clusters data
-            self.cluster_screening = pd.DataFrame(
-                {
-                    "nclusters": cluster_sizes,
-                    "random_state": cluster_random_states,
-                    "silhouette_score": silhouette_scores,
-                    "db_index": db_indexes,
-                }
+            screening = screen_clusters(
+                X,
+                feature_columns=list(self.cluster_features),
+                method=self.cluster_method,
+                maxclusters=maxclusters,
+                ntries=ntries,
+                scale=scale,
+                graph=graph,
             )
-            # Find the best clusters according to Silhouette Score
-            best_db = self.cluster_screening.loc[
-                self.cluster_screening.groupby("nclusters")["db_index"].idxmin()
+            self.cluster_screening = screening.table.copy()
+            self.cluster_screening_method = screening.method
+            self.best_clusters = screening.best_by_db.copy()
+            return screening
+
+    def build_graph(
+        self,
+        *,
+        mode: GraphMode = "hybrid",
+        feature_columns: list[str] | None = None,
+        node_weight_column: str = "probability",
+        feature_k: int = 8,
+        sigma_feature: float | None = None,
+        realspace_weight: float = 1.0,
+        feature_weight: float = 1.0,
+        normalize_node_weights: bool = True,
+        use_node_weights_in_edges: bool = True,
+        direction_columns: tuple[str, str, str] | None = None,
+        directional_weight: float = 0.0,
+        directional_power: float = 1.0,
+    ) -> GraphResult:
+        if self.contactspace is None:
+            raise RuntimeError("Trying to use maps.build_graph() without contact space")
+        if self.data is None:
+            raise RuntimeError("No contact space data available.")
+
+        selected_features = (
+            list(feature_columns) if feature_columns is not None else list(self.features)
+        )
+        node_table = self.data.loc[:, ["x", "y", "z", *selected_features]].copy()
+        required_columns = [node_weight_column]
+        if directional_weight > 0.0:
+            required_columns.extend(
+                list(
+                    direction_columns
+                    or (
+                        "boundary_gradient_x",
+                        "boundary_gradient_y",
+                        "boundary_gradient_z",
+                    )
+                )
+            )
+        for column in required_columns:
+            if column in node_table.columns:
+                continue
+            if column in self.data.columns:
+                node_table.loc[:, column] = self.data[column].to_numpy()
+            elif column in self.contactspace.data.columns:
+                node_table.loc[:, column] = self.contactspace.data[column].to_numpy()
+            else:
+                raise ValueError(
+                    f"required graph column {column!r} not present in maps.data or contactspace.data."
+                )
+
+        node_table.insert(0, "point_index", self.data.index.to_numpy(dtype=np.int64))
+        result = build_point_graph(
+            node_table,
+            mode=mode,
+            feature_columns=selected_features,
+            neighbors=self.contactspace.neighbors,
+            node_weight_column=node_weight_column,
+            feature_k=feature_k,
+            sigma_feature=sigma_feature,
+            realspace_weight=realspace_weight,
+            feature_weight=feature_weight,
+            normalize_node_weights=normalize_node_weights,
+            use_node_weights_in_edges=use_node_weights_in_edges,
+            direction_columns=direction_columns,
+            directional_weight=directional_weight,
+            directional_power=directional_power,
+        )
+        self.graph_result = result
+        return result
+
+    def select_archetypes(
+        self,
+        n_archetypes: int,
+        *,
+        feature_columns: list[str] | None = None,
+        probability_column: str = "probability",
+        region: int | None = None,
+        min_probability: float | None = None,
+        min_probability_quantile: float | None = 0.75,
+        scale_features: bool = True,
+        probability_weight: float = 1.0,
+        extremeness_weight: float = 1.0,
+        diversity_weight: float = 1.0,
+        register: bool = True,
+        kind: str = "archetype",
+        iteration: int | None = 0,
+        label_status: str = "unlabeled",
+        replace_kind: bool = True,
+    ) -> ArchetypeSelectionResult:
+        if self.data is None:
+            raise RuntimeError("No contact space data available.")
+
+        resolved_feature_columns = (
+            list(feature_columns) if feature_columns is not None else list(self.features)
+        )
+        point_table = self.data.copy()
+        point_table.loc[:, "point_index"] = point_table.index.to_numpy(dtype=np.int64)
+        if probability_column not in point_table.columns:
+            if (
+                self.contactspace is None
+                or probability_column not in self.contactspace.data.columns
+            ):
+                raise ValueError(
+                    f"probability_column {probability_column!r} not present in maps.data "
+                    "or contactspace.data."
+                )
+            point_table.loc[:, probability_column] = self.contactspace.data[
+                probability_column
+            ].to_numpy()
+
+        candidate_mask: npt.NDArray[np.bool_] | None = None
+        if region is not None:
+            if self.contactspace is None:
+                raise RuntimeError("Trying to filter archetypes by region without contact space")
+            region_values = self.contactspace.data["region"].to_numpy(dtype=np.int64)
+            candidate_mask = region_values == region
+
+        result = select_feature_archetypes(
+            point_table,
+            n_archetypes=n_archetypes,
+            feature_columns=resolved_feature_columns,
+            probability_column=probability_column,
+            candidate_mask=candidate_mask,
+            min_probability=min_probability,
+            min_probability_quantile=min_probability_quantile,
+            scale_features=scale_features,
+            probability_weight=probability_weight,
+            extremeness_weight=extremeness_weight,
+            diversity_weight=diversity_weight,
+        )
+        self.archetype_selection_result = result
+
+        if register:
+            archetype_table = result.archetype_table.sort_values("selection_rank").reset_index(
+                drop=True
+            )
+            self.add_special_points(
+                result.selected_indexes,
+                kind=kind,
+                iteration=iteration,
+                label_status=label_status,
+                replace_kind=replace_kind,
+                selection_rank=archetype_table["selection_rank"].to_numpy(dtype=np.int64),
+                selection_score=archetype_table["selection_score"].to_numpy(dtype=np.float64),
+                probability_score=archetype_table["probability_score"].to_numpy(dtype=np.float64),
+                extremeness_score=archetype_table["extremeness_score"].to_numpy(dtype=np.float64),
+                diversity_score=archetype_table["diversity_score"].to_numpy(dtype=np.float64),
+            )
+
+        return result
+
+    def propagate_archetypes(
+        self,
+        *,
+        graph: GraphResult | None = None,
+        selected_indexes: npt.ArrayLike | None = None,
+        kind: str = "archetype",
+        alpha: float = 0.9,
+        max_iter: int = 500,
+        tol: float = 1.0e-8,
+        confidence_threshold: float = 0.5,
+        margin_threshold: float = 0.0,
+        update_data: bool = True,
+    ) -> ArchetypePropagationResult:
+        if self.data is None:
+            raise RuntimeError("No contact space data available.")
+
+        if selected_indexes is None:
+            selected = self.special_points.indexes(kind=kind)
+        else:
+            selected = np.asarray(selected_indexes, dtype=np.int64).reshape(-1)
+        if selected.size == 0:
+            raise RuntimeError(
+                "No archetype seeds available. Call maps.select_archetypes(...) first "
+                "or pass selected_indexes explicitly."
+            )
+
+        selected_graph = graph if graph is not None else self.graph_result
+        if selected_graph is None:
+            raise RuntimeError(
+                "No graph available for propagation. Call maps.build_graph(...) first "
+                "or pass graph explicitly."
+            )
+
+        result = propagate_archetypes_on_graph(
+            selected_graph,
+            selected_indexes=selected,
+            alpha=alpha,
+            max_iter=max_iter,
+            tol=tol,
+            confidence_threshold=confidence_threshold,
+            margin_threshold=margin_threshold,
+        )
+        self.archetype_propagation_result = result
+
+        if update_data:
+            assignment = result.assignment_table.set_index("point_index")
+            columns = [
+                "assigned_archetype_rank",
+                "assigned_archetype_index",
+                "archetype_confidence",
+                "archetype_margin",
+                "is_ambiguous",
             ]
-            best_sil = self.cluster_screening.loc[
-                self.cluster_screening.groupby("nclusters")["silhouette_score"].idxmax()
-            ]
-            self.best_clusters = best_db
-            # Plot Silhouette Scores
-            fig, ax1 = plt.subplots()
-            # Plot Silhouette Scores on the left y-axis
-            ax1.scatter(
-                cluster_sizes,
-                silhouette_scores,
-                color="b",
-                marker="o",
-                label="Silhouette Score",
-            )
-            ax1.plot(best_db["nclusters"], best_db["silhouette_score"], "-", color="b")
-            ax1.plot(best_sil["nclusters"], best_sil["silhouette_score"], ":", color="b")
-            ax1.set_xlabel("Number of Clusters")
-            ax1.set_ylabel("Silhouette Score", color="b")
-            ax1.tick_params(axis="y", labelcolor="b")
-            # Create a second y-axis to the right for Davies-Bouldin Index
-            ax2 = ax1.twinx()
-            ax2.scatter(
-                cluster_sizes,
-                db_indexes,
-                color="r",
-                marker="s",
-                label="Davies-Bouldin Index",
-            )
-            ax2.plot(best_db["nclusters"], best_db["db_index"], "-", color="r")
-            ax2.plot(best_sil["nclusters"], best_sil["db_index"], ":", color="r")
-            ax2.set_ylabel("Davies-Bouldin Index", color="r")
-            ax2.tick_params(axis="y", labelcolor="r")
-            # Title and grid
-            ax1.set_title("Silhouette Score and Davies-Bouldin Index vs. Number of Clusters")
-            ax1.grid(True)
-            return fig, ax1, ax2
+            self.data.loc[assignment.index, columns] = assignment.loc[:, columns]
+
+        valid_assignments = result.assigned_archetype_indexes[
+            result.assigned_archetype_indexes >= 0
+        ]
+        assignment_counts: dict[int, int] = {
+            int(point_index): int(np.count_nonzero(valid_assignments == point_index))
+            for point_index in selected
+        }
+        mean_confidences: dict[int, float] = {}
+        assignment_table = result.assignment_table
+        for point_index in selected:
+            point_mask = assignment_table["assigned_archetype_index"].to_numpy(
+                dtype=np.int64
+            ) == int(point_index)
+            if np.any(point_mask):
+                mean_confidences[int(point_index)] = float(
+                    assignment_table.loc[point_mask, "archetype_confidence"].mean()
+                )
+            else:
+                mean_confidences[int(point_index)] = 0.0
+
+        self.update_special_points(
+            kind=kind,
+            point_indexes=selected,
+            assigned_point_count=np.array(
+                [assignment_counts[int(point_index)] for point_index in selected],
+                dtype=np.int64,
+            ),
+            mean_assignment_confidence=np.array(
+                [mean_confidences[int(point_index)] for point_index in selected],
+                dtype=np.float64,
+            ),
+        )
+
+        return result
 
     def sites(self, region: int = 0) -> None:
         # Check that contact space exists

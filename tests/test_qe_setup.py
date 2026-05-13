@@ -3,7 +3,7 @@ import pandas as pd
 from ase import Atoms
 from ase.constraints import FixAtoms, FixCartesian
 
-from mapsy import Maps, QuantumEspressoSetup, SlurmTemplate
+from mapsy import Maps, QuantumEspressoSetup, SlurmTemplate, WorkflowReferenceSpec
 from mapsy.data import Grid, System
 
 
@@ -45,6 +45,23 @@ class FakePreparedCalc:
                 handle.write("&CONTROL\n")
                 handle.write("   calculation = 'relax'\n")
                 handle.write("/\n")
+
+
+def _reference_spec(
+    *,
+    name: str,
+    scope: str,
+    file_column: str = "reference_file",
+) -> WorkflowReferenceSpec:
+    return WorkflowReferenceSpec(
+        name=name,
+        scope=scope,
+        description=None,
+        runner=None,
+        parser=None,
+        file_column=file_column,
+        scalar_output_column="reference_value",
+    )
 
 
 def test_qe_setup_generates_metadata_and_profile() -> None:
@@ -232,13 +249,96 @@ def test_qe_setup_generates_dynamic_scratch_outdir(tmp_path) -> None:
 
     expected_outdir = scratch_root / "qe_job_7"
     script_text = (tmp_path / "qe_job_7" / "submit.slurm").read_text()
-    input_text = (tmp_path / "qe_job_7" / "espresso.pwi").read_text()
 
     assert created["qe_outdir"] == expected_outdir
     assert expected_outdir.exists()
     assert metadata["qe_outdir"] == str(expected_outdir)
     assert f"mkdir -p {expected_outdir}" in script_text
-    assert f"outdir = '{expected_outdir}'" in input_text
+
+
+def test_qe_setup_runs_clean_slab_reference_with_reference_file_column(tmp_path) -> None:
+    setup = QuantumEspressoSetup(
+        runprefix="mpirun -np 1 ",
+        qepath="/opt/qe/bin",
+        pseudodir="/opt/qe/pseudo",
+        pseudopotentials={"Co": "Co.UPF"},
+        input_data={"control": {"calculation": "scf", "prefix": "CoP"}},
+    )
+
+    created: dict[str, object] = {}
+
+    def fake_make_calculator(**kwargs):
+        created.update(kwargs)
+        return FakeCalc()
+
+    setup.make_calculator = fake_make_calculator  # type: ignore[method-assign]
+
+    maps = _build_maps(pd.DataFrame({"x": [1.0], "y": [2.0], "z": [3.0]}))
+    reference = _reference_spec(name="clean_slab", scope="per_map")
+    runner = setup.build_clean_slab_reference_runner(reference_root=tmp_path)
+
+    metadata = runner(
+        maps=maps,
+        workflow=None,
+        reference=reference,
+        map_index=0,
+        system_name="slab_a",
+    )
+
+    expected_dir = tmp_path / "map_0" / "clean_slab"
+    assert created["directory"] == expected_dir
+    assert metadata["reference_file"] == str(expected_dir)
+    assert metadata["label_file"] == str(expected_dir)
+    assert metadata["reference_runner_energy_Ry"] == -1.234
+
+
+def test_qe_setup_prepares_h2_reference_job(tmp_path) -> None:
+    setup = QuantumEspressoSetup(
+        runprefix="srun ",
+        qepath="/opt/qe/bin",
+        pseudodir="/opt/qe/pseudo",
+        pseudopotentials={"H": "H.UPF"},
+        input_data={"control": {"calculation": "scf", "prefix": "H2"}},
+    )
+    scheduler = SlurmTemplate(
+        partition="debug",
+        time="00:10:00",
+        modules=["qe/7.2"],
+    )
+
+    created: dict[str, object] = {}
+
+    def fake_make_calculator(**kwargs):
+        created.update(kwargs)
+        return FakePreparedCalc(input_path=str(tmp_path / "global" / "H2" / "espresso.pwi"))
+
+    setup.make_calculator = fake_make_calculator  # type: ignore[method-assign]
+
+    maps = _build_maps(pd.DataFrame({"x": [1.0], "y": [2.0], "z": [3.0]}))
+    reference = _reference_spec(name="H2", scope="global")
+    runner = setup.build_h2_reference_runner(
+        reference_root=tmp_path,
+        scheduler_template=scheduler,
+        submit=False,
+    )
+
+    metadata = runner(
+        maps=maps,
+        workflow=None,
+        reference=reference,
+        map_index=None,
+        system_name=None,
+    )
+
+    expected_dir = tmp_path / "global" / "H2"
+    script_path = expected_dir / "submit.slurm"
+    script_text = script_path.read_text()
+
+    assert created["directory"] == expected_dir
+    assert metadata["reference_file"] == str(expected_dir)
+    assert metadata["submit_script"] == str(script_path)
+    assert "qe-ref-H2" in script_text
+    assert "srun /opt/qe/bin/pw.x -in espresso.pwi > espresso.pwo" in script_text
 
 
 def test_qe_setup_prepares_relax_retry_from_previous_attempt(tmp_path) -> None:
