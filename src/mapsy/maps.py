@@ -17,6 +17,9 @@ from sklearn.preprocessing import StandardScaler
 from yaml import SafeLoader, load
 
 from mapsy.analysis import (
+    ArchetypePropagationMode,
+    ArchetypeSelectionMode,
+    FeatureConnectivityMode,
     GraphMode,
     aggregate_cluster_graph,
     build_point_graph,
@@ -1010,6 +1013,7 @@ class Maps:
         feature_columns: list[str] | None = None,
         node_weight_column: str = "probability",
         feature_k: int = 8,
+        feature_connectivity: FeatureConnectivityMode = "knn",
         sigma_feature: float | None = None,
         realspace_weight: float = 1.0,
         feature_weight: float = 1.0,
@@ -1060,6 +1064,7 @@ class Maps:
             neighbors=self.contactspace.neighbors,
             node_weight_column=node_weight_column,
             feature_k=feature_k,
+            feature_connectivity=feature_connectivity,
             sigma_feature=sigma_feature,
             realspace_weight=realspace_weight,
             feature_weight=feature_weight,
@@ -1077,14 +1082,19 @@ class Maps:
         n_archetypes: int,
         *,
         feature_columns: list[str] | None = None,
+        graph: GraphResult | None = None,
         probability_column: str = "probability",
         region: int | None = None,
         min_probability: float | None = None,
         min_probability_quantile: float | None = 0.75,
         scale_features: bool = True,
+        selection_mode: ArchetypeSelectionMode = "feature_extreme",
         probability_weight: float = 1.0,
         extremeness_weight: float = 1.0,
         diversity_weight: float = 1.0,
+        endpointness_weight: float = 1.0,
+        geodesic_weight: float = 1.0,
+        branching_weight: float = 0.5,
         register: bool = True,
         kind: str = "archetype",
         iteration: int | None = 0,
@@ -1119,6 +1129,13 @@ class Maps:
             region_values = self.contactspace.data["region"].to_numpy(dtype=np.int64)
             candidate_mask = region_values == region
 
+        selected_graph = graph if graph is not None else self.graph_result
+        if selection_mode == "graph_endpoint" and selected_graph is None:
+            raise RuntimeError(
+                "selection_mode='graph_endpoint' requires a graph. "
+                "Call maps.build_graph(...) first or pass graph explicitly."
+            )
+
         result = select_feature_archetypes(
             point_table,
             n_archetypes=n_archetypes,
@@ -1128,9 +1145,14 @@ class Maps:
             min_probability=min_probability,
             min_probability_quantile=min_probability_quantile,
             scale_features=scale_features,
+            selection_mode=selection_mode,
+            graph=selected_graph,
             probability_weight=probability_weight,
             extremeness_weight=extremeness_weight,
             diversity_weight=diversity_weight,
+            endpointness_weight=endpointness_weight,
+            geodesic_weight=geodesic_weight,
+            branching_weight=branching_weight,
         )
         self.archetype_selection_result = result
 
@@ -1138,17 +1160,33 @@ class Maps:
             archetype_table = result.archetype_table.sort_values("selection_rank").reset_index(
                 drop=True
             )
+            metadata: dict[str, Any] = {
+                "selection_rank": archetype_table["selection_rank"].to_numpy(dtype=np.int64),
+                "selection_score": archetype_table["selection_score"].to_numpy(dtype=np.float64),
+                "probability_score": archetype_table["probability_score"].to_numpy(
+                    dtype=np.float64
+                ),
+                "extremeness_score": archetype_table["extremeness_score"].to_numpy(
+                    dtype=np.float64
+                ),
+                "diversity_score": archetype_table["diversity_score"].to_numpy(dtype=np.float64),
+            }
+            for column in [
+                "euclidean_extremeness_score",
+                "endpoint_score",
+                "endpointness_score",
+                "geodesic_score",
+                "branching_score",
+            ]:
+                if column in archetype_table.columns:
+                    metadata[column] = archetype_table[column].to_numpy(dtype=np.float64)
             self.add_special_points(
                 result.selected_indexes,
                 kind=kind,
                 iteration=iteration,
                 label_status=label_status,
                 replace_kind=replace_kind,
-                selection_rank=archetype_table["selection_rank"].to_numpy(dtype=np.int64),
-                selection_score=archetype_table["selection_score"].to_numpy(dtype=np.float64),
-                probability_score=archetype_table["probability_score"].to_numpy(dtype=np.float64),
-                extremeness_score=archetype_table["extremeness_score"].to_numpy(dtype=np.float64),
-                diversity_score=archetype_table["diversity_score"].to_numpy(dtype=np.float64),
+                **metadata,
             )
 
         return result
@@ -1159,11 +1197,15 @@ class Maps:
         graph: GraphResult | None = None,
         selected_indexes: npt.ArrayLike | None = None,
         kind: str = "archetype",
+        propagation_mode: ArchetypePropagationMode = "diffusion",
         alpha: float = 0.9,
         max_iter: int = 500,
         tol: float = 1.0e-8,
         confidence_threshold: float = 0.5,
         margin_threshold: float = 0.0,
+        propagation_realspace_scale: float = 1.0,
+        propagation_feature_scale: float = 1.0,
+        propagation_use_node_weights: bool = False,
         update_data: bool = True,
     ) -> ArchetypePropagationResult:
         if self.data is None:
@@ -1189,11 +1231,15 @@ class Maps:
         result = propagate_archetypes_on_graph(
             selected_graph,
             selected_indexes=selected,
+            propagation_mode=propagation_mode,
             alpha=alpha,
             max_iter=max_iter,
             tol=tol,
             confidence_threshold=confidence_threshold,
             margin_threshold=margin_threshold,
+            propagation_realspace_scale=propagation_realspace_scale,
+            propagation_feature_scale=propagation_feature_scale,
+            propagation_use_node_weights=propagation_use_node_weights,
         )
         self.archetype_propagation_result = result
 

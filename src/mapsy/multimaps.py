@@ -8,6 +8,9 @@ import pandas as pd
 from yaml import SafeLoader, load
 
 from mapsy.analysis import (
+    ArchetypePropagationMode,
+    ArchetypeSelectionMode,
+    FeatureConnectivityMode,
     GraphMode,
     aggregate_cluster_graph,
     build_point_graph,
@@ -184,6 +187,7 @@ class MultiMaps:
         feature_columns: list[str] | None = None,
         node_weight_column: str = "probability",
         feature_k: int = 8,
+        feature_connectivity: FeatureConnectivityMode = "knn",
         sigma_feature: float | None = None,
         realspace_weight: float = 1.0,
         feature_weight: float = 1.0,
@@ -230,6 +234,7 @@ class MultiMaps:
             neighbors=neighbors,
             node_weight_column=node_weight_column,
             feature_k=feature_k,
+            feature_connectivity=feature_connectivity,
             sigma_feature=sigma_feature,
             realspace_weight=realspace_weight,
             feature_weight=feature_weight,
@@ -249,14 +254,19 @@ class MultiMaps:
         n_archetypes: int,
         *,
         feature_columns: list[str] | None = None,
+        graph: GraphResult | None = None,
         probability_column: str = "probability",
         region: int | None = None,
         min_probability: float | None = None,
         min_probability_quantile: float | None = 0.75,
         scale_features: bool = True,
+        selection_mode: ArchetypeSelectionMode = "feature_extreme",
         probability_weight: float = 1.0,
         extremeness_weight: float = 1.0,
         diversity_weight: float = 1.0,
+        endpointness_weight: float = 1.0,
+        geodesic_weight: float = 1.0,
+        branching_weight: float = 0.5,
         register: bool = True,
         kind: str = "archetype",
         iteration: int | None = 0,
@@ -278,6 +288,13 @@ class MultiMaps:
         if region is not None:
             candidate_mask = self._collect_contactspace_column("region").astype(np.int64) == region
 
+        selected_graph = graph if graph is not None else self.graph_result
+        if selection_mode == "graph_endpoint" and selected_graph is None:
+            raise RuntimeError(
+                "selection_mode='graph_endpoint' requires a graph. "
+                "Call multimaps.build_graph(...) first or pass graph explicitly."
+            )
+
         result = select_feature_archetypes(
             point_table,
             n_archetypes=n_archetypes,
@@ -288,9 +305,14 @@ class MultiMaps:
             min_probability=min_probability,
             min_probability_quantile=min_probability_quantile,
             scale_features=scale_features,
+            selection_mode=selection_mode,
+            graph=selected_graph,
             probability_weight=probability_weight,
             extremeness_weight=extremeness_weight,
             diversity_weight=diversity_weight,
+            endpointness_weight=endpointness_weight,
+            geodesic_weight=geodesic_weight,
+            branching_weight=branching_weight,
         )
         self.archetype_selection_result = result
 
@@ -312,11 +334,15 @@ class MultiMaps:
         *,
         graph: GraphResult | None = None,
         selected_indexes: npt.ArrayLike | None = None,
+        propagation_mode: ArchetypePropagationMode = "diffusion",
         alpha: float = 0.9,
         max_iter: int = 500,
         tol: float = 1.0e-8,
         confidence_threshold: float = 0.5,
         margin_threshold: float = 0.0,
+        propagation_realspace_scale: float = 1.0,
+        propagation_feature_scale: float = 1.0,
+        propagation_use_node_weights: bool = False,
         kind: str = "archetype",
         update_data: bool = True,
     ) -> ArchetypePropagationResult:
@@ -348,11 +374,15 @@ class MultiMaps:
             selected_graph,
             selected_indexes=selected,
             point_index_column="global_point_index",
+            propagation_mode=propagation_mode,
             alpha=alpha,
             max_iter=max_iter,
             tol=tol,
             confidence_threshold=confidence_threshold,
             margin_threshold=margin_threshold,
+            propagation_realspace_scale=propagation_realspace_scale,
+            propagation_feature_scale=propagation_feature_scale,
+            propagation_use_node_weights=propagation_use_node_weights,
         )
         self.archetype_propagation_result = result
 
@@ -495,17 +525,29 @@ class MultiMaps:
     ) -> None:
         for map_index, group in archetype_table.groupby("map_index", sort=False):
             ordered = group.sort_values("selection_rank").reset_index(drop=True)
+            metadata: dict[str, np.ndarray[Any, Any]] = {
+                "selection_rank": ordered["selection_rank"].to_numpy(dtype=np.int64),
+                "selection_score": ordered["selection_score"].to_numpy(dtype=np.float64),
+                "probability_score": ordered["probability_score"].to_numpy(dtype=np.float64),
+                "extremeness_score": ordered["extremeness_score"].to_numpy(dtype=np.float64),
+                "diversity_score": ordered["diversity_score"].to_numpy(dtype=np.float64),
+            }
+            for column in [
+                "euclidean_extremeness_score",
+                "endpoint_score",
+                "endpointness_score",
+                "geodesic_score",
+                "branching_score",
+            ]:
+                if column in ordered.columns:
+                    metadata[column] = ordered[column].to_numpy(dtype=np.float64)
             self.maps[int(map_index)].add_special_points(
                 ordered["point_index"].to_numpy(dtype=np.int64),
                 kind=kind,
                 iteration=iteration,
                 label_status=label_status,
                 replace_kind=False,
-                selection_rank=ordered["selection_rank"].to_numpy(dtype=np.int64),
-                selection_score=ordered["selection_score"].to_numpy(dtype=np.float64),
-                probability_score=ordered["probability_score"].to_numpy(dtype=np.float64),
-                extremeness_score=ordered["extremeness_score"].to_numpy(dtype=np.float64),
-                diversity_score=ordered["diversity_score"].to_numpy(dtype=np.float64),
+                **metadata,
             )
 
     def _combine_contactspace_neighbors(self) -> list[np.ndarray[Any, np.dtype[np.int64]]]:

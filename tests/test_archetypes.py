@@ -112,6 +112,188 @@ def test_maps_propagate_archetypes_marks_ambiguous_regions() -> None:
     assert int(maps.data.loc[1, "assigned_archetype_index"]) == 1
 
 
+def test_maps_propagate_archetypes_shortest_path_gives_compact_groups() -> None:
+    positions = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [3.0, 0.0, 0.0],
+            [4.0, 0.0, 0.0],
+        ]
+    )
+    probabilities = np.ones(len(positions), dtype=np.float64)
+    neighbors = [
+        np.array([1, -1, -1, -1, -1, -1]),
+        np.array([0, 2, -1, -1, -1, -1]),
+        np.array([1, 3, -1, -1, -1, -1]),
+        np.array([2, 4, -1, -1, -1, -1]),
+        np.array([3, -1, -1, -1, -1, -1]),
+    ]
+    maps = Maps(_build_system(), [], StubContactSpace(positions, probabilities, neighbors))
+    maps.data = pd.DataFrame(
+        {
+            "x": positions[:, 0],
+            "y": positions[:, 1],
+            "z": positions[:, 2],
+            "f1": positions[:, 0],
+        }
+    )
+    maps.features = ["f1"]
+    graph = maps.build_graph(mode="realspace")
+
+    result = maps.propagate_archetypes(
+        graph=graph,
+        selected_indexes=np.array([0, 4]),
+        propagation_mode="shortest_path",
+        confidence_threshold=0.0,
+        margin_threshold=0.0,
+    )
+
+    assigned = result.assignment_table.set_index("point_index")["assigned_archetype_index"]
+    assert assigned.loc[0] == 0
+    assert assigned.loc[1] == 0
+    assert assigned.loc[3] == 4
+    assert assigned.loc[4] == 4
+
+
+def test_maps_propagate_archetypes_region_grow_splits_by_topology() -> None:
+    positions = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [3.0, 0.0, 0.0],
+            [4.0, 0.0, 0.0],
+        ]
+    )
+    probabilities = np.ones(len(positions), dtype=np.float64)
+    neighbors = [
+        np.array([1, -1, -1, -1, -1, -1]),
+        np.array([0, 2, -1, -1, -1, -1]),
+        np.array([1, 3, -1, -1, -1, -1]),
+        np.array([2, 4, -1, -1, -1, -1]),
+        np.array([3, -1, -1, -1, -1, -1]),
+    ]
+    maps = Maps(_build_system(), [], StubContactSpace(positions, probabilities, neighbors))
+    maps.data = pd.DataFrame(
+        {
+            "x": positions[:, 0],
+            "y": positions[:, 1],
+            "z": positions[:, 2],
+            "f1": positions[:, 0],
+        }
+    )
+    maps.features = ["f1"]
+    graph = maps.build_graph(mode="realspace")
+
+    result = maps.propagate_archetypes(
+        graph=graph,
+        selected_indexes=np.array([0, 4]),
+        propagation_mode="region_grow",
+        confidence_threshold=0.0,
+        margin_threshold=0.0,
+    )
+
+    assigned = result.assignment_table.set_index("point_index")["assigned_archetype_index"]
+    assert assigned.loc[0] == 0
+    assert assigned.loc[1] == 0
+    assert assigned.loc[3] == 4
+    assert assigned.loc[4] == 4
+
+
+def test_maps_propagate_archetypes_watershed_prefers_connected_regions() -> None:
+    positions = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [3.0, 0.0, 0.0],
+        ]
+    )
+    probabilities = np.array([1.0, 0.5, 1.0, 1.0], dtype=np.float64)
+    neighbors = [
+        np.array([1, -1, -1, -1, -1, -1]),
+        np.array([0, 2, -1, -1, -1, -1]),
+        np.array([1, 3, -1, -1, -1, -1]),
+        np.array([2, -1, -1, -1, -1, -1]),
+    ]
+    maps = Maps(_build_system(), [], StubContactSpace(positions, probabilities, neighbors))
+    maps.data = pd.DataFrame(
+        {
+            "x": positions[:, 0],
+            "y": positions[:, 1],
+            "z": positions[:, 2],
+            "f1": positions[:, 0],
+        }
+    )
+    maps.features = ["f1"]
+    graph = maps.build_graph(mode="realspace")
+
+    result = maps.propagate_archetypes(
+        graph=graph,
+        selected_indexes=np.array([0, 3]),
+        propagation_mode="watershed",
+        confidence_threshold=0.0,
+        margin_threshold=0.0,
+    )
+
+    assigned = result.assignment_table.set_index("point_index")["assigned_archetype_index"]
+    assert assigned.loc[0] == 0
+    assert assigned.loc[1] == 0
+    assert assigned.loc[2] == 3
+    assert assigned.loc[3] == 3
+
+
+def test_graph_endpoint_selection_prefers_bent_tail_tips() -> None:
+    positions = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [2.0, 1.0, 0.0],
+            [1.0, 2.0, 0.0],
+            [-1.0, 0.0, 0.0],
+            [-2.0, 0.0, 0.0],
+        ]
+    )
+    probabilities = np.ones(len(positions), dtype=np.float64)
+    neighbors = [
+        np.array([1, 4, -1, -1, -1, -1]),
+        np.array([0, 2, -1, -1, -1, -1]),
+        np.array([1, 3, -1, -1, -1, -1]),
+        np.array([2, -1, -1, -1, -1, -1]),
+        np.array([0, 5, -1, -1, -1, -1]),
+        np.array([4, -1, -1, -1, -1, -1]),
+    ]
+    contactspace = StubContactSpace(positions, probabilities, neighbors)
+    maps = Maps(_build_system(), [], contactspace)
+    maps.data = pd.DataFrame(
+        {
+            "x": positions[:, 0],
+            "y": positions[:, 1],
+            "z": positions[:, 2],
+            "pc0": positions[:, 0],
+            "pc1": positions[:, 1],
+        }
+    )
+    maps.features = ["pc0", "pc1"]
+    graph = maps.build_graph(mode="realspace")
+
+    result = maps.select_archetypes(
+        2,
+        feature_columns=["pc0", "pc1"],
+        graph=graph,
+        selection_mode="graph_endpoint",
+        probability_weight=0.0,
+        extremeness_weight=1.0,
+        diversity_weight=0.25,
+        min_probability_quantile=None,
+    )
+
+    assert set(result.selected_indexes.tolist()) == {3, 5}
+    assert "endpoint_score" in result.candidate_table.columns
+
+
 def test_multimaps_archetype_wrappers_register_and_propagate() -> None:
     positions = np.array(
         [

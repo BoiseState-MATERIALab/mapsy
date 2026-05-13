@@ -4,11 +4,14 @@ import numpy as np
 import numpy.typing as npt
 import pandas as pd
 from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.spatial.distance import cdist
 from sklearn.neighbors import NearestNeighbors
 
 from mapsy.results import GraphResult
 
 GraphMode: TypeAlias = Literal["realspace", "feature", "hybrid"]
+FeatureConnectivityMode: TypeAlias = Literal["knn", "knn_mst"]
 
 
 def build_point_graph(
@@ -19,6 +22,7 @@ def build_point_graph(
     neighbors: list[npt.NDArray[np.int64]] | npt.NDArray[np.int64] | None = None,
     node_weight_column: str = "probability",
     feature_k: int = 8,
+    feature_connectivity: FeatureConnectivityMode = "knn",
     sigma_feature: float | None = None,
     realspace_weight: float = 1.0,
     feature_weight: float = 1.0,
@@ -79,6 +83,7 @@ def build_point_graph(
             edge_accumulator,
             features=features,
             feature_k=feature_k,
+            feature_connectivity=feature_connectivity,
             sigma_feature=sigma_feature,
             feature_weight=feature_weight,
             system_ids=system_array,
@@ -116,6 +121,7 @@ def build_point_graph(
             "realspace_weight": realspace_weight,
             "feature_weight": feature_weight,
             "feature_k": feature_k,
+            "feature_connectivity": feature_connectivity,
             "sigma_feature": sigma_feature,
             "direction_columns": direction_columns,
             "directional_weight": directional_weight,
@@ -163,6 +169,7 @@ def _accumulate_feature_edges(
     *,
     features: npt.NDArray[np.float64],
     feature_k: int,
+    feature_connectivity: FeatureConnectivityMode,
     sigma_feature: float | None,
     feature_weight: float,
     system_ids: npt.NDArray[Any],
@@ -174,6 +181,7 @@ def _accumulate_feature_edges(
             features=features,
             indices=np.arange(len(features), dtype=np.int64),
             feature_k=feature_k,
+            feature_connectivity=feature_connectivity,
             sigma_feature=sigma_feature,
             feature_weight=feature_weight,
         )
@@ -188,6 +196,7 @@ def _accumulate_feature_edges(
             features=features[indexes],
             indices=indexes,
             feature_k=feature_k,
+            feature_connectivity=feature_connectivity,
             sigma_feature=sigma_feature,
             feature_weight=feature_weight,
         )
@@ -199,6 +208,7 @@ def _accumulate_feature_edges_subset(
     features: npt.NDArray[np.float64],
     indices: npt.NDArray[np.int64],
     feature_k: int,
+    feature_connectivity: FeatureConnectivityMode,
     sigma_feature: float | None,
     feature_weight: float,
 ) -> None:
@@ -239,6 +249,51 @@ def _accumulate_feature_edges_subset(
             )
             similarity = np.exp(-float(distance) ** 2 / (sigma**2))
             payload["feature_component"] += float(feature_weight) * float(similarity)
+
+    if feature_connectivity == "knn_mst":
+        _accumulate_feature_mst_edges(
+            edge_accumulator,
+            features=features,
+            indices=indices,
+            sigma=sigma,
+            feature_weight=feature_weight,
+        )
+
+
+def _accumulate_feature_mst_edges(
+    edge_accumulator: dict[tuple[int, int], dict[str, float]],
+    *,
+    features: npt.NDArray[np.float64],
+    indices: npt.NDArray[np.int64],
+    sigma: float,
+    feature_weight: float,
+) -> None:
+    npoints = len(indices)
+    if npoints < 2:
+        return
+    distances = cdist(features, features, metric="euclidean")
+    mst = minimum_spanning_tree(distances).tocoo()
+    for local_source, local_target, distance in zip(
+        mst.row,
+        mst.col,
+        mst.data,
+        strict=False,
+    ):
+        global_source = int(indices[int(local_source)])
+        global_target = int(indices[int(local_target)])
+        if global_source == global_target:
+            continue
+        key = (
+            (global_source, global_target)
+            if global_source < global_target
+            else (global_target, global_source)
+        )
+        payload = edge_accumulator.setdefault(
+            key,
+            {"realspace_component": 0.0, "feature_component": 0.0},
+        )
+        similarity = max(float(np.exp(-float(distance) ** 2 / (sigma**2))), 1.0e-12)
+        payload["feature_component"] += float(feature_weight) * float(similarity)
 
 
 def _build_edge_table(
