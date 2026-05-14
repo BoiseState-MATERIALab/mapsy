@@ -29,6 +29,7 @@ from mapsy.clustering import (
     clustering_uses_random_state,
     normalize_cluster_method,
 )
+from mapsy.maps import _coerce_layer_values
 from mapsy.results import (
     ArchetypePropagationResult,
     ArchetypeSelectionResult,
@@ -44,6 +45,8 @@ if TYPE_CHECKING:
 
 
 class MultiMaps:
+    _METADATA_COLUMNS = ("region", "layer")
+
     def __init__(
         self,
         maps: Sequence["Maps"],
@@ -69,6 +72,7 @@ class MultiMaps:
         self.graph_result: GraphResult | None = None
         self.archetype_selection_result: ArchetypeSelectionResult | None = None
         self.archetype_propagation_result: ArchetypePropagationResult | None = None
+        self.layer_ranking: pd.DataFrame | None = None
 
         self.nclusters: int = 0
         self.cluster_method: str = "spectral"
@@ -249,6 +253,34 @@ class MultiMaps:
         self.graph_result = result
         return result
 
+    def rank_layers(
+        self,
+        *,
+        feature_columns: list[str] | None = None,
+        scale_features: bool = True,
+        completeness_weight: float = 1.0,
+        variance_weight: float = 1.0,
+        min_points: int = 1,
+    ) -> pd.DataFrame:
+        self._ensure_data()
+
+        frames: list[pd.DataFrame] = []
+        for map_index, (name, maps) in enumerate(zip(self.names, self.maps, strict=False)):
+            ranking = maps.rank_layers(
+                feature_columns=feature_columns,
+                scale_features=scale_features,
+                completeness_weight=completeness_weight,
+                variance_weight=variance_weight,
+                min_points=min_points,
+            ).copy()
+            ranking.insert(0, "system", name)
+            ranking.insert(0, "map_index", map_index)
+            frames.append(ranking)
+
+        result = pd.concat(frames, ignore_index=True)
+        self.layer_ranking = result.copy()
+        return result
+
     def select_archetypes(
         self,
         n_archetypes: int,
@@ -257,6 +289,7 @@ class MultiMaps:
         graph: GraphResult | None = None,
         probability_column: str = "probability",
         region: int | None = None,
+        layer: int | Sequence[int] | None = None,
         min_probability: float | None = None,
         min_probability_quantile: float | None = 0.75,
         scale_features: bool = True,
@@ -285,8 +318,18 @@ class MultiMaps:
             )
 
         candidate_mask: np.ndarray[Any, np.dtype[np.bool_]] | None = None
-        if region is not None:
-            candidate_mask = self._collect_contactspace_column("region").astype(np.int64) == region
+        if region is not None or layer is not None:
+            candidate_mask = np.ones(len(point_table), dtype=bool)
+            if region is not None:
+                candidate_mask &= (
+                    self._collect_contactspace_column("region").astype(np.int64) == region
+                )
+            if layer is not None:
+                layer_values = self._collect_contactspace_column("layer").astype(np.int64)
+                requested_layers = _coerce_layer_values(layer)
+                candidate_mask &= np.isin(layer_values, requested_layers)
+                if min_probability is None and min_probability_quantile == 0.75:
+                    min_probability_quantile = None
 
         selected_graph = graph if graph is not None else self.graph_result
         if selection_mode == "graph_endpoint" and selected_graph is None:
@@ -443,7 +486,10 @@ class MultiMaps:
             elif set(current_features) != set(reference_features):
                 raise ValueError("All maps in MultiMaps must expose the same feature columns")
 
-            ordered = frame.loc[:, ["x", "y", "z", *reference_features]].copy()
+            metadata_columns = [
+                column for column in self._METADATA_COLUMNS if column in frame.columns
+            ]
+            ordered = frame.loc[:, ["x", "y", "z", *metadata_columns, *reference_features]].copy()
             ordered.insert(0, "point_index", np.arange(len(ordered), dtype=np.int64))
             ordered.insert(0, "map_index", index)
             ordered.insert(0, "system", name)
@@ -478,7 +524,11 @@ class MultiMaps:
             return features
         if maps.data is None:
             raise RuntimeError("No maps data available.")
-        return [column for column in maps.data.columns if column not in {"x", "y", "z"}]
+        return [
+            column
+            for column in maps.data.columns
+            if column not in {"x", "y", "z", *self._METADATA_COLUMNS}
+        ]
 
     def _propagate_columns(self, columns: list[str]) -> None:
         if self.data is None:

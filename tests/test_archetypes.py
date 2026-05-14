@@ -1,6 +1,11 @@
+import matplotlib
 import numpy as np
 import pandas as pd
 from ase import Atoms
+
+matplotlib.use("Agg")
+
+from matplotlib import pyplot as plt
 
 from mapsy import Maps, MultiMaps
 from mapsy.data import Grid, System
@@ -12,12 +17,18 @@ class StubContactSpace:
         positions: np.ndarray,
         probabilities: np.ndarray,
         neighbors: list[np.ndarray],
+        layers: np.ndarray | None = None,
     ) -> None:
         self.nm = len(positions)
         self.neighbors = [np.asarray(row, dtype=np.int64) for row in neighbors]
         self.data = pd.DataFrame(positions, columns=["x", "y", "z"])
         self.data.loc[:, "probability"] = probabilities
         self.data.loc[:, "region"] = np.zeros(self.nm, dtype=np.int64)
+        self.data.loc[:, "layer"] = (
+            np.asarray(layers, dtype=np.int64)
+            if layers is not None
+            else np.zeros(self.nm, dtype=np.int64)
+        )
         self._feature_columns: list[str] = []
 
     @property
@@ -83,6 +94,188 @@ def test_maps_select_archetypes_prefers_high_probability_extremes() -> None:
 
     special = maps.get_special_points(kind="archetype")
     assert set(special["point_index"].tolist()) == {1, 3}
+
+
+def test_maps_select_archetypes_can_filter_candidates_by_layer() -> None:
+    positions = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [3.0, 0.0, 0.0],
+        ]
+    )
+    probabilities = np.array([0.1, 0.9, 0.2, 0.8], dtype=np.float64)
+    neighbors = [
+        np.array([1, -1, -1, -1, -1, -1]),
+        np.array([0, 2, -1, -1, -1, -1]),
+        np.array([1, 3, -1, -1, -1, -1]),
+        np.array([2, -1, -1, -1, -1, -1]),
+    ]
+    layers = np.array([0, 0, 1, 1], dtype=np.int64)
+    maps = Maps(_build_system(), [], StubContactSpace(positions, probabilities, neighbors, layers))
+    maps.data = pd.DataFrame(
+        {
+            "x": positions[:, 0],
+            "y": positions[:, 1],
+            "z": positions[:, 2],
+            "f1": [0.0, 1.0, 10.0, 11.0],
+        }
+    )
+    maps.features = ["f1"]
+
+    result = maps.select_archetypes(
+        1,
+        feature_columns=["f1"],
+        layer=1,
+    )
+
+    assert result.candidate_indexes.tolist() == [2, 3]
+    assert result.selected_indexes.tolist() == [3]
+    assert result.metadata is not None
+    assert result.metadata["min_probability_quantile"] is None
+
+
+def test_maps_rank_layers_can_prioritize_completeness_or_feature_variance() -> None:
+    positions = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [3.0, 0.0, 0.0],
+            [4.0, 0.0, 0.0],
+        ]
+    )
+    probabilities = np.ones(len(positions), dtype=np.float64)
+    neighbors = [
+        np.array([1, -1, -1, -1, -1, -1]),
+        np.array([0, 2, -1, -1, -1, -1]),
+        np.array([1, 3, -1, -1, -1, -1]),
+        np.array([2, 4, -1, -1, -1, -1]),
+        np.array([3, -1, -1, -1, -1, -1]),
+    ]
+    layers = np.array([0, 0, 0, 1, 1], dtype=np.int64)
+    maps = Maps(_build_system(), [], StubContactSpace(positions, probabilities, neighbors, layers))
+    maps.data = pd.DataFrame(
+        {
+            "x": positions[:, 0],
+            "y": positions[:, 1],
+            "z": positions[:, 2],
+            "f1": [0.0, 0.1, 0.2, 10.0, 20.0],
+        }
+    )
+    maps.features = ["f1"]
+
+    completeness_ranking = maps.rank_layers(
+        feature_columns=["f1"],
+        completeness_weight=1.0,
+        variance_weight=0.0,
+    )
+    assert completeness_ranking.iloc[0]["layer"] == 0
+    assert completeness_ranking.iloc[0]["npoints"] == 3
+
+    variance_ranking = maps.rank_layers(
+        feature_columns=["f1"],
+        completeness_weight=0.0,
+        variance_weight=1.0,
+    )
+    assert variance_ranking.iloc[0]["layer"] == 1
+    assert "feature_variance_mean" in variance_ranking.columns
+    assert (
+        variance_ranking.iloc[0]["feature_variance_mean"]
+        > variance_ranking.iloc[1]["feature_variance_mean"]
+    )
+
+
+def test_multimaps_rank_layers_returns_per_map_rankings() -> None:
+    positions = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+        ]
+    )
+    neighbors = [
+        np.array([1, -1, -1, -1, -1, -1]),
+        np.array([0, -1, -1, -1, -1, -1]),
+    ]
+
+    map_a = Maps(
+        _build_system(),
+        [],
+        StubContactSpace(positions, np.ones(2, dtype=np.float64), neighbors, np.array([0, 1])),
+    )
+    map_a.data = pd.DataFrame(
+        {
+            "x": positions[:, 0],
+            "y": positions[:, 1],
+            "z": positions[:, 2],
+            "f1": [0.0, 2.0],
+        }
+    )
+    map_a.features = ["f1"]
+
+    map_b = Maps(
+        _build_system(),
+        [],
+        StubContactSpace(positions + np.array([10.0, 0.0, 0.0]), np.ones(2), neighbors),
+    )
+    map_b.data = pd.DataFrame(
+        {
+            "x": positions[:, 0] + 10.0,
+            "y": positions[:, 1],
+            "z": positions[:, 2],
+            "f1": [1.0, 1.1],
+        }
+    )
+    map_b.features = ["f1"]
+
+    multimaps = MultiMaps([map_a, map_b], names=["a", "b"])
+    ranking = multimaps.rank_layers(
+        feature_columns=["f1"],
+        completeness_weight=1.0,
+        variance_weight=0.0,
+    )
+
+    assert {"map_index", "system", "layer", "layer_rank"}.issubset(ranking.columns)
+    assert ranking["map_index"].tolist() == [0, 0, 1]
+    assert ranking["system"].tolist() == ["a", "a", "b"]
+
+
+def test_maps_scatter_can_plot_contactspace_layers_categorically() -> None:
+    positions = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [3.0, 0.0, 0.0],
+        ]
+    )
+    probabilities = np.ones(len(positions), dtype=np.float64)
+    neighbors = [
+        np.array([1, -1, -1, -1, -1, -1]),
+        np.array([0, 2, -1, -1, -1, -1]),
+        np.array([1, 3, -1, -1, -1, -1]),
+        np.array([2, -1, -1, -1, -1, -1]),
+    ]
+    layers = np.array([0, 0, 1, 1], dtype=np.int64)
+    maps = Maps(_build_system(), [], StubContactSpace(positions, probabilities, neighbors, layers))
+    maps.data = pd.DataFrame(
+        {
+            "x": positions[:, 0],
+            "y": positions[:, 1],
+            "z": positions[:, 2],
+            "f1": [0.0, 1.0, 2.0, 3.0],
+        }
+    )
+    maps.features = ["f1"]
+
+    fig, ax = maps.scatter(feature="layer", categorical=True, region=None)
+
+    legend = ax.get_legend()
+    assert legend is not None
+    labels = [text.get_text() for text in legend.get_texts()]
+    assert labels == ["layer = 0", "layer = 1"]
+    plt.close(fig)
 
 
 def test_maps_propagate_archetypes_marks_ambiguous_regions() -> None:

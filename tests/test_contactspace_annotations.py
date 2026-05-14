@@ -5,8 +5,9 @@ import pandas as pd
 from ase import Atoms
 
 from mapsy import Maps
+from mapsy.boundaries import Boundary, ContactSpace
 from mapsy.boundaries.ionic import IonicGeometry
-from mapsy.data import Grid, System
+from mapsy.data import GradientField, Grid, ScalarField, System
 from mapsy.io.parser import ContactSpaceGenerator
 
 
@@ -33,6 +34,17 @@ class StubContactSpace:
         elif not as_feature and name in self._feature_columns:
             self._feature_columns.remove(name)
         return array
+
+
+class DummyBoundary(Boundary):
+    def update(self) -> None:
+        return
+
+    def _build(self) -> None:
+        return
+
+    def _build_solvent_aware_boundary(self) -> None:
+        return
 
 
 def _build_system(cell_length: float = 10.0) -> System:
@@ -67,7 +79,11 @@ def test_maps_atcontactspace_includes_contactspace_feature_annotations() -> None
     data = maps.atcontactspace()
 
     assert "ionic_distance" in data.columns
+    assert "region" in data.columns
+    assert "layer" in data.columns
     assert maps.features == ["ionic_distance"]
+    assert "region" not in maps.features
+    assert "layer" not in maps.features
     np.testing.assert_allclose(data["ionic_distance"].to_numpy(), annotation)
 
 
@@ -93,6 +109,83 @@ def test_contactspace_data_includes_boundary_derived_columns() -> None:
     assert expected.issubset(contactspace.data.columns)
     assert expected.issubset(contactspace.annotation_columns)
     assert set(contactspace.feature_columns).isdisjoint(expected)
+
+
+def test_contactspace_layer_assignment_groups_points_by_boundary_sheet() -> None:
+    grid = Grid(scalars=[2, 2, 1], cell=np.diag([2.0, 2.0, 1.0]))
+    boundary = DummyBoundary(mode="system", grid=grid)
+
+    switch = ScalarField(grid)
+    switch[:] = np.array(
+        [
+            [[0.0], [0.0]],
+            [[1.0], [1.0]],
+        ]
+    )
+    boundary.switch[:] = switch
+
+    gradient = GradientField(grid)
+    gradient[0, :, :, :] = 1.0
+    gradient[1, :, :, :] = 0.0
+    gradient[2, :, :, :] = 0.0
+    boundary.gradient[:] = gradient
+
+    contactspace = ContactSpace(
+        boundary,
+        tol=0.1,
+        assign_layers=True,
+        layer_switch_tolerance=0.1,
+        layer_gradient_cosine_min=0.99,
+        layer_orthogonality_tolerance=0.1,
+    )
+
+    assert "layer" in contactspace.data.columns
+    assert "layer" in contactspace.annotation_columns
+    assert "layer" not in contactspace.feature_columns
+    assert contactspace.nlayers == 2
+
+    frame = contactspace.data.copy()
+    layers_by_x = frame.groupby("x")["layer"].nunique()
+    assert layers_by_x.loc[0.0] == 1
+    assert layers_by_x.loc[1.0] == 1
+    assert (
+        frame.loc[frame["x"] == 0.0, "layer"].iloc[0]
+        != frame.loc[frame["x"] == 1.0, "layer"].iloc[0]
+    )
+
+
+def test_contactspace_layer_assignment_connects_diagonal_tangent_neighbors() -> None:
+    grid = Grid(scalars=[2, 2, 1], cell=np.diag([2.0, 2.0, 1.0]))
+    boundary = DummyBoundary(mode="system", grid=grid)
+
+    switch = ScalarField(grid)
+    switch[:] = np.array(
+        [
+            [[0.0], [1.0]],
+            [[1.0], [2.0]],
+        ]
+    )
+    boundary.switch[:] = switch
+
+    gradient = GradientField(grid)
+    diagonal_normal = 1.0 / np.sqrt(2.0)
+    gradient[0, :, :, :] = diagonal_normal
+    gradient[1, :, :, :] = diagonal_normal
+    gradient[2, :, :, :] = 0.0
+    boundary.gradient[:] = gradient
+
+    contactspace = ContactSpace(
+        boundary,
+        tol=0.1,
+        assign_layers=True,
+        layer_switch_tolerance=0.1,
+        layer_gradient_cosine_min=0.99,
+        layer_orthogonality_tolerance=0.1,
+    )
+
+    assert contactspace.nlayers == 3
+    frame = contactspace.data.set_index(["x", "y"])
+    assert frame.loc[(0.0, 1.0), "layer"] == frame.loc[(1.0, 0.0), "layer"]
 
 
 def test_maps_annotate_ionic_distance_updates_contactspace_and_maps_data() -> None:

@@ -21,6 +21,8 @@ from mapsy.io.parser import resolve_file_model
 
 
 class FakeMaps:
+    _metadata_columns = {"region", "layer"}
+
     def __init__(self, frame: pd.DataFrame) -> None:
         self._frame = frame
         nneighbors = np.full((len(frame), 6), -1, dtype=np.int64)
@@ -30,7 +32,11 @@ class FakeMaps:
 
     def atcontactspace(self) -> pd.DataFrame:
         self.data = self._frame.copy()
-        self.features = self.data.columns.drop(["x", "y", "z"]).tolist()
+        self.features = [
+            column
+            for column in self.data.columns
+            if column not in {"x", "y", "z", *self._metadata_columns}
+        ]
         return self.data
 
 
@@ -54,6 +60,8 @@ def test_multimaps_combines_contact_space_data() -> None:
                 "x": [0.0, 1.0],
                 "y": [0.0, 1.0],
                 "z": [0.0, 0.0],
+                "region": [0, 0],
+                "layer": [1, 1],
                 "f1": [0.1, 0.2],
                 "f2": [1.0, 1.1],
             }
@@ -65,6 +73,8 @@ def test_multimaps_combines_contact_space_data() -> None:
                 "x": [2.0, 3.0],
                 "y": [2.0, 3.0],
                 "z": [0.0, 0.0],
+                "region": [1, 1],
+                "layer": [0, 1],
                 "f1": [0.3, 0.4],
                 "f2": [1.2, 1.3],
             }
@@ -75,9 +85,13 @@ def test_multimaps_combines_contact_space_data() -> None:
     combined = multimaps.atcontactspace()
 
     assert multimaps.features == ["f1", "f2"]
+    assert "region" not in multimaps.features
+    assert "layer" not in multimaps.features
     assert combined["system"].tolist() == ["a", "a", "b", "b"]
     assert combined["map_index"].tolist() == [0, 0, 1, 1]
     assert combined["point_index"].tolist() == [0, 1, 0, 1]
+    assert combined["region"].tolist() == [0, 0, 1, 1]
+    assert combined["layer"].tolist() == [1, 1, 0, 1]
 
 
 def test_multimaps_requires_shared_features() -> None:

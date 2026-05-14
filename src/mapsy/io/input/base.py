@@ -1,7 +1,7 @@
 from pydantic import (
     BaseModel as PydanticBaseModel,
 )
-from pydantic import NonNegativeInt, PositiveFloat, PositiveInt
+from pydantic import NonNegativeFloat, NonNegativeInt, PositiveFloat, PositiveInt
 
 from mapsy.io.input.keytypes import (
     ContactSpaceMode,
@@ -72,3 +72,7 @@ class ContactSpaceModel(BaseModel):
     cutoff: PositiveInt = 300
     threshold: NonZeroFloat = 0.1
     side: NonZeroFloat = 1.0
+    assign_layers: bool = False
+    layer_switch_tolerance: NonNegativeFloat = 0.25
+    layer_gradient_cosine_min: float = 0.9
+    layer_orthogonality_tolerance: NonNegativeFloat = 0.25

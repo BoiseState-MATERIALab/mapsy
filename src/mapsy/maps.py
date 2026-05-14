@@ -66,6 +66,12 @@ def _run_multiproc_lists(
     return multiproc(func, list(args))
 
 
+def _coerce_layer_values(layer: int | Sequence[int]) -> NDArrayI:
+    if isinstance(layer, Sequence):
+        return np.asarray(list(layer), dtype=np.int64).reshape(-1)
+    return np.asarray([layer], dtype=np.int64)
+
+
 class SpecialPointRegistry:
     """Registry of contact-space points selected for downstream simulations."""
 
@@ -259,6 +265,7 @@ class SpecialPointRegistry:
 
 # Class for Maps, which includes functionality for processing symmetry functions
 class Maps:
+    _METADATA_COLUMNS = {"region", "layer"}
     bedug: bool = False
     verbosity: int = 0  # Verbosity level (how much logging to show)
 
@@ -279,6 +286,7 @@ class Maps:
     graph_result: GraphResult | None = None
     archetype_selection_result: ArchetypeSelectionResult | None = None
     archetype_propagation_result: ArchetypePropagationResult | None = None
+    layer_ranking: pd.DataFrame | None = None
 
     nclusters: int = 0
     cluster_method: str = "spectral"
@@ -339,6 +347,7 @@ class Maps:
         positions: npt.NDArray = self.contactspace.data[["x", "y", "z"]].values
 
         self.data = self.atpoints(positions)
+        self._sync_contactspace_metadata()
         self._sync_contactspace_features()
         self._refresh_features()
 
@@ -626,6 +635,7 @@ class Maps:
         index: int | None = None,
         axes: list[str] | None = None,
         region: int | None = 0,
+        layer: int | Sequence[int] | None = None,
         categorical: bool = False,
         centroids: bool = False,
         splitby: str | None = None,
@@ -639,11 +649,27 @@ class Maps:
         # Check that contact space maps have been generated
         if self.data is None:
             raise RuntimeError("No contact space data available.")
-        # Filter data by region
-        filterdata = self.data[self.contactspace.data["region"] == region]
+        frame = self.data.copy()
+        contactspace_columns = self.contactspace.data
+        for column in {feature, splitby}:
+            if column is None or column in frame.columns:
+                continue
+            if column in contactspace_columns.columns:
+                frame.loc[:, column] = contactspace_columns[column].to_numpy()
+            else:
+                raise ValueError(f"Column {column!r} not found in maps data or contactspace data.")
+
+        mask = np.ones(len(frame), dtype=bool)
+        if region is not None:
+            mask &= contactspace_columns["region"].to_numpy(dtype=np.int64) == region
+        if layer is not None:
+            layer_values = contactspace_columns["layer"].to_numpy(dtype=np.int64)
+            requested_layers = _coerce_layer_values(layer)
+            mask &= np.isin(layer_values, requested_layers)
+        filterdata = frame.loc[mask]
         # Check if feature or index is provided and if it is valid
         if feature is not None:
-            if feature not in self.data.columns:
+            if feature not in filterdata.columns:
                 raise ValueError(f"Feature {feature} not found in maps data.")
         elif index is not None:
             if index >= len(self.features) or index < 0:
@@ -666,7 +692,7 @@ class Maps:
         f = filterdata[feature].values.astype(np.float64)
         # Select the axis for splitting
         if splitby is not None:
-            if splitby not in self.data.columns:
+            if splitby not in filterdata.columns:
                 raise ValueError(f"Split axis {splitby[0]} not found in maps data.")
             s = filterdata[splitby].values
             nsplit = np.unique(s).size
@@ -1081,6 +1107,102 @@ class Maps:
         self.graph_result = result
         return result
 
+    def rank_layers(
+        self,
+        *,
+        feature_columns: list[str] | None = None,
+        scale_features: bool = True,
+        completeness_weight: float = 1.0,
+        variance_weight: float = 1.0,
+        min_points: int = 1,
+    ) -> pd.DataFrame:
+        if self.data is None:
+            raise RuntimeError("No contact space data available.")
+        if self.contactspace is None:
+            raise RuntimeError("Trying to rank layers without contact space")
+        if "layer" not in self.contactspace.data.columns:
+            raise RuntimeError("Contact space does not define layer assignments")
+        if min_points <= 0:
+            raise ValueError(f"min_points must be positive, got {min_points}.")
+        if completeness_weight < 0.0 or variance_weight < 0.0:
+            raise ValueError("Layer ranking weights must be non-negative")
+        if completeness_weight == 0.0 and variance_weight == 0.0:
+            raise ValueError("At least one layer ranking weight must be positive")
+
+        resolved_feature_columns = (
+            list(feature_columns) if feature_columns is not None else list(self.features)
+        )
+        missing_features = [
+            column for column in resolved_feature_columns if column not in self.data.columns
+        ]
+        if missing_features:
+            raise ValueError(f"Missing feature columns in maps.data: {missing_features}.")
+        if variance_weight > 0.0 and not resolved_feature_columns:
+            raise ValueError(
+                "feature_columns must contain at least one column when variance_weight > 0."
+            )
+
+        frame = self.data.copy()
+        frame.loc[:, "layer"] = self.contactspace.data["layer"].to_numpy(dtype=np.int64)
+
+        if resolved_feature_columns:
+            feature_values = frame.loc[:, resolved_feature_columns].to_numpy(dtype=np.float64)
+            if scale_features:
+                feature_values = StandardScaler().fit_transform(feature_values)
+            feature_frame = pd.DataFrame(
+                feature_values,
+                index=frame.index,
+                columns=resolved_feature_columns,
+            )
+            frame.loc[:, resolved_feature_columns] = feature_frame
+
+        group_sizes = frame.groupby("layer", sort=True).size().rename("npoints")
+        ranking = group_sizes.reset_index()
+        ranking = ranking.loc[ranking["npoints"] >= min_points].copy()
+        if ranking.empty:
+            raise RuntimeError("No layers remain after applying min_points filter.")
+
+        total_points = int(frame.shape[0])
+        ranking.loc[:, "completeness_fraction"] = ranking["npoints"] / total_points
+
+        if resolved_feature_columns:
+            variance_table = (
+                frame.groupby("layer", sort=True)[resolved_feature_columns]
+                .var(ddof=0)
+                .fillna(0.0)
+                .reset_index()
+            )
+            rename_map = {column: f"{column}_variance" for column in resolved_feature_columns}
+            variance_table = variance_table.rename(columns=rename_map)
+            ranking = ranking.merge(variance_table, on="layer", how="left")
+            variance_columns = list(rename_map.values())
+            ranking.loc[:, variance_columns] = ranking[variance_columns].fillna(0.0)
+            ranking.loc[:, "feature_variance_mean"] = ranking[variance_columns].mean(axis=1)
+            ranking.loc[:, "feature_variance_sum"] = ranking[variance_columns].sum(axis=1)
+        else:
+            ranking.loc[:, "feature_variance_mean"] = 0.0
+            ranking.loc[:, "feature_variance_sum"] = 0.0
+
+        ranking.loc[:, "completeness_score"] = self._normalize_ranking_component(
+            ranking["npoints"].to_numpy(dtype=np.float64)
+        )
+        ranking.loc[:, "variance_score"] = self._normalize_ranking_component(
+            ranking["feature_variance_mean"].to_numpy(dtype=np.float64)
+        )
+        ranking.loc[:, "layer_score"] = completeness_weight * ranking[
+            "completeness_score"
+        ].to_numpy(dtype=np.float64) + variance_weight * ranking["variance_score"].to_numpy(
+            dtype=np.float64
+        )
+        ranking = ranking.sort_values(
+            ["layer_score", "npoints", "feature_variance_mean", "layer"],
+            ascending=[False, False, False, True],
+        ).reset_index(drop=True)
+        ranking.loc[:, "layer_rank"] = np.arange(len(ranking), dtype=np.int64)
+
+        self.layer_ranking = ranking.copy()
+        return ranking
+
     def select_archetypes(
         self,
         n_archetypes: int,
@@ -1089,6 +1211,7 @@ class Maps:
         graph: GraphResult | None = None,
         probability_column: str = "probability",
         region: int | None = None,
+        layer: int | Sequence[int] | None = None,
         min_probability: float | None = None,
         min_probability_quantile: float | None = 0.75,
         scale_features: bool = True,
@@ -1127,11 +1250,21 @@ class Maps:
             ].to_numpy()
 
         candidate_mask: npt.NDArray[np.bool_] | None = None
-        if region is not None:
+        if region is not None or layer is not None:
             if self.contactspace is None:
-                raise RuntimeError("Trying to filter archetypes by region without contact space")
-            region_values = self.contactspace.data["region"].to_numpy(dtype=np.int64)
-            candidate_mask = region_values == region
+                raise RuntimeError(
+                    "Trying to filter archetypes by region or layer without contact space"
+                )
+            candidate_mask = np.ones(len(point_table), dtype=bool)
+            if region is not None:
+                region_values = self.contactspace.data["region"].to_numpy(dtype=np.int64)
+                candidate_mask &= region_values == region
+            if layer is not None:
+                layer_values = self.contactspace.data["layer"].to_numpy(dtype=np.int64)
+                requested_layers = _coerce_layer_values(layer)
+                candidate_mask &= np.isin(layer_values, requested_layers)
+                if min_probability is None and min_probability_quantile == 0.75:
+                    min_probability_quantile = None
 
         selected_graph = graph if graph is not None else self.graph_result
         if selection_mode == "graph_endpoint" and selected_graph is None:
@@ -1621,13 +1754,26 @@ class Maps:
         for column in self.contactspace.feature_columns:
             self.data.loc[:, column] = self.contactspace.data[column].to_numpy()
 
+    def _sync_contactspace_metadata(self) -> None:
+        """Propagate canonical contact-space metadata columns into Maps data."""
+        if self.contactspace is None or self.data is None:
+            return
+
+        for column in self._METADATA_COLUMNS:
+            if column in self.contactspace.data.columns:
+                self.data.loc[:, column] = self.contactspace.data[column].to_numpy()
+
     def _refresh_features(self) -> None:
         """Update the list of feature columns exposed by the current dataset."""
         if self.data is None:
             self.features = []
             return
 
-        self.features = [column for column in self.data.columns if column not in {"x", "y", "z"}]
+        self.features = [
+            column
+            for column in self.data.columns
+            if column not in {"x", "y", "z", *self._METADATA_COLUMNS}
+        ]
 
     def _resolve_selection_feature_columns(
         self,
@@ -1652,6 +1798,16 @@ class Maps:
         if uncertainty_column is not None:
             excluded.add(uncertainty_column)
         return [column for column in self.features if column not in excluded]
+
+    @staticmethod
+    def _normalize_ranking_component(values: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:
+        if values.size == 0:
+            return values.astype(np.float64, copy=True)
+        vmin = float(np.min(values))
+        vmax = float(np.max(values))
+        if np.isclose(vmin, vmax):
+            return np.ones_like(values, dtype=np.float64)
+        return (values - vmin) / (vmax - vmin)
 
     def _energy_component(
         self,
@@ -1887,6 +2043,13 @@ def _namespace_contactspace(contactspace: dict[str, Any]) -> Any:
         cutoff=contactspace.get("cutoff", 300),
         threshold=contactspace.get("threshold", 0.1),
         side=contactspace.get("side", 1.0),
+        assign_layers=contactspace.get("assign_layers", False),
+        layer_switch_tolerance=contactspace.get("layer_switch_tolerance", 0.25),
+        layer_gradient_cosine_min=contactspace.get("layer_gradient_cosine_min", 0.9),
+        layer_orthogonality_tolerance=contactspace.get(
+            "layer_orthogonality_tolerance",
+            0.25,
+        ),
     )
 
 
