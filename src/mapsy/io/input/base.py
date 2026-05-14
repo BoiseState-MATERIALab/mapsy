@@ -29,8 +29,12 @@ class FileModel(BaseModel):
 
     fileformat: FileFormat = "xyz+"
     name: str = ""
+    names: list[str] = []
     folder: str = ""
+    folders: list[str] = []
     root: str = ""
+    pattern: str = ""
+    recursive: bool = False
     units: Units = "bohr"
 
 

@@ -1,3 +1,5 @@
+import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -21,6 +23,9 @@ def _resolve_path(pathname: str, basepath: str | Path | None = None) -> Path:
 
 
 def _file_pattern(filemodel: "FileModel") -> str:
+    pattern = getattr(filemodel, "pattern", "")
+    if pattern:
+        return str(pattern)
     suffixes = {
         "xyz+": ".xyz",
         "cube": ".cube",
@@ -30,22 +35,89 @@ def _file_pattern(filemodel: "FileModel") -> str:
     return f"{filemodel.root}*{suffix}" if suffix else f"{filemodel.root}*"
 
 
-def resolve_file_model(filemodel: "FileModel", basepath: str | Path | None = None) -> list[str]:
-    if filemodel.name:
-        return [str(_resolve_path(filemodel.name, basepath))]
+@dataclass(frozen=True)
+class ResolvedFileRecord:
+    path: str
+    source_file: str
+    source_file_name: str
+    source_file_stem: str
+    source_folder: str
+    source_folder_name: str
+    source_folder_number: int | float | None
 
-    folder = _resolve_path(filemodel.folder, basepath)
-    if not folder.exists():
-        raise OSError(f"Input folder does not exist: {folder}")
-    if not folder.is_dir():
-        raise OSError(f"Input folder is not a directory: {folder}")
+    def metadata(self) -> dict[str, str | int | float | None]:
+        return {
+            "source_file": self.source_file,
+            "source_file_name": self.source_file_name,
+            "source_file_stem": self.source_file_stem,
+            "source_folder": self.source_folder,
+            "source_folder_name": self.source_folder_name,
+            "source_folder_number": self.source_folder_number,
+        }
 
-    matches = sorted(path for path in folder.glob(_file_pattern(filemodel)) if path.is_file())
+
+def _folder_number(folder_name: str) -> int | float | None:
+    matches = re.findall(r"\d+(?:\.\d+)?", folder_name)
     if not matches:
-        raise OSError(
-            f"No files matched root {filemodel.root!r} in {folder} for format {filemodel.fileformat!r}"
-        )
-    return [str(path) for path in matches]
+        return None
+    value = matches[-1]
+    return float(value) if "." in value else int(value)
+
+
+def _record_for_path(path: Path) -> ResolvedFileRecord:
+    resolved = path.resolve()
+    folder = resolved.parent
+    return ResolvedFileRecord(
+        path=str(resolved),
+        source_file=str(resolved),
+        source_file_name=resolved.name,
+        source_file_stem=resolved.stem,
+        source_folder=str(folder),
+        source_folder_name=folder.name,
+        source_folder_number=_folder_number(folder.name),
+    )
+
+
+def resolve_file_records(
+    filemodel: "FileModel",
+    basepath: str | Path | None = None,
+) -> list[ResolvedFileRecord]:
+    if filemodel.name:
+        return [_record_for_path(_resolve_path(filemodel.name, basepath))]
+
+    names = list(getattr(filemodel, "names", []) or [])
+    if names:
+        return [_record_for_path(_resolve_path(name, basepath)) for name in names]
+
+    folders = list(getattr(filemodel, "folders", []) or [])
+    folder = getattr(filemodel, "folder", None)
+    if not folders and folder:
+        folders = [folder]
+    if not folders:
+        raise ValueError("File input requires name, names, folder, or folders.")
+
+    pattern = _file_pattern(filemodel)
+    recursive = bool(getattr(filemodel, "recursive", False))
+    records: list[ResolvedFileRecord] = []
+    for folder_name in folders:
+        folder = _resolve_path(folder_name, basepath)
+        if not folder.exists():
+            raise OSError(f"Input folder does not exist: {folder}")
+        if not folder.is_dir():
+            raise OSError(f"Input folder is not a directory: {folder}")
+
+        iterator = folder.rglob(pattern) if recursive else folder.glob(pattern)
+        matches = sorted(path for path in iterator if path.is_file())
+        if not matches:
+            raise OSError(
+                f"No files matched pattern {pattern!r} in {folder} for format {filemodel.fileformat!r}"
+            )
+        records.extend(_record_for_path(path) for path in matches)
+    return records
+
+
+def resolve_file_model(filemodel: "FileModel", basepath: str | Path | None = None) -> list[str]:
+    return [record.path for record in resolve_file_records(filemodel, basepath)]
 
 
 class DataParser:
@@ -111,6 +183,12 @@ class SystemParser:
 
     def filenames(self) -> list[str]:
         return resolve_file_model(self.filemodel, self.basepath)
+
+    def file_records(self) -> list[ResolvedFileRecord]:
+        return resolve_file_records(self.filemodel, self.basepath)
+
+    def parse_file(self, filename: str) -> System:
+        return self._parse_file(filename)
 
     def _parse_file(self, filename: str) -> System:
         file = self._build_file_parser(filename)

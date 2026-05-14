@@ -8,7 +8,9 @@ __all__ = [
     "DataParser",
     "SystemParser",
     "ContactSpaceGenerator",
+    "ResolvedFileRecord",
     "resolve_file_model",
+    "resolve_file_records",
 ]
 
 
@@ -33,20 +35,26 @@ def __getattr__(name: str) -> Any:
         "DataParser",
         "SystemParser",
         "ContactSpaceGenerator",
+        "ResolvedFileRecord",
         "resolve_file_model",
+        "resolve_file_records",
     }:
         from .parser import (
             ContactSpaceGenerator,
             DataParser,
+            ResolvedFileRecord,
             SystemParser,
             resolve_file_model,
+            resolve_file_records,
         )
 
         exports = {
             "DataParser": DataParser,
             "SystemParser": SystemParser,
             "ContactSpaceGenerator": ContactSpaceGenerator,
+            "ResolvedFileRecord": ResolvedFileRecord,
             "resolve_file_model": resolve_file_model,
+            "resolve_file_records": resolve_file_records,
         }
         return exports[name]
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

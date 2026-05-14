@@ -211,3 +211,41 @@ def test_maps_annotate_ionic_distance_updates_contactspace_and_maps_data() -> No
     assert maps.data is not None
     np.testing.assert_allclose(maps.data["ionic_distance"].to_numpy(), distances)
     assert maps.features == ["ionic_distance"]
+
+
+def test_maps_save_and_load_roundtrip_preserves_cached_data(tmp_path) -> None:
+    system = _build_system()
+    positions = np.array(
+        [
+            [1.0, 2.0, 3.0],
+            [4.0, 5.0, 6.0],
+        ]
+    )
+    contactspace = StubContactSpace(positions)
+    contactspace.data.loc[:, "region"] = np.array([0, 1], dtype=np.int64)
+    contactspace.data.loc[:, "layer"] = np.array([2, 3], dtype=np.int64)
+
+    maps = Maps(system, [], contactspace)
+    maps.data = pd.DataFrame(
+        {
+            "x": positions[:, 0],
+            "y": positions[:, 1],
+            "z": positions[:, 2],
+            "region": [0, 1],
+            "layer": [2, 3],
+            "f1": [0.1, 0.2],
+        }
+    )
+    maps.features = ["f1"]
+    maps.add_special_points([1], kind="adaptive", iteration=2, label_status="completed")
+
+    path = maps.save(tmp_path / "maps.pkl")
+    loaded = Maps.load(path)
+
+    assert loaded.data is not None
+    pd.testing.assert_frame_equal(loaded.data, maps.data)
+    assert loaded.features == ["f1"]
+    pd.testing.assert_frame_equal(
+        loaded.get_special_points(kind="adaptive").reset_index(drop=True),
+        maps.get_special_points(kind="adaptive").reset_index(drop=True),
+    )

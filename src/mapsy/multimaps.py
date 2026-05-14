@@ -1,4 +1,5 @@
-from collections.abc import Sequence
+import pickle
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -45,12 +46,22 @@ if TYPE_CHECKING:
 
 
 class MultiMaps:
-    _METADATA_COLUMNS = ("region", "layer")
+    _METADATA_COLUMNS = (
+        "region",
+        "layer",
+        "source_file",
+        "source_file_name",
+        "source_file_stem",
+        "source_folder",
+        "source_folder_name",
+        "source_folder_number",
+    )
 
     def __init__(
         self,
         maps: Sequence["Maps"],
         names: Sequence[str] | None = None,
+        metadata: Sequence[Mapping[str, Any]] | None = None,
     ) -> None:
         if not maps:
             raise ValueError("maps must contain at least one Maps instance")
@@ -63,6 +74,11 @@ class MultiMaps:
         )
         if len(self.names) != len(self.maps):
             raise ValueError("names and maps must have the same length")
+        self.map_metadata = (
+            [dict(item) for item in metadata] if metadata is not None else [{} for _ in self.maps]
+        )
+        if len(self.map_metadata) != len(self.maps):
+            raise ValueError("metadata and maps must have the same length")
 
         self.data: pd.DataFrame | None = None
         self.features: list[str] = []
@@ -89,6 +105,29 @@ class MultiMaps:
 
     def atcontactspace(self) -> pd.DataFrame:
         return self._build_dataset(recompute=True)
+
+    def save(
+        self,
+        filename: str | Path,
+        *,
+        protocol: int = pickle.HIGHEST_PROTOCOL,
+    ) -> Path:
+        path = Path(filename).expanduser().resolve()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("wb") as handle:
+            pickle.dump(self, handle, protocol=protocol)
+        return path
+
+    @classmethod
+    def load(cls, filename: str | Path) -> "MultiMaps":
+        path = Path(filename).expanduser().resolve()
+        with path.open("rb") as handle:
+            loaded = pickle.load(handle)
+        if not isinstance(loaded, cls):
+            raise TypeError(
+                f"Pickle at {path} contains {type(loaded).__name__}, expected {cls.__name__}."
+            )
+        return loaded
 
     def analyze_pca(self, scale: bool = False) -> PCAAnalysisResult:
         data = self._ensure_data()
@@ -480,6 +519,7 @@ class MultiMaps:
         start = 0
         for index, (name, maps) in enumerate(zip(self.names, self.maps, strict=False)):
             frame = self._get_map_frame(maps, recompute).copy()
+            self._attach_map_metadata(index, maps, frame)
             current_features = self._get_map_features(maps)
             if reference_features is None:
                 reference_features = current_features
@@ -487,7 +527,9 @@ class MultiMaps:
                 raise ValueError("All maps in MultiMaps must expose the same feature columns")
 
             metadata_columns = [
-                column for column in self._METADATA_COLUMNS if column in frame.columns
+                column
+                for column in self._METADATA_COLUMNS
+                if column in frame.columns and column not in reference_features
             ]
             ordered = frame.loc[:, ["x", "y", "z", *metadata_columns, *reference_features]].copy()
             ordered.insert(0, "point_index", np.arange(len(ordered), dtype=np.int64))
@@ -527,8 +569,26 @@ class MultiMaps:
         return [
             column
             for column in maps.data.columns
-            if column not in {"x", "y", "z", *self._METADATA_COLUMNS}
+            if column
+            not in {
+                "x",
+                "y",
+                "z",
+                *self._METADATA_COLUMNS,
+                *getattr(maps, "_METADATA_COLUMNS", set()),
+            }
         ]
+
+    def _attach_map_metadata(self, index: int, maps: "Maps", frame: pd.DataFrame) -> None:
+        metadata = self.map_metadata[index]
+        if not metadata:
+            return
+        for column, value in metadata.items():
+            frame.loc[:, column] = value
+            if maps.data is not None:
+                maps.data.loc[:, column] = value
+        if maps.data is not None and hasattr(maps, "_refresh_features"):
+            maps._refresh_features()
 
     def _propagate_columns(self, columns: list[str]) -> None:
         if self.data is None:
@@ -661,7 +721,8 @@ class MultiMapsFromFile(MultiMaps):
         basepath = Path(filename).expanduser().resolve().parent
         systemmodel = _namespace_system(system)
         system_parser = SystemParser(systemmodel, basepath=basepath)
-        system_files = system_parser.filenames()
+        file_records = system_parser.file_records()
+        system_files = [record.path for record in file_records]
 
         if len(system_files) > 1 and systemmodel.properties:
             raise NotImplementedError(
@@ -669,7 +730,8 @@ class MultiMapsFromFile(MultiMaps):
             )
 
         maps_list = []
-        for system in system_parser.parse_many():
+        for path in system_files:
+            system = system_parser.parse_file(path)
             parsed_symmetryfunctions = SymmetryFunctionsParser(
                 _namespace_symmetryfunctions(symmetryfunctions)
             ).parse()
@@ -678,6 +740,10 @@ class MultiMapsFromFile(MultiMaps):
             ).generate(system)
             maps_list.append(Maps(system, parsed_symmetryfunctions, parsed_contactspace))
 
-        super().__init__(maps_list, names=[Path(path).stem for path in system_files])
+        super().__init__(
+            maps_list,
+            names=[Path(path).stem for path in system_files],
+            metadata=[record.metadata() for record in file_records],
+        )
         self.debug = bool(control.get("debug", False))
         self.verbosity = int(control.get("verbosity", 0))

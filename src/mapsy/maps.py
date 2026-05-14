@@ -1,6 +1,8 @@
 import logging
+import pickle
 from collections.abc import Callable, Sequence
 from copy import deepcopy
+from pathlib import Path
 from typing import Any, TypeAlias
 
 import matplotlib.pyplot as plt
@@ -265,7 +267,16 @@ class SpecialPointRegistry:
 
 # Class for Maps, which includes functionality for processing symmetry functions
 class Maps:
-    _METADATA_COLUMNS = {"region", "layer"}
+    _METADATA_COLUMNS = {
+        "region",
+        "layer",
+        "source_file",
+        "source_file_name",
+        "source_file_stem",
+        "source_folder",
+        "source_folder_name",
+        "source_folder_number",
+    }
     bedug: bool = False
     verbosity: int = 0  # Verbosity level (how much logging to show)
 
@@ -554,6 +565,29 @@ class Maps:
     def tofile(self) -> None:
         """TODO"""
         return None
+
+    def save(
+        self,
+        filename: str | Path,
+        *,
+        protocol: int = pickle.HIGHEST_PROTOCOL,
+    ) -> Path:
+        path = Path(filename).expanduser().resolve()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("wb") as handle:
+            pickle.dump(self, handle, protocol=protocol)
+        return path
+
+    @classmethod
+    def load(cls, filename: str | Path) -> "Maps":
+        path = Path(filename).expanduser().resolve()
+        with path.open("rb") as handle:
+            loaded = pickle.load(handle)
+        if not isinstance(loaded, cls):
+            raise TypeError(
+                f"Pickle at {path} contains {type(loaded).__name__}, expected {cls.__name__}."
+            )
+        return loaded
 
     def plot(
         self,
@@ -2003,8 +2037,12 @@ def _namespace_system(system: dict[str, Any]) -> Any:
         file=SimpleNamespace(
             fileformat=file.get("fileformat", "xyz+"),
             name=file.get("name", ""),
+            names=file.get("names", []),
             folder=file.get("folder", ""),
+            folders=file.get("folders", []),
             root=file.get("root", ""),
+            pattern=file.get("pattern", ""),
+            recursive=file.get("recursive", False),
             units=file.get("units", "bohr"),
         ),
         dimension=system.get("dimension", 2),
@@ -2017,8 +2055,12 @@ def _namespace_system(system: dict[str, Any]) -> Any:
                     SimpleNamespace(
                         fileformat=(prop.get("file") or {}).get("fileformat", "cube"),
                         name=(prop.get("file") or {}).get("name", ""),
+                        names=(prop.get("file") or {}).get("names", []),
                         folder=(prop.get("file") or {}).get("folder", ""),
+                        folders=(prop.get("file") or {}).get("folders", []),
                         root=(prop.get("file") or {}).get("root", ""),
+                        pattern=(prop.get("file") or {}).get("pattern", ""),
+                        recursive=(prop.get("file") or {}).get("recursive", False),
                         units=(prop.get("file") or {}).get("units", "bohr"),
                     )
                     if prop.get("file") is not None
@@ -2056,6 +2098,18 @@ def _namespace_contactspace(contactspace: dict[str, Any]) -> Any:
 def _namespace_symmetryfunctions(symmetryfunctions: dict[str, Any]) -> Any:
     from types import SimpleNamespace
 
+    def normalize_order(value: Any) -> list[int]:
+        if isinstance(value, int):
+            return list(range(value))
+        if isinstance(value, np.integer):
+            return list(range(int(value)))
+        if isinstance(value, (list, tuple)):
+            return [int(item) for item in value]
+        array = np.asarray(value, dtype=np.int64)
+        if array.ndim == 0:
+            return list(range(int(array)))
+        return [int(item) for item in array.reshape(-1)]
+
     functions = []
     for function in symmetryfunctions.get("functions") or []:
         functions.append(
@@ -2063,7 +2117,7 @@ def _namespace_symmetryfunctions(symmetryfunctions: dict[str, Any]) -> Any:
                 type=function.get("type", "bp"),
                 cutoff=function.get("cutoff", "cos"),
                 radius=function.get("radius", 5.0),
-                order=function.get("order", 1),
+                order=normalize_order(function.get("order", 1)),
                 etas=function.get("etas", [1.0]),
                 rss=function.get("rss", [0.0]),
                 lambdas=function.get("lambdas", [-1.0, 1.0]),

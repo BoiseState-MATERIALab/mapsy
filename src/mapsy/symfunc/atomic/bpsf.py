@@ -20,12 +20,21 @@ class BPSFParser:
         self.cutoff = symfuncmodel.cutoff
         self.radius = symfuncmodel.radius
 
-        self.order = np.array(symfuncmodel.order, dtype=np.int64)
+        self.order = self._coerce_order(symfuncmodel.order)
         self.etas = np.array(symfuncmodel.etas)
         self.rss = np.array(symfuncmodel.rss)
         self.zetas = np.array(symfuncmodel.zetas)
         self.lambdas = np.array(symfuncmodel.lambdas)
         self.kappas = np.array(symfuncmodel.kappas)
+
+    @staticmethod
+    def _coerce_order(order: object) -> npt.NDArray[np.int64]:
+        if isinstance(order, (int, np.integer)):
+            return np.arange(int(order), dtype=np.int64)
+        array = np.asarray(order, dtype=np.int64)
+        if array.ndim == 0:
+            return np.arange(int(array), dtype=np.int64)
+        return array.reshape(-1)
 
     def parse(self) -> list[SymmetryFunction]:
         symmetryfunctions: list[SymmetryFunction] = []

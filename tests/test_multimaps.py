@@ -17,7 +17,7 @@ from mapsy import (
     plot_cluster_screening,
     plot_pca_scree,
 )
-from mapsy.io.parser import resolve_file_model
+from mapsy.io.parser import resolve_file_model, resolve_file_records
 
 
 class FakeMaps:
@@ -46,6 +46,20 @@ def _write_xyz(path: Path, x: float) -> None:
             [
                 "1",
                 "5.0 5.0 5.0",
+                f"H {x:.1f} 1.0 1.0",
+            ]
+        )
+        + "\n"
+    )
+
+
+def _write_extxyz(path: Path, x: float) -> None:
+    path.write_text(
+        "\n".join(
+            [
+                "1",
+                'Lattice="5.0 0.0 0.0 0.0 5.0 0.0 0.0 0.0 5.0" '
+                'Origin="0.0 0.0 0.0" Properties=species:S:1:pos:R:3',
                 f"H {x:.1f} 1.0 1.0",
             ]
         )
@@ -92,6 +106,46 @@ def test_multimaps_combines_contact_space_data() -> None:
     assert combined["point_index"].tolist() == [0, 1, 0, 1]
     assert combined["region"].tolist() == [0, 0, 1, 1]
     assert combined["layer"].tolist() == [1, 1, 0, 1]
+
+
+def test_multimaps_save_and_load_roundtrip_preserves_cached_data(tmp_path: Path) -> None:
+    map_a = FakeMaps(
+        pd.DataFrame(
+            {
+                "x": [0.0, 1.0],
+                "y": [0.0, 1.0],
+                "z": [0.0, 0.0],
+                "region": [0, 0],
+                "layer": [1, 1],
+                "f1": [0.1, 0.2],
+            }
+        )
+    )
+    map_b = FakeMaps(
+        pd.DataFrame(
+            {
+                "x": [2.0, 3.0],
+                "y": [2.0, 3.0],
+                "z": [0.0, 0.0],
+                "region": [1, 1],
+                "layer": [0, 1],
+                "f1": [0.3, 0.4],
+            }
+        )
+    )
+
+    multimaps = MultiMaps([map_a, map_b], names=["a", "b"])
+    combined = multimaps.atcontactspace().copy()
+
+    path = multimaps.save(tmp_path / "multimaps.pkl")
+    loaded = MultiMaps.load(path)
+
+    assert loaded.data is not None
+    pd.testing.assert_frame_equal(loaded.data, combined)
+    assert loaded.features == ["f1"]
+    assert loaded.names == ["a", "b"]
+    assert loaded.maps[0].data is not None
+    assert loaded.maps[1].data is not None
 
 
 def test_multimaps_requires_shared_features() -> None:
@@ -295,6 +349,37 @@ def test_resolve_file_model_supports_folder_and_root(tmp_path: Path) -> None:
     ]
 
 
+def test_resolve_file_model_supports_multiple_folders_and_source_metadata(
+    tmp_path: Path,
+) -> None:
+    folder_a = tmp_path / "cop-10"
+    folder_b = tmp_path / "cop-15"
+    folder_a.mkdir()
+    folder_b.mkdir()
+    _write_extxyz(folder_a / "sample_a.extxyz", 1.0)
+    _write_extxyz(folder_b / "sample_b.extxyz", 2.0)
+
+    filemodel = SimpleNamespace(
+        fileformat="xyz+",
+        name="",
+        names=[],
+        folder="",
+        folders=["cop-10", "cop-15"],
+        root="",
+        pattern="*.extxyz",
+        recursive=False,
+        units="angstrom",
+    )
+    records = resolve_file_records(filemodel, basepath=tmp_path)
+
+    assert resolve_file_model(filemodel, basepath=tmp_path) == [
+        str((folder_a / "sample_a.extxyz").resolve()),
+        str((folder_b / "sample_b.extxyz").resolve()),
+    ]
+    assert [record.source_folder_name for record in records] == ["cop-10", "cop-15"]
+    assert [record.source_folder_number for record in records] == [10, 15]
+
+
 def test_multimaps_from_file_loads_multiple_systems(tmp_path: Path) -> None:
     systems_dir = tmp_path / "systems"
     systems_dir.mkdir()
@@ -331,7 +416,7 @@ def test_multimaps_from_file_loads_multiple_systems(tmp_path: Path) -> None:
                 - type: ac
                   cutoff: cos
                   radius: 2.0
-                  order: [0]
+                  order: 1
                   compositional: false
                   structural: true
                   radial: true
@@ -349,3 +434,65 @@ def test_multimaps_from_file_loads_multiple_systems(tmp_path: Path) -> None:
 
     assert not combined.empty
     assert combined["system"].isin(["sample_a", "sample_b"]).all()
+
+
+def test_multimaps_from_file_preserves_source_folder_metadata(tmp_path: Path) -> None:
+    folder_a = tmp_path / "cop-10"
+    folder_b = tmp_path / "cop-15"
+    folder_a.mkdir()
+    folder_b.mkdir()
+    _write_extxyz(folder_a / "sample_a.extxyz", 1.0)
+    _write_extxyz(folder_b / "sample_b.extxyz", 2.0)
+
+    input_file = tmp_path / "multimaps.yaml"
+    input_file.write_text(
+        dedent(
+            """
+            control:
+              debug: false
+              verbosity: 0
+
+            system:
+              systemtype: ions
+              file:
+                fileformat: xyz+
+                folders:
+                  - cop-10
+                  - cop-15
+                pattern: "*.extxyz"
+                units: angstrom
+              dimension: 2
+              axis: 2
+
+            contactspace:
+              mode: system
+              distance: 0.5
+              spread: 0.5
+              cutoff: 2
+              threshold: 0.1
+
+            symmetryfunctions:
+              functions:
+                - type: ac
+                  cutoff: cos
+                  radius: 2.0
+                  order: [0]
+                  compositional: false
+                  structural: true
+                  radial: true
+            """
+        ).strip()
+        + "\n"
+    )
+
+    multimaps = MultiMapsFromFile(str(input_file))
+    combined = multimaps.atcontactspace()
+
+    assert len(multimaps.features) == 1
+    assert "source_folder_number" not in multimaps.features
+    assert combined.groupby("system")["source_folder_number"].first().to_dict() == {
+        "sample_a": 10,
+        "sample_b": 15,
+    }
+    assert set(combined["source_folder_name"]) == {"cop-10", "cop-15"}
+    assert all("source_folder_number" in maps.data.columns for maps in multimaps.maps)

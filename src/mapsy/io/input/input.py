@@ -97,16 +97,30 @@ class Input(BaseModel):
             return
 
         has_name = bool(file.name)
+        has_names = bool(file.names)
         has_folder = bool(file.folder)
+        has_folders = bool(file.folders)
         has_root = bool(file.root)
+        has_pattern = bool(file.pattern)
+        has_folder_input = has_folder or has_folders
 
-        if has_name and (has_folder or has_root):
+        if has_name and has_names:
+            raise ValueError(f"{context} file input must use either 'name' or 'names', not both.")
+        if (has_name or has_names) and (has_folder_input or has_root or has_pattern):
             raise ValueError(
-                f"{context} file input must use either 'name' or 'folder'/'root', not both."
+                f"{context} file input must use explicit file names or folder discovery, not both."
             )
-        if has_folder != has_root:
-            raise ValueError(f"{context} file input requires both 'folder' and 'root'.")
-        if not has_name and not (has_folder and has_root):
+        if has_folder and has_folders:
             raise ValueError(
-                f"{context} file input requires either 'name' or both 'folder' and 'root'."
+                f"{context} file input must use either 'folder' or 'folders', not both."
+            )
+        if has_root and has_pattern:
+            raise ValueError(f"{context} file input must use either 'root' or 'pattern', not both.")
+        if has_folder_input and not (has_root or has_pattern):
+            raise ValueError(f"{context} file input requires 'root' or 'pattern'.")
+        if (has_root or has_pattern) and not has_folder_input:
+            raise ValueError(f"{context} file input requires 'folder' or 'folders'.")
+        if not (has_name or has_names or has_folder_input):
+            raise ValueError(
+                f"{context} file input requires 'name', 'names', 'folder', or 'folders'."
             )
