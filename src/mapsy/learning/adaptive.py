@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import pandas as pd
 
+from .datasets import SupervisedDataset
 from .models import ModelSuite
 
 
@@ -16,15 +17,39 @@ class ModelTrainingSpec:
     model: Any
     builder: Any
     role: str | None = None
+    last_dataset: SupervisedDataset | None = field(default=None, init=False)
 
     @property
     def name(self) -> str:
         return str(self.model.name)
 
+    def build_dataset(self, frame: pd.DataFrame) -> SupervisedDataset:
+        self.last_dataset = self.builder.build(frame, dataset_name=self.name)
+        return self.last_dataset
+
     def fit(self, frame: pd.DataFrame) -> Any:
-        dataset = self.builder.build(frame, dataset_name=self.name)
+        dataset = self.build_dataset(frame)
         self.model.fit_dataset(dataset)
         return self.model
+
+    def validate_loo(self, frame: pd.DataFrame | None = None) -> dict[str, Any]:
+        dataset = self.build_dataset(frame) if frame is not None else self.last_dataset
+        if dataset is None:
+            raise RuntimeError("No dataset has been built. Pass a frame or call fit first.")
+        if hasattr(self.model, "validate_loo_dataset"):
+            return cast(dict[str, Any], self.model.validate_loo_dataset(dataset))
+        if hasattr(self.model, "validate_loo_frame"):
+            return cast(
+                dict[str, Any],
+                self.model.validate_loo_frame(
+                    dataset.frame,
+                    feature_columns=dataset.feature_columns,
+                    target_column=dataset.target_column,
+                ),
+            )
+        if hasattr(self.model, "validate_loo"):
+            return cast(dict[str, Any], self.model.validate_loo(dataset.X(), dataset.y()))
+        raise AttributeError("Model does not provide validate_loo_frame or validate_loo.")
 
 
 @dataclass

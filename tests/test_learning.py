@@ -96,6 +96,64 @@ def test_robust_gaussian_process_surrogate_matches_notebook_style_fit() -> None:
     assert validation["predictions"].shape == y.shape
     assert np.isfinite(validation["r2"])
 
+    dataset = PointPropertyDatasetBuilder(
+        feature_columns=["pc1", "distance"],
+        target_column="energy",
+    ).build(
+        pd.DataFrame(
+            {
+                "pc1": X[:, 0],
+                "distance": X[:, 1],
+                "energy": y,
+            }
+        )
+    )
+    dataset_validation = model.validate_loo_dataset(dataset)
+    assert dataset_validation["predictions"].shape == y.shape
+
+
+def test_model_training_spec_validates_builder_dataset() -> None:
+    frame = pd.DataFrame(
+        {
+            "point_index": [0, 1, 2],
+            "pca0": [0.0, 0.5, 1.0],
+            "pca1": [0.2, 0.1, 0.4],
+            "E_bfgs_steps_Ry": [
+                np.array([-1.00, -1.10]),
+                np.array([-1.30, -1.35]),
+                np.array([-1.55, -1.70]),
+            ],
+            "z_H_bfgs_steps_A": [
+                np.array([1.6, 1.4]),
+                np.array([1.7, 1.5]),
+                np.array([1.8, 1.6]),
+            ],
+        }
+    )
+    model = RobustGaussianProcessSurrogate(
+        name="pes",
+        role="pes",
+        feature_names=["pca0", "pca1", "distance"],
+        target_name="E_bfgs_steps_Ry",
+        n_random_starts=1,
+        n_cv_splits=2,
+        seed=0,
+    )
+    spec = ModelTrainingSpec(
+        model=model,
+        builder=RelaxStepDatasetBuilder(adsorbate_label="H", coordinate_feature="distance"),
+        role="pes",
+    )
+
+    spec.fit(frame)
+    validation = spec.validate_loo()
+
+    assert spec.last_dataset is not None
+    assert len(spec.last_dataset.frame) == 6
+    assert spec.last_dataset.feature_columns == ["pca0", "pca1", "distance"]
+    assert validation["predictions"].shape == (6,)
+    assert np.isfinite(validation["rmse"])
+
 
 class _LinearModel:
     def __init__(

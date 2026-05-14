@@ -150,6 +150,9 @@ class RobustGaussianProcessSurrogate:
         self.target_name = dataset.target_column
         return self.fit(dataset.X(), dataset.y())
 
+    def validate_loo_dataset(self, dataset: SupervisedDataset) -> dict[str, Any]:
+        return self.validate_loo(dataset.X(), dataset.y())
+
     def fit_frame(
         self,
         frame: pd.DataFrame,
@@ -218,6 +221,20 @@ class RobustGaussianProcessSurrogate:
             "predictions": predictions,
             "residuals": residuals,
         }
+
+    def validate_loo_frame(
+        self,
+        frame: pd.DataFrame,
+        *,
+        feature_columns: list[str] | None = None,
+        target_column: str | None = None,
+    ) -> dict[str, Any]:
+        features = list(feature_columns) if feature_columns is not None else self.feature_names
+        target = target_column or self.target_name
+        return self.validate_loo(
+            frame.loc[:, features].to_numpy(dtype=float),
+            frame.loc[:, target].to_numpy(dtype=float),
+        )
 
     def fitted_kernel(self) -> Any:
         if self.best_record_ is None:

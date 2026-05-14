@@ -164,6 +164,10 @@ class CalculationWorkflow:
             metadata = self._coerce_runner_result(result)
             for key, value in self._workflow_metadata().items():
                 metadata.setdefault(key, value)
+            output_file = metadata.get(self.file_column)
+            if output_file is not None and not pd.isna(output_file):
+                metadata.setdefault("label_status", "unlabeled")
+                metadata.setdefault("label_error", None)
             maps.update_special_points(
                 kind=row["kind"] if kind is None else kind,
                 point_indexes=[int(row["point_index"])],
