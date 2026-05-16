@@ -69,17 +69,20 @@ def test_qe_relax_parser_extracts_common_metrics(tmp_path) -> None:
     assert np.isclose(parsed["x_H_input_A"], 0.0)
     assert np.isclose(parsed["y_H_input_A"], 0.0)
     assert np.isclose(parsed["z_H_input_A"], 0.40 * 10.0 * 0.529177210903)
-    assert np.isclose(parsed["x_H_final_A"], 0.3)
-    assert np.isclose(parsed["y_H_final_A"], 0.4)
-    assert np.isclose(parsed["z_H_final_A"], 2.20)
+    assert np.isclose(parsed["x_H_final_A"], 0.1)
+    assert np.isclose(parsed["y_H_final_A"], 0.2)
+    assert np.isclose(parsed["z_H_final_A"], 2.00)
     np.testing.assert_allclose(parsed["E_bfgs_steps_Ry"], np.array([-123.4, -124.0]))
     np.testing.assert_allclose(
         parsed["H_positions_bfgs_A"],
-        np.array([[0.1, 0.2, 2.0], [0.3, 0.4, 2.2]]),
+        np.array([[0.0, 0.0, 0.40 * 10.0 * 0.529177210903], [0.1, 0.2, 2.0]]),
     )
-    np.testing.assert_allclose(parsed["x_H_bfgs_steps_A"], np.array([0.1, 0.3]))
-    np.testing.assert_allclose(parsed["y_H_bfgs_steps_A"], np.array([0.2, 0.4]))
-    np.testing.assert_allclose(parsed["z_H_bfgs_steps_A"], np.array([2.0, 2.2]))
+    np.testing.assert_allclose(parsed["x_H_bfgs_steps_A"], np.array([0.0, 0.1]))
+    np.testing.assert_allclose(parsed["y_H_bfgs_steps_A"], np.array([0.0, 0.2]))
+    np.testing.assert_allclose(
+        parsed["z_H_bfgs_steps_A"],
+        np.array([0.40 * 10.0 * 0.529177210903, 2.0]),
+    )
     assert parsed["n_ionic_steps"] == 2
     assert parsed["relax_converged"] is True
 
@@ -164,9 +167,32 @@ def test_qe_energy_parser_extracts_final_converged_energy(tmp_path) -> None:
     parsed = QuantumEspressoEnergyParser().parse(jobdir)
 
     assert parsed["label_file"] == str(jobdir)
+    assert np.isclose(parsed["E_converged_final_Ry"], -10.6)
+    assert parsed["energy_converged"] is True
+    assert parsed["n_scf_iterations"] == 1
+
+
+def test_qe_energy_parser_supports_custom_output_columns(tmp_path) -> None:
+    jobdir = tmp_path / "reference_h2"
+    jobdir.mkdir()
+    (jobdir / "espresso.pwo").write_text(
+        "\n".join(
+            [
+                "     iteration #  1",
+                "     total energy              =   -10.0000 Ry",
+                "!    total energy              =   -10.6000 Ry",
+            ]
+        )
+        + "\n"
+    )
+
+    parsed = QuantumEspressoEnergyParser(
+        energy_column="reference_energy_Ry",
+        converged_column="reference_converged",
+    ).parse(jobdir)
+
     assert np.isclose(parsed["reference_energy_Ry"], -10.6)
     assert parsed["reference_converged"] is True
-    assert parsed["n_scf_iterations"] == 1
 
 
 def test_qe_energy_parser_marks_missing_converged_energy_as_failed(tmp_path) -> None:
@@ -176,7 +202,7 @@ def test_qe_energy_parser_marks_missing_converged_energy_as_failed(tmp_path) -> 
 
     parsed = QuantumEspressoEnergyParser().parse(jobdir)
 
-    assert parsed["reference_converged"] is False
+    assert parsed["energy_converged"] is False
     assert parsed["label_status"] == "failed"
     assert "could not find a converged" in parsed["label_error"]
 
@@ -332,13 +358,13 @@ def test_qe_relax_parser_extracts_force_and_geometry_metrics(tmp_path) -> None:
     assert np.isclose(parsed["fx_H_final_Ry_au"], 0.003)
     assert np.isclose(parsed["fy_H_final_Ry_au"], -0.004)
     assert np.isclose(parsed["fz_H_final_Ry_au"], 0.006)
-    assert np.isclose(parsed["x_H_final_A"], 0.3)
-    assert np.isclose(parsed["y_H_final_A"], 0.4)
-    assert np.isclose(parsed["z_H_final_A"], 2.2)
+    assert np.isclose(parsed["x_H_final_A"], 0.1)
+    assert np.isclose(parsed["y_H_final_A"], 0.2)
+    assert np.isclose(parsed["z_H_final_A"], 2.0)
     np.testing.assert_allclose(parsed["E_bfgs_steps_Ry"], np.array([-123.4, -124.0]))
     np.testing.assert_allclose(
         parsed["H_positions_bfgs_A"],
-        np.array([[0.1, 0.2, 2.0], [0.3, 0.4, 2.2]]),
+        np.array([[0.1, 0.2, 2.0], [0.1, 0.2, 2.0]]),
     )
     assert parsed["n_ionic_steps"] == 2
     assert parsed["relax_converged"] is True
@@ -437,9 +463,9 @@ def test_qe_multi_relax_parser_prefers_latest_converged_attempt(tmp_path) -> Non
     assert parsed["attempt_000_relax_converged"] is False
     assert parsed["attempt_001_relax_converged"] is True
     assert np.isclose(parsed["E_bfgs_final_Ry"], -124.0)
-    assert np.isclose(parsed["x_H_final_A"], 0.3)
-    assert np.isclose(parsed["y_H_final_A"], 0.4)
-    assert np.isclose(parsed["z_H_final_A"], 2.2)
+    assert np.isclose(parsed["x_H_final_A"], 0.2)
+    assert np.isclose(parsed["y_H_final_A"], 0.3)
+    assert np.isclose(parsed["z_H_final_A"], 2.1)
     assert "label_status" not in parsed
 
 

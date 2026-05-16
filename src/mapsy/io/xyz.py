@@ -1,5 +1,6 @@
 # Read XYZ+ files (+: cell information in the second line)
 import logging
+import re
 
 import numpy as np
 import numpy.typing as npt
@@ -45,7 +46,31 @@ class XYZParser(BaseParser):
                 logger.info("Reading cell origin information from first line")
                 origin = np.array(list(map(float, self.contents[0].split()[1:])), dtype=np.float64)
             a: float = 1.0
-            if len(self.contents[1].split()) == 1:
+            header = self.contents[1]
+            lattice_match = re.search(r'Lattice="([^"]+)"', header)
+            if lattice_match:
+                logger.info("Reading extended XYZ lattice information")
+                values = np.fromstring(lattice_match.group(1), sep=" ", dtype=np.float64)
+                if values.size != 9:
+                    raise ValueError("Extended XYZ Lattice field must contain 9 values.")
+                cell = values.reshape(3, 3)
+                origin_match = re.search(r'Origin="([^"]+)"', header)
+                if origin_match:
+                    origin_values = np.fromstring(origin_match.group(1), sep=" ", dtype=np.float64)
+                    if origin_values.size != 3:
+                        raise ValueError("Extended XYZ Origin field must contain 3 values.")
+                    origin = origin_values
+                if self.units == "bohr":
+                    cell *= Bohr
+                    if origin is not None:
+                        origin = origin * Bohr
+                elif self.units == "alat":
+                    a = cell[0, 0]
+                    cell *= a
+                    cell[0, 0] = a
+                    if origin is not None:
+                        origin = origin * a
+            elif len(self.contents[1].split()) == 1:
                 logger.info("Assuming a cubic cell of size alat")
                 a = float(self.contents[1].split()[0])
                 cell = np.eye(3) * a
@@ -67,6 +92,8 @@ class XYZParser(BaseParser):
                     a = cell[0, 0]
                     cell *= a
                     cell[0, 0] = a
+            else:
+                raise ValueError("Second XYZ line must contain cell lengths or a Lattice field.")
 
         except Exception as e:
             logger.exception(f"Error parsing xyz+ header for {self.fname}")

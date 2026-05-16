@@ -43,12 +43,21 @@ def basis_function(order: int, rcut: float, x: npt.ArrayLike) -> npt.NDArray[np.
 
 class ACSFParser:
     def __init__(self, symfuncmodel: "SymFuncModel") -> None:
-        self.order = np.array(symfuncmodel.order, dtype=np.int64)
+        self.order = self._coerce_order(symfuncmodel.order)
         self.cutoff = symfuncmodel.cutoff
         self.radius = symfuncmodel.radius
         self.radial = symfuncmodel.radial
         self.compositional = symfuncmodel.compositional
         self.structural = symfuncmodel.structural
+
+    @staticmethod
+    def _coerce_order(order: object) -> npt.NDArray[np.int64]:
+        if isinstance(order, (int, np.integer)):
+            return np.arange(int(order), dtype=np.int64)
+        array = np.asarray(order, dtype=np.int64)
+        if array.ndim == 0:
+            return np.arange(int(array), dtype=np.int64)
+        return array.reshape(-1)
 
     def parse(self) -> list[SymmetryFunction]:
         symmetryfunctions: list[SymmetryFunction] = []
@@ -137,10 +146,11 @@ class ACSymmetryFunction(SymmetryFunction):
     @order.setter
     def order(self, order: npt.NDArray[np.int64]) -> None:
         """docstring"""
-        for i in order:
+        order_array = np.asarray(order, dtype=np.int64).reshape(-1)
+        for i in order_array:
             if not 0 <= i < 1000:
                 raise ValueError("order out of range")
-        self.__order = order
+        self.__order = order_array
 
     def _generate_keys(self) -> list[str]:
         """docstring"""

@@ -1,8 +1,11 @@
 import logging
+import pickle
 from collections.abc import Callable, Sequence
 from copy import deepcopy
+from pathlib import Path
 from typing import Any, TypeAlias
 
+import dill
 import matplotlib.pyplot as plt
 import numpy as np
 import numpy.typing as npt
@@ -13,10 +16,14 @@ from matplotlib.axes import Axes
 from matplotlib.figure import Figure
 from matplotlib.gridspec import GridSpec
 from matplotlib.ticker import MultipleLocator
+from pathos.multiprocessing import ProcessingPool
 from sklearn.preprocessing import StandardScaler
 from yaml import SafeLoader, load
 
 from mapsy.analysis import (
+    ArchetypePropagationMode,
+    ArchetypeSelectionMode,
+    FeatureConnectivityMode,
     GraphMode,
     aggregate_cluster_graph,
     build_point_graph,
@@ -59,8 +66,28 @@ NDArrayI: TypeAlias = npt.NDArray[np.int64]
 def _run_multiproc_lists(
     func: Callable[[NDArrayF], list[NDArrayF]],
     args: Sequence[NDArrayF],
+    workers: int | None = None,
 ) -> list[list[NDArrayF]]:
+    if len(args) == 0:
+        return []
+    if workers is not None and workers <= 1:
+        return [func(arg) for arg in args]
+    if workers is not None:
+        with ProcessingPool(nodes=max(1, int(workers))) as pool:
+            return list(pool.map(func, list(args)))
     return multiproc(func, list(args))
+
+
+def _chunk_positions(
+    positions: npt.NDArray,
+    workers: int | None,
+) -> list[NDArrayF]:
+    if workers is None:
+        return [np.asarray(a, dtype=np.float64) for a in full2chunk(positions)]
+    n_chunks = min(max(1, int(workers)), len(positions))
+    if n_chunks <= 1:
+        return [np.asarray(positions, dtype=np.float64)]
+    return [np.asarray(a, dtype=np.float64) for a in np.array_split(positions, n_chunks, axis=0)]
 
 
 class SpecialPointRegistry:
@@ -256,6 +283,17 @@ class SpecialPointRegistry:
 
 # Class for Maps, which includes functionality for processing symmetry functions
 class Maps:
+    _METADATA_COLUMNS = {
+        "region",
+        "core_distance",
+        "is_core",
+        "source_file",
+        "source_file_name",
+        "source_file_stem",
+        "source_folder",
+        "source_folder_name",
+        "source_folder_number",
+    }
     bedug: bool = False
     verbosity: int = 0  # Verbosity level (how much logging to show)
 
@@ -326,20 +364,42 @@ class Maps:
     def len(self) -> int:
         return len(self.symmetryfunctions)
 
-    def atcontactspace(self) -> pd.DataFrame:
+    def atcontactspace(
+        self,
+        *,
+        workers: int | None = None,
+        release_contactspace_cache: bool = False,
+    ) -> pd.DataFrame:
         """
         Compute symmetry functions for points in the contact space
         """
         # Calculation symmetry functions on contact points
         if self.contactspace is None:
             raise RuntimeError("Trying to use maps.compute() without contact space")
+        contactspace = self.contactspace
         positions: npt.NDArray = self.contactspace.data[["x", "y", "z"]].values
+        if release_contactspace_cache:
+            self.release_contactspace_cache()
 
-        self.data = self.atpoints(positions)
+        if release_contactspace_cache:
+            self.contactspace = None
+        try:
+            self.data = self.atpoints(positions, workers=workers)
+        finally:
+            self.contactspace = contactspace
+        self._sync_contactspace_metadata()
         self._sync_contactspace_features()
         self._refresh_features()
 
         return self.data
+
+    def release_contactspace_cache(self) -> None:
+        """Release dense contact-space fields not needed for tabular feature analysis."""
+        if self.contactspace is None:
+            return
+        release = getattr(self.contactspace, "release_dense_fields", None)
+        if release is not None:
+            release()
 
     def annotate_contactspace(
         self,
@@ -515,15 +575,19 @@ class Maps:
             **metadata,
         )
 
-    def atpoints(self, positions: npt.NDArray) -> pd.DataFrame:
+    def atpoints(self, positions: npt.NDArray, *, workers: int | None = None) -> pd.DataFrame:
         """
         Compute symmetry functions for the given positions in parallel
         """
 
         # Parallelize over the postitions
-        args: list[NDArrayF] = [np.asarray(a, dtype=np.float64) for a in full2chunk(positions)]
+        args: list[NDArrayF] = _chunk_positions(positions, workers)
         # Map chunks -> per-chunk list of arrays (one array per symmetry function)
-        chunk_results: list[list[NDArrayF]] = _run_multiproc_lists(self._process_chunk, args)
+        chunk_results: list[list[NDArrayF]] = _run_multiproc_lists(
+            self._process_chunk,
+            args,
+            workers=workers,
+        )
         # Combine across chunks: for each symmetry function, vstack chunk results
         combined_per_sf: list[list[NDArrayF]] = [[] for _ in range(self.nsfs)]
         for chunk_list in chunk_results:
@@ -542,6 +606,35 @@ class Maps:
     def tofile(self) -> None:
         """TODO"""
         return None
+
+    def save(
+        self,
+        filename: str | Path,
+        *,
+        protocol: int = pickle.HIGHEST_PROTOCOL,
+    ) -> Path:
+        path = Path(filename).expanduser().resolve()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_name(f".{path.name}.tmp")
+        with tmp_path.open("wb") as handle:
+            dill.dump(self, handle, protocol=protocol)
+        tmp_path.replace(path)
+        return path
+
+    @classmethod
+    def load(cls, filename: str | Path) -> "Maps":
+        path = Path(filename).expanduser().resolve()
+        with path.open("rb") as handle:
+            try:
+                loaded = dill.load(handle)
+            except Exception:
+                handle.seek(0)
+                loaded = pickle.load(handle)
+        if not isinstance(loaded, cls):
+            raise TypeError(
+                f"Pickle at {path} contains {type(loaded).__name__}, expected {cls.__name__}."
+            )
+        return loaded
 
     def plot(
         self,
@@ -636,11 +729,23 @@ class Maps:
         # Check that contact space maps have been generated
         if self.data is None:
             raise RuntimeError("No contact space data available.")
-        # Filter data by region
-        filterdata = self.data[self.contactspace.data["region"] == region]
+        frame = self.data.copy()
+        contactspace_columns = self.contactspace.data
+        for column in {feature, splitby}:
+            if column is None or column in frame.columns:
+                continue
+            if column in contactspace_columns.columns:
+                frame.loc[:, column] = contactspace_columns[column].to_numpy()
+            else:
+                raise ValueError(f"Column {column!r} not found in maps data or contactspace data.")
+
+        mask = np.ones(len(frame), dtype=bool)
+        if region is not None:
+            mask &= contactspace_columns["region"].to_numpy(dtype=np.int64) == region
+        filterdata = frame.loc[mask]
         # Check if feature or index is provided and if it is valid
         if feature is not None:
-            if feature not in self.data.columns:
+            if feature not in filterdata.columns:
                 raise ValueError(f"Feature {feature} not found in maps data.")
         elif index is not None:
             if index >= len(self.features) or index < 0:
@@ -663,7 +768,7 @@ class Maps:
         f = filterdata[feature].values.astype(np.float64)
         # Select the axis for splitting
         if splitby is not None:
-            if splitby not in self.data.columns:
+            if splitby not in filterdata.columns:
                 raise ValueError(f"Split axis {splitby[0]} not found in maps data.")
             s = filterdata[splitby].values
             nsplit = np.unique(s).size
@@ -674,7 +779,8 @@ class Maps:
             fig, axs = plt.subplots(nsplit, 1, figsize=(8, 4 * nsplit))
             axslist = [axs]
         if categorical:
-            nf = np.unique(f).size
+            category_values = np.unique(f)
+            nf = category_values.size
             colors = plt.cm.tab20(np.linspace(0, 1, nf, endpoint=False)).tolist()
         else:
             fmin = np.min(f)
@@ -703,12 +809,15 @@ class Maps:
                 else:
                     scatter = ax.scatter(x1m, x2m, c=fm, vmin=fmin, vmax=fmax, **kwargs)
             else:
-                for i, fvalue in enumerate(np.unique(f)):
+                for i, fvalue in enumerate(category_values):
+                    label_value = (
+                        str(int(fvalue)) if np.isclose(fvalue, int(fvalue)) else str(fvalue)
+                    )
                     scatter = ax.scatter(
                         x1m[fm == fvalue],
                         x2m[fm == fvalue],
                         color=colors[i],
-                        label=f"{feature} = {i:2}",
+                        label=f"{feature} = {label_value}",
                         **kwargs,
                     )
             if centroids:
@@ -740,6 +849,153 @@ class Maps:
                 colorbar = fig.colorbar(scatter, ax=ax)
             colorbar.solids.set_alpha(1.0)
         return fig, axs
+
+    def scatter_core_projection(
+        self,
+        feature: str | None = None,
+        index: int | None = None,
+        *,
+        plane: tuple[str, str] = ("x", "y"),
+        selector: str = "core",
+        region: int | None = 0,
+        core_only: bool = True,
+        max_core_distance: float | None = None,
+        categorical: bool = False,
+        set_aspect: str = "on",
+        **kwargs: dict[str, Any],
+    ) -> tuple[Figure, Axes]:
+        if self.contactspace is None:
+            raise RuntimeError("Trying to use maps.scatter_core_projection() without contact space")
+        if self.data is None:
+            raise RuntimeError("No contact space data available.")
+        if len(plane) != 2 or plane[0] == plane[1]:
+            raise ValueError(f"plane must contain two distinct axes, got {plane!r}.")
+        if selector not in {"core", "top", "bottom", "weighted_mean"}:
+            raise ValueError("selector must be one of {'core', 'top', 'bottom', 'weighted_mean'}.")
+        if categorical and selector == "weighted_mean":
+            raise ValueError("selector='weighted_mean' is only valid for numeric features.")
+        if set_aspect not in ["on", "off", "equal", "scaled"]:
+            raise ValueError("set_aspect must be one of ['on','off','equal','scaled']")
+
+        frame = self.data.copy()
+        required_columns = {feature, *plane, "core_distance", "probability"}
+        for column in required_columns:
+            if column is None or column in frame.columns:
+                continue
+            if column in self.contactspace.data.columns:
+                frame.loc[:, column] = self.contactspace.data[column].to_numpy()
+            else:
+                raise ValueError(f"Column {column!r} not found in maps data or contactspace data.")
+
+        if feature is not None:
+            if feature not in frame.columns:
+                raise ValueError(f"Feature {feature} not found in maps data.")
+        elif index is not None:
+            if index >= len(self.features) or index < 0:
+                raise ValueError(f"Index {index} out of bounds.")
+            feature = self.features[index]
+            logger.info(f"Plotting feature {feature}")
+        else:
+            raise ValueError("Either feature or index must be provided.")
+
+        if feature is None:
+            raise RuntimeError("Feature resolution failed unexpectedly.")
+
+        remaining_axes = [axis for axis in ["x", "y", "z"] if axis not in plane]
+        if len(remaining_axes) != 1:
+            raise ValueError(f"plane must be a subset of ('x', 'y', 'z'), got {plane!r}.")
+        normal_axis = remaining_axes[0]
+
+        mask = self._core_selection_mask(
+            core_only=core_only,
+            max_core_distance=max_core_distance,
+        )
+        if region is not None:
+            mask &= self.contactspace.data["region"].to_numpy(dtype=np.int64) == region
+
+        columns = [plane[0], plane[1], normal_axis, feature, "core_distance", "probability"]
+        projected_input = frame.loc[mask, columns].copy()
+        if projected_input.empty:
+            raise ValueError("No points available after applying the projection filters.")
+
+        if selector == "weighted_mean":
+            feature_values = pd.to_numeric(projected_input[feature], errors="raise")
+            projected_input.loc[:, feature] = feature_values.to_numpy(dtype=np.float64)
+            groups: list[dict[str, Any]] = []
+            for coords, group in projected_input.groupby(list(plane), sort=False, dropna=False):
+                weights = group["probability"].to_numpy(dtype=np.float64)
+                if np.allclose(weights.sum(), 0.0):
+                    weights = np.ones(len(group), dtype=np.float64)
+                row = {
+                    plane[0]: coords[0],
+                    plane[1]: coords[1],
+                    normal_axis: np.average(
+                        group[normal_axis].to_numpy(dtype=np.float64),
+                        weights=weights,
+                    ),
+                    feature: np.average(group[feature].to_numpy(dtype=np.float64), weights=weights),
+                    "core_distance": float(
+                        np.min(group["core_distance"].to_numpy(dtype=np.float64))
+                    ),
+                    "probability": float(np.max(weights)),
+                    "multiplicity": int(len(group)),
+                }
+                groups.append(row)
+            projected = pd.DataFrame(groups)
+        else:
+            ascending = {
+                "core": [True, False, False],
+                "top": [False, True, False],
+                "bottom": [True, True, False],
+            }[selector]
+            sort_columns = {
+                "core": ["core_distance", "probability", normal_axis],
+                "top": [normal_axis, "core_distance", "probability"],
+                "bottom": [normal_axis, "core_distance", "probability"],
+            }[selector]
+            ordered = projected_input.sort_values(
+                sort_columns, ascending=ascending, kind="mergesort"
+            )
+            projected = ordered.groupby(list(plane), sort=False, as_index=False).first()
+            counts = (
+                projected_input.groupby(list(plane), sort=False)
+                .size()
+                .rename("multiplicity")
+                .reset_index()
+            )
+            projected = projected.merge(counts, on=list(plane), how="left")
+
+        x = projected[plane[0]].to_numpy(dtype=np.float64)
+        y = projected[plane[1]].to_numpy(dtype=np.float64)
+
+        fig, ax = plt.subplots(1, 1, figsize=(8, 4))
+        ax.set_title(f"Core projection of {feature} on {plane[0]}-{plane[1]}")
+        ax.set_xlabel(plane[0])
+        ax.set_ylabel(plane[1])
+
+        if categorical:
+            values = projected[feature].to_numpy()
+            category_values = pd.unique(values)
+            colors = plt.cm.tab20(np.linspace(0, 1, len(category_values), endpoint=False)).tolist()
+            for color, category in zip(colors, category_values, strict=False):
+                scatter = ax.scatter(
+                    x[values == category],
+                    y[values == category],
+                    color=color,
+                    label=f"{feature} = {category}",
+                    **kwargs,
+                )
+            leg = ax.legend(bbox_to_anchor=(1.01, 0.5), loc="center left")
+            for lh in leg.legend_handles:
+                lh.set_alpha(1)
+        else:
+            values = projected[feature].to_numpy(dtype=np.float64)
+            scatter = ax.scatter(x, y, c=values, **kwargs)
+            colorbar = fig.colorbar(scatter, ax=ax)
+            colorbar.solids.set_alpha(1.0)
+
+        ax.axis(set_aspect)
+        return fig, ax
 
     def scatter_pca_grid(
         self,
@@ -838,6 +1094,12 @@ class Maps:
         # Check that contact space exists
         if self.contactspace is None:
             raise RuntimeError("Trying to use maps.tovolumetric() without contact space")
+        if self.contactspace.grid is None or self.contactspace.mask is None:
+            raise RuntimeError(
+                "Cannot convert to volumetric data after contact-space dense fields were "
+                "released. Recreate the contact space, or compute features with "
+                "release_contactspace_cache=False."
+            )
         # Check that contact space maps have been generated
         if self.data is None:
             raise RuntimeError("No contact space data available.")
@@ -860,24 +1122,51 @@ class Maps:
         data[self.contactspace.mask] = f
         return ScalarField(self.contactspace.grid, data=data)
 
-    def analyze_pca(self, scale: bool = False) -> PCAAnalysisResult:
+    def analyze_pca(
+        self,
+        scale: bool = False,
+        *,
+        core_only: bool = False,
+        max_core_distance: float | None = None,
+    ) -> PCAAnalysisResult:
         # Check that contact space exists
         if self.contactspace is None:
             raise RuntimeError("Trying to use maps.analyze_pca() without contact space")
         # Check that contact space maps have been generated
         if self.data is None:
             raise RuntimeError("No contact space data available.")
-        X = self.data[self.features].values.astype(np.float64)
+        mask = self._core_selection_mask(
+            core_only=core_only,
+            max_core_distance=max_core_distance,
+        )
+        X = self.data.loc[mask, self.features].values.astype(np.float64)
+        if len(X) == 0:
+            raise ValueError("No points available after applying the core filter for PCA.")
         result = fit_pca_analysis(X, feature_columns=list(self.features), scale=scale)
         self.pca_analysis_result = result
         return result
 
-    def reduce(self, npca: int | None = None, scale: bool = False) -> PCAAnalysisResult | PCAResult:
+    def reduce(
+        self,
+        npca: int | None = None,
+        scale: bool = False,
+        *,
+        core_only: bool = False,
+        max_core_distance: float | None = None,
+    ) -> PCAAnalysisResult | PCAResult:
         if npca is None:
-            return self.analyze_pca(scale=scale)
+            return self.analyze_pca(
+                scale=scale,
+                core_only=core_only,
+                max_core_distance=max_core_distance,
+            )
         if self.data is None:
             raise RuntimeError("No contact space data available.")
-        analysis = self.analyze_pca(scale=scale)
+        analysis = self.analyze_pca(
+            scale=scale,
+            core_only=core_only,
+            max_core_distance=max_core_distance,
+        )
         data = self.data
         result = project_pca(analysis, data[self.features].values.astype(np.float64), npca=npca)
         self.npca = npca
@@ -895,6 +1184,8 @@ class Maps:
         random_state: int | None = None,
         scale: bool = False,
         graph: GraphResult | None = None,
+        core_only: bool = False,
+        max_core_distance: float | None = None,
     ) -> ClusterResult | ClusterScreeningResult:
         """ """
         # Check that contact space exists
@@ -909,10 +1200,25 @@ class Maps:
         else:
             self.cluster_features = features
         self.cluster_method = normalize_cluster_method(method)
-        X = self.data[self.cluster_features].values.astype(np.float64)
-        if graph is not None and graph.matrix.shape[0] != len(X):
+        core_mask = self._core_selection_mask(
+            core_only=core_only,
+            max_core_distance=max_core_distance,
+        )
+        X = self.data.loc[core_mask, self.cluster_features].values.astype(np.float64)
+        if len(X) == 0:
+            raise ValueError("No points available after applying the core filter for clustering.")
+        selected_graph = (
+            self._subset_graph_result(graph, core_mask)
+            if graph is not None and not np.all(core_mask)
+            else graph
+        )
+        if graph is not None and graph.matrix.shape[0] != len(self.data):
             raise ValueError(
-                f"graph has {graph.matrix.shape[0]} nodes, expected {len(X)} to match maps.data."
+                f"graph has {graph.matrix.shape[0]} nodes, expected {len(self.data)} to match maps.data."
+            )
+        if selected_graph is not None and selected_graph.matrix.shape[0] != len(X):
+            raise ValueError(
+                f"graph has {selected_graph.matrix.shape[0]} nodes, expected {len(X)} to match the selected clustering points."
             )
         if nclusters is not None:
             if not clustering_uses_random_state(self.cluster_method):
@@ -968,12 +1274,15 @@ class Maps:
                 random_state=effective_random_state,
                 scale=scale,
                 screening=screening_result,
-                graph=graph,
+                graph=selected_graph,
             )
-            self.data["Cluster"] = result.labels
+            full_labels = np.full(len(self.data), -1, dtype=np.int64)
+            full_labels[core_mask] = result.labels
+            self.data["Cluster"] = full_labels
             # Store number of clusters
             self.nclusters = nclusters
             self.cluster_result = result
+            self.cluster_result.labels = full_labels
             # Compute the cluster centers in features space
             self.cluster_centers = result.centers
             # Compute the number of points in each cluster
@@ -981,12 +1290,18 @@ class Maps:
             # Generate clusters connectivity matrix
             if self.contactspace is None:
                 raise RuntimeError("Trying to use maps.cluster() without contact space")
-            self.cluster_graph = aggregate_cluster_graph(result.labels, self.contactspace.neighbors)
+            self.cluster_graph = aggregate_cluster_graph(full_labels, self.contactspace.neighbors)
             self.cluster_edges = self.cluster_graph.copy()
             for i in range(nclusters):
                 self.cluster_edges[i, i] = 0
             result.graph = self.cluster_graph
             result.edges = self.cluster_edges
+            result.metadata = {
+                **(result.metadata or {}),
+                "core_only": core_only,
+                "max_core_distance": max_core_distance,
+                "n_selected_points": int(np.count_nonzero(core_mask)),
+            }
             return result
         else:
             screening = screen_clusters(
@@ -996,7 +1311,7 @@ class Maps:
                 maxclusters=maxclusters,
                 ntries=ntries,
                 scale=scale,
-                graph=graph,
+                graph=selected_graph,
             )
             self.cluster_screening = screening.table.copy()
             self.cluster_screening_method = screening.method
@@ -1010,6 +1325,7 @@ class Maps:
         feature_columns: list[str] | None = None,
         node_weight_column: str = "probability",
         feature_k: int = 8,
+        feature_connectivity: FeatureConnectivityMode = "knn",
         sigma_feature: float | None = None,
         realspace_weight: float = 1.0,
         feature_weight: float = 1.0,
@@ -1060,6 +1376,7 @@ class Maps:
             neighbors=self.contactspace.neighbors,
             node_weight_column=node_weight_column,
             feature_k=feature_k,
+            feature_connectivity=feature_connectivity,
             sigma_feature=sigma_feature,
             realspace_weight=realspace_weight,
             feature_weight=feature_weight,
@@ -1077,14 +1394,21 @@ class Maps:
         n_archetypes: int,
         *,
         feature_columns: list[str] | None = None,
+        graph: GraphResult | None = None,
         probability_column: str = "probability",
         region: int | None = None,
+        core_only: bool = False,
+        max_core_distance: float | None = None,
         min_probability: float | None = None,
         min_probability_quantile: float | None = 0.75,
         scale_features: bool = True,
+        selection_mode: ArchetypeSelectionMode = "feature_extreme",
         probability_weight: float = 1.0,
         extremeness_weight: float = 1.0,
         diversity_weight: float = 1.0,
+        endpointness_weight: float = 1.0,
+        geodesic_weight: float = 1.0,
+        branching_weight: float = 0.5,
         register: bool = True,
         kind: str = "archetype",
         iteration: int | None = 0,
@@ -1113,11 +1437,32 @@ class Maps:
             ].to_numpy()
 
         candidate_mask: npt.NDArray[np.bool_] | None = None
-        if region is not None:
+        if region is not None or core_only or max_core_distance is not None:
             if self.contactspace is None:
-                raise RuntimeError("Trying to filter archetypes by region without contact space")
-            region_values = self.contactspace.data["region"].to_numpy(dtype=np.int64)
-            candidate_mask = region_values == region
+                raise RuntimeError(
+                    "Trying to filter archetypes by region or core_distance without contact space"
+                )
+            candidate_mask = np.ones(len(point_table), dtype=bool)
+            if region is not None:
+                region_values = self.contactspace.data["region"].to_numpy(dtype=np.int64)
+                candidate_mask &= region_values == region
+            candidate_mask &= self._core_selection_mask(
+                core_only=core_only,
+                max_core_distance=max_core_distance,
+            )
+            if (
+                (core_only or max_core_distance is not None)
+                and min_probability is None
+                and min_probability_quantile == 0.75
+            ):
+                min_probability_quantile = None
+
+        selected_graph = graph if graph is not None else self.graph_result
+        if selection_mode == "graph_endpoint" and selected_graph is None:
+            raise RuntimeError(
+                "selection_mode='graph_endpoint' requires a graph. "
+                "Call maps.build_graph(...) first or pass graph explicitly."
+            )
 
         result = select_feature_archetypes(
             point_table,
@@ -1128,9 +1473,14 @@ class Maps:
             min_probability=min_probability,
             min_probability_quantile=min_probability_quantile,
             scale_features=scale_features,
+            selection_mode=selection_mode,
+            graph=selected_graph,
             probability_weight=probability_weight,
             extremeness_weight=extremeness_weight,
             diversity_weight=diversity_weight,
+            endpointness_weight=endpointness_weight,
+            geodesic_weight=geodesic_weight,
+            branching_weight=branching_weight,
         )
         self.archetype_selection_result = result
 
@@ -1138,17 +1488,33 @@ class Maps:
             archetype_table = result.archetype_table.sort_values("selection_rank").reset_index(
                 drop=True
             )
+            metadata: dict[str, Any] = {
+                "selection_rank": archetype_table["selection_rank"].to_numpy(dtype=np.int64),
+                "selection_score": archetype_table["selection_score"].to_numpy(dtype=np.float64),
+                "probability_score": archetype_table["probability_score"].to_numpy(
+                    dtype=np.float64
+                ),
+                "extremeness_score": archetype_table["extremeness_score"].to_numpy(
+                    dtype=np.float64
+                ),
+                "diversity_score": archetype_table["diversity_score"].to_numpy(dtype=np.float64),
+            }
+            for column in [
+                "euclidean_extremeness_score",
+                "endpoint_score",
+                "endpointness_score",
+                "geodesic_score",
+                "branching_score",
+            ]:
+                if column in archetype_table.columns:
+                    metadata[column] = archetype_table[column].to_numpy(dtype=np.float64)
             self.add_special_points(
                 result.selected_indexes,
                 kind=kind,
                 iteration=iteration,
                 label_status=label_status,
                 replace_kind=replace_kind,
-                selection_rank=archetype_table["selection_rank"].to_numpy(dtype=np.int64),
-                selection_score=archetype_table["selection_score"].to_numpy(dtype=np.float64),
-                probability_score=archetype_table["probability_score"].to_numpy(dtype=np.float64),
-                extremeness_score=archetype_table["extremeness_score"].to_numpy(dtype=np.float64),
-                diversity_score=archetype_table["diversity_score"].to_numpy(dtype=np.float64),
+                **metadata,
             )
 
         return result
@@ -1159,11 +1525,15 @@ class Maps:
         graph: GraphResult | None = None,
         selected_indexes: npt.ArrayLike | None = None,
         kind: str = "archetype",
+        propagation_mode: ArchetypePropagationMode = "diffusion",
         alpha: float = 0.9,
         max_iter: int = 500,
         tol: float = 1.0e-8,
         confidence_threshold: float = 0.5,
         margin_threshold: float = 0.0,
+        propagation_realspace_scale: float = 1.0,
+        propagation_feature_scale: float = 1.0,
+        propagation_use_node_weights: bool = False,
         update_data: bool = True,
     ) -> ArchetypePropagationResult:
         if self.data is None:
@@ -1189,11 +1559,15 @@ class Maps:
         result = propagate_archetypes_on_graph(
             selected_graph,
             selected_indexes=selected,
+            propagation_mode=propagation_mode,
             alpha=alpha,
             max_iter=max_iter,
             tol=tol,
             confidence_threshold=confidence_threshold,
             margin_threshold=margin_threshold,
+            propagation_realspace_scale=propagation_realspace_scale,
+            propagation_feature_scale=propagation_feature_scale,
+            propagation_use_node_weights=propagation_use_node_weights,
         )
         self.archetype_propagation_result = result
 
@@ -1571,13 +1945,88 @@ class Maps:
         for column in self.contactspace.feature_columns:
             self.data.loc[:, column] = self.contactspace.data[column].to_numpy()
 
+    def _sync_contactspace_metadata(self) -> None:
+        """Propagate canonical contact-space metadata columns into Maps data."""
+        if self.contactspace is None or self.data is None:
+            return
+
+        for column in self._METADATA_COLUMNS:
+            if column in self.contactspace.data.columns:
+                self.data.loc[:, column] = self.contactspace.data[column].to_numpy()
+
     def _refresh_features(self) -> None:
         """Update the list of feature columns exposed by the current dataset."""
         if self.data is None:
             self.features = []
             return
 
-        self.features = [column for column in self.data.columns if column not in {"x", "y", "z"}]
+        self.features = [
+            column
+            for column in self.data.columns
+            if column not in {"x", "y", "z", *self._METADATA_COLUMNS}
+        ]
+
+    def _core_selection_mask(
+        self,
+        *,
+        core_only: bool = False,
+        max_core_distance: float | None = None,
+    ) -> npt.NDArray[np.bool_]:
+        if self.data is None:
+            raise RuntimeError("No contact space data available.")
+
+        mask = np.ones(len(self.data), dtype=bool)
+        if not core_only and max_core_distance is None:
+            return mask
+        if self.contactspace is None:
+            raise RuntimeError("Trying to filter by core without contact space")
+
+        if core_only:
+            if "is_core" in self.data.columns:
+                mask &= self.data["is_core"].to_numpy(dtype=bool)
+            elif "is_core" in self.contactspace.data.columns:
+                mask &= self.contactspace.data["is_core"].to_numpy(dtype=bool)
+            else:
+                raise ValueError(
+                    "core_only=True requires the is_core annotation. "
+                    "Set core_tolerance during contact-space generation or use max_core_distance."
+                )
+
+        if max_core_distance is not None:
+            core_distance = self.contactspace.data["core_distance"].to_numpy(dtype=np.float64)
+            mask &= core_distance <= float(max_core_distance)
+
+        return mask
+
+    @staticmethod
+    def _subset_graph_result(
+        graph: GraphResult,
+        mask: npt.NDArray[np.bool_],
+    ) -> GraphResult:
+        indexes = np.flatnonzero(mask).astype(np.int64, copy=False)
+        remap = -np.ones(len(mask), dtype=np.int64)
+        remap[indexes] = np.arange(len(indexes), dtype=np.int64)
+
+        edge_table = graph.edge_table.copy()
+        if not edge_table.empty:
+            sources = edge_table["source"].to_numpy(dtype=np.int64)
+            targets = edge_table["target"].to_numpy(dtype=np.int64)
+            edge_mask = np.isin(sources, indexes) & np.isin(targets, indexes)
+            edge_table = edge_table.loc[edge_mask].copy()
+            edge_table.loc[:, "source"] = remap[edge_table["source"].to_numpy(dtype=np.int64)]
+            edge_table.loc[:, "target"] = remap[edge_table["target"].to_numpy(dtype=np.int64)]
+            edge_table = edge_table.reset_index(drop=True)
+
+        return GraphResult(
+            mode=graph.mode,
+            feature_columns=list(graph.feature_columns),
+            node_weight_column=graph.node_weight_column,
+            node_table=graph.node_table.iloc[indexes].reset_index(drop=True).copy(),
+            node_weights=graph.node_weights[indexes].astype(np.float64, copy=True),
+            edge_table=edge_table,
+            matrix=graph.matrix[indexes][:, indexes].tocsr(),
+            metadata=deepcopy(graph.metadata),
+        )
 
     def _resolve_selection_feature_columns(
         self,
@@ -1797,8 +2246,12 @@ def _namespace_system(system: dict[str, Any]) -> Any:
         file=SimpleNamespace(
             fileformat=file.get("fileformat", "xyz+"),
             name=file.get("name", ""),
+            names=file.get("names", []),
             folder=file.get("folder", ""),
+            folders=file.get("folders", []),
             root=file.get("root", ""),
+            pattern=file.get("pattern", ""),
+            recursive=file.get("recursive", False),
             units=file.get("units", "bohr"),
         ),
         dimension=system.get("dimension", 2),
@@ -1811,8 +2264,12 @@ def _namespace_system(system: dict[str, Any]) -> Any:
                     SimpleNamespace(
                         fileformat=(prop.get("file") or {}).get("fileformat", "cube"),
                         name=(prop.get("file") or {}).get("name", ""),
+                        names=(prop.get("file") or {}).get("names", []),
                         folder=(prop.get("file") or {}).get("folder", ""),
+                        folders=(prop.get("file") or {}).get("folders", []),
                         root=(prop.get("file") or {}).get("root", ""),
+                        pattern=(prop.get("file") or {}).get("pattern", ""),
+                        recursive=(prop.get("file") or {}).get("recursive", False),
                         units=(prop.get("file") or {}).get("units", "bohr"),
                     )
                     if prop.get("file") is not None
@@ -1827,6 +2284,25 @@ def _namespace_system(system: dict[str, Any]) -> Any:
 def _namespace_contactspace(contactspace: dict[str, Any]) -> Any:
     from types import SimpleNamespace
 
+    allowed_keys = {
+        "mode",
+        "radiusmode",
+        "radii",
+        "radiusfile",
+        "alpha",
+        "spread",
+        "distance",
+        "cutoff",
+        "threshold",
+        "side",
+        "core_epsilon",
+        "core_tolerance",
+    }
+    unexpected = sorted(set(contactspace) - allowed_keys)
+    if unexpected:
+        names = ", ".join(repr(name) for name in unexpected)
+        raise ValueError(f"Unknown contactspace keys: {names}.")
+
     return SimpleNamespace(
         mode=contactspace.get("mode", "system"),
         radiusmode=contactspace.get("radiusmode", contactspace.get("radii", "muff")),
@@ -1837,11 +2313,25 @@ def _namespace_contactspace(contactspace: dict[str, Any]) -> Any:
         cutoff=contactspace.get("cutoff", 300),
         threshold=contactspace.get("threshold", 0.1),
         side=contactspace.get("side", 1.0),
+        core_epsilon=contactspace.get("core_epsilon", 1.0e-12),
+        core_tolerance=contactspace.get("core_tolerance"),
     )
 
 
 def _namespace_symmetryfunctions(symmetryfunctions: dict[str, Any]) -> Any:
     from types import SimpleNamespace
+
+    def normalize_order(value: Any) -> list[int]:
+        if isinstance(value, int):
+            return list(range(value))
+        if isinstance(value, np.integer):
+            return list(range(int(value)))
+        if isinstance(value, (list, tuple)):
+            return [int(item) for item in value]
+        array = np.asarray(value, dtype=np.int64)
+        if array.ndim == 0:
+            return list(range(int(array)))
+        return [int(item) for item in array.reshape(-1)]
 
     functions = []
     for function in symmetryfunctions.get("functions") or []:
@@ -1850,7 +2340,7 @@ def _namespace_symmetryfunctions(symmetryfunctions: dict[str, Any]) -> Any:
                 type=function.get("type", "bp"),
                 cutoff=function.get("cutoff", "cos"),
                 radius=function.get("radius", 5.0),
-                order=function.get("order", 1),
+                order=normalize_order(function.get("order", 1)),
                 etas=function.get("etas", [1.0]),
                 rss=function.get("rss", [0.0]),
                 lambdas=function.get("lambdas", [-1.0, 1.0]),

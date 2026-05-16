@@ -1,7 +1,7 @@
 from pydantic import (
     BaseModel as PydanticBaseModel,
 )
-from pydantic import NonNegativeInt, PositiveFloat, PositiveInt
+from pydantic import NonNegativeFloat, NonNegativeInt, PositiveFloat, PositiveInt
 
 from mapsy.io.input.keytypes import (
     ContactSpaceMode,
@@ -29,8 +29,12 @@ class FileModel(BaseModel):
 
     fileformat: FileFormat = "xyz+"
     name: str = ""
+    names: list[str] = []
     folder: str = ""
+    folders: list[str] = []
     root: str = ""
+    pattern: str = ""
+    recursive: bool = False
     units: Units = "bohr"
 
 
@@ -63,6 +67,9 @@ class SystemModel(BaseModel):
 class ContactSpaceModel(BaseModel):
     """Contact space input model"""
 
+    class Config(BaseModel.Config):
+        extra = "forbid"
+
     mode: ContactSpaceMode = "system"
     radiusmode: RadiusMode = "muff"
     radiusfile: str | None = None
@@ -72,3 +79,5 @@ class ContactSpaceModel(BaseModel):
     cutoff: PositiveInt = 300
     threshold: NonZeroFloat = 0.1
     side: NonZeroFloat = 1.0
+    core_epsilon: PositiveFloat = 1.0e-12
+    core_tolerance: NonNegativeFloat | None = None

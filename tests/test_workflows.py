@@ -125,6 +125,7 @@ def test_calculation_workflow_run_supports_parallel_runner_execution() -> None:
     after_run = maps.get_special_points(kind="adaptive").sort_values("point_index")
 
     assert after_run["label_file"].tolist() == ["calc_0.out", "calc_1.out"]
+    assert after_run["label_status"].tolist() == ["unlabeled", "unlabeled"]
     assert all(name != "MainThread" for name in after_run["runner_thread"].tolist())
 
 
@@ -153,7 +154,7 @@ def test_calculation_workflow_retry_failed_targets_only_failed_points() -> None:
 
     assert special.iloc[0]["label_file"] == "retry_0.out"
     assert pd.isna(special.iloc[1]["label_file"])
-    assert special["label_status"].tolist() == ["failed", "completed"]
+    assert special["label_status"].tolist() == ["unlabeled", "completed"]
 
 
 def test_calculation_workflow_record_outputs_resets_points_for_recollection() -> None:

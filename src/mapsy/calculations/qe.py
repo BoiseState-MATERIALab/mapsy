@@ -70,9 +70,9 @@ class AdsorptionEnergyParser:
     adsorbed_energy_column: str = "E_bfgs_final_Ry"
     adsorption_energy_column: str = "E_ads_Ry"
     slab_reference_name: str = "clean_slab"
-    slab_reference_column: str = "reference_energy_Ry"
+    slab_reference_column: str = "E_converged_final_Ry"
     gas_reference_name: str | None = "H2"
-    gas_reference_column: str = "reference_energy_Ry"
+    gas_reference_column: str = "E_converged_final_Ry"
     gas_multiplier: float = 0.5
     include_reference_metadata: bool = True
     map_index_resolver: Callable[..., int | None] | None = None
@@ -120,25 +120,47 @@ class AdsorptionEnergyParser:
             self.slab_reference_name,
             map_index=resolved_map_index,
         )
-        slab_energy = float(slab_reference[self.slab_reference_column])
+        slab_energy, slab_column = self._reference_energy(
+            slab_reference,
+            preferred_column=self.slab_reference_column,
+        )
 
         gas_energy = 0.0
+        gas_column = self.gas_reference_column
         if self.gas_reference_name is not None:
             gas_reference = workflow.get_reference(self.gas_reference_name)
-            gas_energy = float(gas_reference[self.gas_reference_column])
+            gas_energy, gas_column = self._reference_energy(
+                gas_reference,
+                preferred_column=self.gas_reference_column,
+            )
 
         adsorption_energy = adsorbed_energy - slab_energy - float(self.gas_multiplier) * gas_energy
         parsed[self.adsorption_energy_column] = adsorption_energy
 
         if self.include_reference_metadata:
-            parsed[f"{self.slab_reference_name}_{self.slab_reference_column}"] = slab_energy
+            parsed[f"{self.slab_reference_name}_{slab_column}"] = slab_energy
             if self.gas_reference_name is not None:
-                parsed[f"{self.gas_reference_name}_{self.gas_reference_column}"] = gas_energy
+                parsed[f"{self.gas_reference_name}_{gas_column}"] = gas_energy
                 parsed[f"{self.gas_reference_name}_multiplier"] = float(self.gas_multiplier)
             if resolved_map_index is not None:
                 parsed["reference_map_index"] = int(resolved_map_index)
 
         return parsed
+
+    @staticmethod
+    def _reference_energy(
+        reference: Mapping[str, Any],
+        *,
+        preferred_column: str,
+    ) -> tuple[float, str]:
+        columns = [preferred_column]
+        for fallback in ("E_converged_final_Ry", "reference_energy_Ry"):
+            if fallback not in columns:
+                columns.append(fallback)
+        for column in columns:
+            if column in reference and not pd.isna(reference[column]):
+                return float(reference[column]), column
+        raise KeyError("Reference record does not contain an energy column. " f"Tried {columns}.")
 
     def __call__(
         self,
@@ -186,9 +208,9 @@ def build_adsorption_energy_parser(
     adsorbed_energy_column: str = "E_bfgs_final_Ry",
     adsorption_energy_column: str = "E_ads_Ry",
     slab_reference_name: str = "clean_slab",
-    slab_reference_column: str = "reference_energy_Ry",
+    slab_reference_column: str = "E_converged_final_Ry",
     gas_reference_name: str | None = "H2",
-    gas_reference_column: str = "reference_energy_Ry",
+    gas_reference_column: str = "E_converged_final_Ry",
     gas_multiplier: float = 0.5,
     include_reference_metadata: bool = True,
     map_index_resolver: Callable[..., int | None] | None = None,
@@ -215,9 +237,9 @@ def build_che_adsorption_energy_parser(
     adsorbed_energy_column: str = "E_bfgs_final_Ry",
     adsorption_energy_column: str = "E_ads_Ry",
     slab_reference_name: str = "clean_slab",
-    slab_reference_column: str = "reference_energy_Ry",
+    slab_reference_column: str = "E_converged_final_Ry",
     gas_reference_name: str | None = "H2",
-    gas_reference_column: str = "reference_energy_Ry",
+    gas_reference_column: str = "E_converged_final_Ry",
     gas_multiplier: float = 0.5,
     include_reference_metadata: bool = True,
     map_index_resolver: Callable[..., int | None] | None = None,
@@ -255,9 +277,9 @@ def build_relax_adsorption_parser(
     adsorbed_energy_column: str = "E_bfgs_final_Ry",
     adsorption_energy_column: str = "E_ads_Ry",
     slab_reference_name: str = "clean_slab",
-    slab_reference_column: str = "reference_energy_Ry",
+    slab_reference_column: str = "E_converged_final_Ry",
     gas_reference_name: str | None = "H2",
-    gas_reference_column: str = "reference_energy_Ry",
+    gas_reference_column: str = "E_converged_final_Ry",
     gas_multiplier: float = 0.5,
     include_reference_metadata: bool = True,
     map_index_resolver: Callable[..., int | None] | None = None,
@@ -1782,6 +1804,70 @@ class _QuantumEspressoParserBase(ABC):
         ]
         return np.vstack(coordinates).astype(float)
 
+    def ordered_energy_and_last_atom_coordinates_history(
+        self,
+        pwo_path: Path,
+        pwi_path: Path,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Return converged energies with the geometry used for each energy evaluation."""
+        if not pwo_path.exists():
+            return np.zeros(0, dtype=float), np.zeros((0, 3), dtype=float)
+
+        lines = self._read_lines(pwo_path)
+        alat_angstrom = self._extract_alat_angstrom_from_pwo(lines)
+        current_coordinates = self.last_atom_input_coordinates_from_pwi(
+            pwi_path,
+            fallback_alat_angstrom=alat_angstrom,
+        )
+
+        energies: list[float] = []
+        coordinates: list[np.ndarray] = []
+        index = 0
+        while index < len(lines):
+            energy_match = self.re_energy_converged.search(lines[index])
+            if energy_match is not None:
+                energies.append(float(energy_match.group(1)))
+                coordinates.append(np.array(current_coordinates, dtype=float))
+                index += 1
+                continue
+
+            atomic_match = self.re_atomic.match(lines[index])
+            if atomic_match is None:
+                index += 1
+                continue
+
+            unit = (atomic_match.group(1) or "").strip().lower()
+            index += 1
+            symbols: list[str] = []
+            positions: list[list[float]] = []
+            while index < len(lines):
+                atom_match = self.re_atom.match(lines[index])
+                if atom_match is None:
+                    break
+                symbols.append(atom_match.group(1))
+                positions.append(
+                    [
+                        float(atom_match.group(2)),
+                        float(atom_match.group(3)),
+                        float(atom_match.group(4)),
+                    ]
+                )
+                index += 1
+            if positions:
+                current_coordinates = self._last_atom_coordinates_from_block_angstrom(
+                    {
+                        "unit": unit,
+                        "symbols": symbols,
+                        "pos": np.array(positions, dtype=float),
+                    },
+                    alat_angstrom=alat_angstrom,
+                )
+
+        coordinate_history = (
+            np.vstack(coordinates).astype(float) if coordinates else np.zeros((0, 3), dtype=float)
+        )
+        return np.array(energies, dtype=float), coordinate_history
+
     def ionic_steps_from_pwo(self, pwo_path: Path) -> int:
         if not pwo_path.exists():
             return 0
@@ -2068,7 +2154,8 @@ class QuantumEspressoScfParser(_QuantumEspressoParserBase):
 class QuantumEspressoEnergyParser(_QuantumEspressoParserBase):
     """Minimal parser for final converged QE total energies."""
 
-    energy_column: str = "reference_energy_Ry"
+    energy_column: str = "E_converged_final_Ry"
+    converged_column: str = "energy_converged"
     require_converged_energy: bool = True
 
     def parse(self, output_file: str | Path) -> dict[str, Any]:
@@ -2078,7 +2165,7 @@ class QuantumEspressoEnergyParser(_QuantumEspressoParserBase):
         parsed = {
             "label_file": str(folder),
             self.energy_column: energy_last,
-            "reference_converged": converged,
+            self.converged_column: converged,
             "n_scf_iterations": self.scf_iteration_count(pwo_path),
         }
         if self.require_converged_energy and not converged:
@@ -2420,10 +2507,16 @@ class QuantumEspressoRelaxParser(_QuantumEspressoParserBase):
             pwi_path,
             fallback_alat_angstrom=alat_angstrom,
         )
-        final_coordinates = self.last_atom_final_coordinates_from_pwo(pwo_path)
-        coordinates_history = self.last_atom_coordinates_history_from_pwo(pwo_path)
-        energy_first, energy_last = self.converged_energies_first_last(pwo_path)
-        energy_history = self.converged_energy_history(pwo_path)
+        energy_history, coordinates_history = self.ordered_energy_and_last_atom_coordinates_history(
+            pwo_path, pwi_path
+        )
+        energy_first = float(energy_history[0]) if energy_history.size else np.nan
+        energy_last = float(energy_history[-1]) if energy_history.size else np.nan
+        final_coordinates = (
+            coordinates_history[-1]
+            if coordinates_history.size
+            else self.last_atom_final_coordinates_from_pwo(pwo_path)
+        )
         total_force_first, total_force_last = self.total_forces_first_last(pwo_path)
         adsorbate_force_first, adsorbate_force_last = self.adsorbate_forces_first_last(
             pwo_path,

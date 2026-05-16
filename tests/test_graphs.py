@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 import pytest
 from ase import Atoms
+from scipy.sparse.csgraph import connected_components
 
 from mapsy import GraphResult, Maps, MultiMaps
 from mapsy.data import Grid, System
@@ -131,6 +132,44 @@ def test_maps_build_graph_feature_connects_close_points() -> None:
     }
     assert edge_lookup[(0, 1)] > 0.0
     assert edge_lookup[(0, 1)] > edge_lookup.get((1, 2), 0.0)
+
+
+def test_maps_build_graph_feature_knn_mst_adds_connectivity_backbone() -> None:
+    positions = np.column_stack([np.arange(6, dtype=np.float64), np.zeros(6), np.zeros(6)])
+    probabilities = np.ones(6, dtype=np.float64)
+    neighbors = [np.full(6, -1, dtype=np.int64) for _ in range(6)]
+
+    system = _build_system()
+    contactspace = StubContactSpace(positions, probabilities, neighbors)
+    maps = Maps(system, [], contactspace)
+    maps.data = pd.DataFrame(
+        {
+            "x": positions[:, 0],
+            "y": positions[:, 1],
+            "z": positions[:, 2],
+            "pca0": [0.0, 0.1, 5.0, 5.1, 10.0, 10.1],
+        }
+    )
+    maps.features = ["pca0"]
+
+    knn_graph = maps.build_graph(
+        mode="feature",
+        feature_columns=["pca0"],
+        feature_k=1,
+        feature_connectivity="knn",
+    )
+    mst_graph = maps.build_graph(
+        mode="feature",
+        feature_columns=["pca0"],
+        feature_k=1,
+        feature_connectivity="knn_mst",
+    )
+
+    n_knn_components, _ = connected_components(knn_graph.matrix, directed=False)
+    n_mst_components, _ = connected_components(mst_graph.matrix, directed=False)
+
+    assert n_knn_components > 1
+    assert n_mst_components == 1
 
 
 def test_maps_build_graph_directional_weight_prefers_boundary_normal_direction() -> None:

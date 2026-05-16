@@ -133,12 +133,19 @@ def aggregate_cluster_graph(
     labels: npt.NDArray[np.int64],
     neighbors: list[npt.NDArray[np.int64]] | npt.NDArray[np.int64],
 ) -> npt.NDArray[np.int64]:
-    nclusters = int(np.max(labels)) + 1
+    valid_labels = labels[labels >= 0]
+    if valid_labels.size == 0:
+        return np.zeros((0, 0), dtype=np.int64)
+    nclusters = int(np.max(valid_labels)) + 1
     graph = np.zeros((nclusters, nclusters), dtype=np.int64)
     for i, ci in enumerate(labels):
+        if ci < 0:
+            continue
         local_neighbors = np.asarray(neighbors[i], dtype=np.int64).reshape(-1)
         for j in local_neighbors[local_neighbors >= 0]:
             cj = labels[int(j)]
+            if cj < 0:
+                continue
             graph[int(ci), int(cj)] += 1
             graph[int(cj), int(ci)] += 1
     return graph // 2
