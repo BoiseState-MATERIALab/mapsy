@@ -1,11 +1,22 @@
+import json
+import logging
+import os
 import pickle
+import time
 from collections.abc import Mapping, Sequence
+from contextlib import AbstractContextManager, nullcontext
+from copy import deepcopy
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
+import dill
 import numpy as np
 import numpy.typing as npt
 import pandas as pd
+import scipy.spatial.distance as distance
+from pathos.multiprocessing import ProcessingPool
+from sklearn.preprocessing import StandardScaler
+from threadpoolctl import threadpool_limits
 from yaml import SafeLoader, load
 
 from mapsy.analysis import (
@@ -30,7 +41,6 @@ from mapsy.clustering import (
     clustering_uses_random_state,
     normalize_cluster_method,
 )
-from mapsy.maps import _coerce_layer_values
 from mapsy.results import (
     ArchetypePropagationResult,
     ArchetypeSelectionResult,
@@ -45,10 +55,143 @@ if TYPE_CHECKING:
     from .maps import Maps
 
 
+logger = logging.getLogger(__name__)
+
+
+def _build_maps_from_file_worker(
+    task: tuple[str, str, dict[str, Any], dict[str, Any], dict[str, Any]]
+) -> Any:
+    path, basepath, system_params, symmetryfunctions, contactspace = task
+
+    from mapsy.io.parser import ContactSpaceGenerator, SystemParser
+    from mapsy.maps import (
+        Maps,
+        _namespace_contactspace,
+        _namespace_symmetryfunctions,
+        _namespace_system,
+    )
+    from mapsy.symfunc.parser import SymmetryFunctionsParser
+
+    system_parser = SystemParser(_namespace_system(system_params), basepath=basepath)
+    system = system_parser.parse_file(path)
+    parsed_symmetryfunctions = SymmetryFunctionsParser(
+        _namespace_symmetryfunctions(symmetryfunctions)
+    ).parse()
+    parsed_contactspace = ContactSpaceGenerator(_namespace_contactspace(contactspace)).generate(
+        system
+    )
+    return Maps(system, parsed_symmetryfunctions, parsed_contactspace)
+
+
+def _resolve_multimaps_workers(control: Mapping[str, Any], nitems: int) -> int:
+    if nitems <= 1:
+        return 1
+
+    raw_workers = None
+    for key in ("workers", "nworkers", "n_workers", "n_jobs", "njobs", "max_workers"):
+        if key in control:
+            raw_workers = control[key]
+            break
+
+    if raw_workers is None:
+        if not bool(control.get("parallel", False)):
+            return 1
+        available = os.cpu_count() or 1
+        return max(1, min(4, available, nitems))
+
+    workers = int(raw_workers)
+    if workers <= 0:
+        available = os.cpu_count() or 1
+        return max(1, min(4, available, nitems))
+    return max(1, min(workers, nitems))
+
+
+def _write_map_feature_status(
+    status_directory: str | None,
+    map_index: int,
+    status: str,
+    **metadata: Any,
+) -> None:
+    if status_directory is None:
+        return
+    directory = Path(status_directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"map_{map_index:05d}.status.json"
+    tmp_path = path.with_name(f".{path.name}.tmp")
+    payload = {
+        "map_index": map_index,
+        "status": status,
+        "pid": os.getpid(),
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        **metadata,
+    }
+    with tmp_path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+    tmp_path.replace(path)
+
+
+def _threadpool_context(threadpool_threads: int | None) -> AbstractContextManager[Any]:
+    if threadpool_threads is None or threadpool_threads <= 0:
+        return nullcontext()
+    return cast(
+        AbstractContextManager[Any],
+        threadpool_limits(limits=int(threadpool_threads)),
+    )
+
+
+def _compute_map_features_worker(
+    task: tuple[int, Any, int | None, bool, str | None, int | None],
+) -> tuple[int, Any, float, int]:
+    (
+        map_index,
+        maps,
+        point_workers,
+        release_contactspace_cache,
+        status_directory,
+        threadpool_threads,
+    ) = task
+    start = time.perf_counter()
+    npoints = 0 if maps.contactspace is None else len(maps.contactspace.data)
+    _write_map_feature_status(
+        status_directory,
+        map_index,
+        "running",
+        point_workers=point_workers,
+        threadpool_threads=threadpool_threads,
+        npoints=npoints,
+    )
+    try:
+        with _threadpool_context(threadpool_threads):
+            maps.atcontactspace(
+                workers=point_workers,
+                release_contactspace_cache=release_contactspace_cache,
+            )
+    except Exception as exc:
+        _write_map_feature_status(
+            status_directory,
+            map_index,
+            "failed",
+            elapsed_seconds=time.perf_counter() - start,
+            error=repr(exc),
+        )
+        raise
+    elapsed = time.perf_counter() - start
+    npoints = 0 if maps.data is None else len(maps.data)
+    _write_map_feature_status(
+        status_directory,
+        map_index,
+        "done",
+        elapsed_seconds=elapsed,
+        npoints=npoints,
+    )
+    return map_index, maps, elapsed, npoints
+
+
 class MultiMaps:
     _METADATA_COLUMNS = (
         "region",
-        "layer",
+        "core_distance",
+        "is_core",
         "source_file",
         "source_file_name",
         "source_file_stem",
@@ -88,7 +231,6 @@ class MultiMaps:
         self.graph_result: GraphResult | None = None
         self.archetype_selection_result: ArchetypeSelectionResult | None = None
         self.archetype_propagation_result: ArchetypePropagationResult | None = None
-        self.layer_ranking: pd.DataFrame | None = None
 
         self.nclusters: int = 0
         self.cluster_method: str = "spectral"
@@ -103,8 +245,177 @@ class MultiMaps:
 
         self._slices: list[slice] = []
 
-    def atcontactspace(self) -> pd.DataFrame:
-        return self._build_dataset(recompute=True)
+    def atcontactspace(
+        self,
+        *,
+        recompute: bool = True,
+        parallel: str | bool = "points",
+        workers: int | None = None,
+        point_workers: int | None = None,
+        checkpoint: str | Path | None = None,
+        checkpoint_every: int = 1,
+        map_indexes: npt.ArrayLike | None = None,
+        release_contactspace_cache: bool = False,
+        checkpoint_mode: str = "full",
+        progress: bool = False,
+        threadpool_threads: int | None = None,
+    ) -> pd.DataFrame:
+        """Compute child-map features with optional map-level parallelism and checkpoints."""
+        mode = self._normalize_feature_parallelism(parallel)
+        checkpoint_mode = self._normalize_checkpoint_mode(checkpoint_mode)
+        if checkpoint is not None and checkpoint_mode == "maps" and not recompute:
+            self._load_map_feature_checkpoints(checkpoint, map_indexes=map_indexes)
+
+        targets = self._feature_target_indexes(
+            recompute=recompute,
+            map_indexes=map_indexes,
+        )
+        self._feature_progress(
+            progress,
+            (
+                f"feature run: mode={mode}, targets={len(targets)}/{len(self.maps)}, "
+                f"checkpoint_mode={checkpoint_mode}"
+            ),
+        )
+        if release_contactspace_cache:
+            self.release_contactspace_cache(
+                map_indexes=self._feature_target_indexes(
+                    recompute=True,
+                    map_indexes=map_indexes,
+                )
+            )
+
+        if mode == "maps":
+            map_workers = self._resolve_feature_workers(workers, len(targets))
+            if map_workers > 1 and targets:
+                child_point_workers = 1 if point_workers is None else point_workers
+                child_threadpool_threads = 1 if threadpool_threads is None else threadpool_threads
+                status_directory = (
+                    str(self._map_checkpoint_directory(checkpoint))
+                    if checkpoint is not None and checkpoint_mode == "maps"
+                    else None
+                )
+                self._feature_progress(
+                    progress,
+                    (
+                        f"launching {len(targets)} map jobs with map_workers={map_workers}, "
+                        f"point_workers={child_point_workers}, "
+                        f"threadpool_threads={child_threadpool_threads}"
+                    ),
+                )
+                tasks = (
+                    (
+                        index,
+                        self.maps[index],
+                        child_point_workers,
+                        release_contactspace_cache,
+                        status_directory,
+                        child_threadpool_threads,
+                    )
+                    for index in targets
+                )
+                with ProcessingPool(nodes=map_workers) as pool:
+                    for completed, result in enumerate(
+                        pool.uimap(_compute_map_features_worker, tasks),
+                        start=1,
+                    ):
+                        index, maps, elapsed, npoints = result
+                        self.maps[index] = maps
+                        self._feature_progress(
+                            progress,
+                            (
+                                f"finished map {index} ({self._map_name(index)}) "
+                                f"{completed}/{len(targets)} in {elapsed:.1f}s "
+                                f"({npoints} points)"
+                            ),
+                        )
+                        if checkpoint is not None and checkpoint_mode == "maps":
+                            checkpoint_start = time.perf_counter()
+                            path = self._save_map_feature_checkpoint(checkpoint, index)
+                            self._feature_progress(
+                                progress,
+                                (
+                                    f"checkpointed map {index} in "
+                                    f"{time.perf_counter() - checkpoint_start:.1f}s -> {path}"
+                                ),
+                            )
+            else:
+                serial_point_workers = 1 if point_workers is None else point_workers
+                self._compute_feature_targets_serial(
+                    targets,
+                    point_workers=serial_point_workers,
+                    checkpoint=checkpoint,
+                    checkpoint_every=checkpoint_every,
+                    release_contactspace_cache=release_contactspace_cache,
+                    checkpoint_mode=checkpoint_mode,
+                    progress=progress,
+                    threadpool_threads=threadpool_threads,
+                )
+        else:
+            selected_point_workers = (
+                1 if mode == "none" else workers if point_workers is None else point_workers
+            )
+            self._compute_feature_targets_serial(
+                targets,
+                point_workers=selected_point_workers,
+                checkpoint=checkpoint,
+                checkpoint_every=checkpoint_every,
+                release_contactspace_cache=release_contactspace_cache,
+                checkpoint_mode=checkpoint_mode,
+                progress=progress,
+                threadpool_threads=threadpool_threads,
+            )
+
+        if not self._all_maps_have_data():
+            self.data = None
+            if checkpoint is not None and checkpoint_mode == "full":
+                checkpoint_start = time.perf_counter()
+                path = self._save_feature_checkpoint(checkpoint)
+                self._feature_progress(
+                    progress,
+                    (
+                        f"wrote partial checkpoint in "
+                        f"{time.perf_counter() - checkpoint_start:.1f}s -> {path}"
+                    ),
+                )
+            self._feature_progress(progress, "feature run incomplete; returning partial dataset")
+            return self._partial_feature_dataset()
+
+        data = self._build_dataset(recompute=False)
+        if checkpoint is not None:
+            checkpoint_start = time.perf_counter()
+            path = self._save_feature_checkpoint(checkpoint)
+            self._feature_progress(
+                progress,
+                (
+                    f"wrote final checkpoint in "
+                    f"{time.perf_counter() - checkpoint_start:.1f}s -> {path}"
+                ),
+            )
+        self._feature_progress(progress, f"feature run complete: {len(data)} total points")
+        return data
+
+    def release_contactspace_cache(self, map_indexes: npt.ArrayLike | None = None) -> None:
+        """Release dense contact-space fields from all child maps."""
+        indexes = self._feature_target_indexes(
+            recompute=True,
+            map_indexes=map_indexes,
+        )
+        for index in indexes:
+            maps = self.maps[index]
+            release = getattr(maps, "release_contactspace_cache", None)
+            if release is not None:
+                release()
+
+    def _map_name(self, index: int) -> str:
+        if index < len(self.names):
+            return self.names[index]
+        return f"map_{index}"
+
+    @staticmethod
+    def _feature_progress(enabled: bool, message: str) -> None:
+        if enabled:
+            logger.info("[mapsy] %s", message)
 
     def save(
         self,
@@ -114,33 +425,66 @@ class MultiMaps:
     ) -> Path:
         path = Path(filename).expanduser().resolve()
         path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("wb") as handle:
-            pickle.dump(self, handle, protocol=protocol)
+        tmp_path = path.with_name(f".{path.name}.tmp")
+        with tmp_path.open("wb") as handle:
+            dill.dump(self, handle, protocol=protocol)
+        tmp_path.replace(path)
         return path
 
     @classmethod
     def load(cls, filename: str | Path) -> "MultiMaps":
         path = Path(filename).expanduser().resolve()
         with path.open("rb") as handle:
-            loaded = pickle.load(handle)
+            try:
+                loaded = dill.load(handle)
+            except Exception:
+                handle.seek(0)
+                loaded = pickle.load(handle)
         if not isinstance(loaded, cls):
             raise TypeError(
                 f"Pickle at {path} contains {type(loaded).__name__}, expected {cls.__name__}."
             )
         return loaded
 
-    def analyze_pca(self, scale: bool = False) -> PCAAnalysisResult:
+    def analyze_pca(
+        self,
+        scale: bool = False,
+        *,
+        core_only: bool = False,
+        max_core_distance: float | None = None,
+    ) -> PCAAnalysisResult:
         data = self._ensure_data()
-        X = data[self.features].values.astype(np.float64)
+        mask = self._core_selection_mask(
+            core_only=core_only,
+            max_core_distance=max_core_distance,
+        )
+        X = data.loc[mask, self.features].values.astype(np.float64)
+        if len(X) == 0:
+            raise ValueError("No points available after applying the core filter for PCA.")
         result = fit_pca_analysis(X, feature_columns=list(self.features), scale=scale)
         self.pca_analysis_result = result
         return result
 
-    def reduce(self, npca: int | None = None, scale: bool = False) -> PCAAnalysisResult | PCAResult:
+    def reduce(
+        self,
+        npca: int | None = None,
+        scale: bool = False,
+        *,
+        core_only: bool = False,
+        max_core_distance: float | None = None,
+    ) -> PCAAnalysisResult | PCAResult:
         if npca is None:
-            return self.analyze_pca(scale=scale)
+            return self.analyze_pca(
+                scale=scale,
+                core_only=core_only,
+                max_core_distance=max_core_distance,
+            )
         data = self._ensure_data()
-        analysis = self.analyze_pca(scale=scale)
+        analysis = self.analyze_pca(
+            scale=scale,
+            core_only=core_only,
+            max_core_distance=max_core_distance,
+        )
         result = project_pca(analysis, data[self.features].values.astype(np.float64), npca=npca)
         self.npca = npca
         self.pca_result = result
@@ -158,14 +502,31 @@ class MultiMaps:
         random_state: int | None = None,
         scale: bool = False,
         graph: GraphResult | None = None,
+        core_only: bool = False,
+        max_core_distance: float | None = None,
     ) -> ClusterResult | ClusterScreeningResult:
         data = self._ensure_data()
         self.cluster_features = list(features) if features is not None else list(self.features)
         self.cluster_method = normalize_cluster_method(method)
-        X = data[self.cluster_features].values.astype(np.float64)
-        if graph is not None and graph.matrix.shape[0] != len(X):
+        core_mask = self._core_selection_mask(
+            core_only=core_only,
+            max_core_distance=max_core_distance,
+        )
+        X = data.loc[core_mask, self.cluster_features].values.astype(np.float64)
+        if len(X) == 0:
+            raise ValueError("No points available after applying the core filter for clustering.")
+        selected_graph = (
+            self._subset_graph_result(graph, core_mask)
+            if graph is not None and not np.all(core_mask)
+            else graph
+        )
+        if graph is not None and graph.matrix.shape[0] != len(data):
             raise ValueError(
-                f"graph has {graph.matrix.shape[0]} nodes, expected {len(X)} to match multimaps.data."
+                f"graph has {graph.matrix.shape[0]} nodes, expected {len(data)} to match multimaps.data."
+            )
+        if selected_graph is not None and selected_graph.matrix.shape[0] != len(X):
+            raise ValueError(
+                f"graph has {selected_graph.matrix.shape[0]} nodes, expected {len(X)} to match the selected clustering points."
             )
 
         if nclusters is not None:
@@ -194,18 +555,27 @@ class MultiMaps:
                 random_state=chosen_random_state,
                 scale=scale,
                 screening=screening_result,
-                graph=graph,
+                graph=selected_graph,
             )
-            data.loc[:, "Cluster"] = result.labels
+            full_labels = np.full(len(data), -1, dtype=np.int64)
+            full_labels[core_mask] = result.labels
+            data.loc[:, "Cluster"] = full_labels
             self.nclusters = nclusters
             self.cluster_result = result
+            self.cluster_result.labels = full_labels
             self.cluster_centers = result.centers
-            self.cluster_graph = self._aggregate_graph(result.labels.astype(np.int64))
+            self.cluster_graph = self._aggregate_graph(full_labels.astype(np.int64))
             self.cluster_edges = self.cluster_graph.copy()
             for i in range(nclusters):
                 self.cluster_edges[i, i] = 0
             result.graph = self.cluster_graph
             result.edges = self.cluster_edges
+            result.metadata = {
+                **(result.metadata or {}),
+                "core_only": core_only,
+                "max_core_distance": max_core_distance,
+                "n_selected_points": int(np.count_nonzero(core_mask)),
+            }
             self._propagate_columns(["Cluster"])
             return result
 
@@ -216,12 +586,73 @@ class MultiMaps:
             maxclusters=maxclusters,
             ntries=ntries,
             scale=scale,
-            graph=graph,
+            graph=selected_graph,
         )
         self.cluster_screening = screening.table.copy()
         self.cluster_screening_method = screening.method
         self.best_clusters = screening.best_by_db.copy()
         return screening
+
+    def sites(
+        self,
+        region: int = 0,
+        *,
+        scope: str = "global",
+        kind: str = "centroid",
+        iteration: int | None = 0,
+        label_status: str = "unlabeled",
+        replace_kind: bool = True,
+    ) -> pd.DataFrame:
+        """Register cluster-centroid sites globally or independently within each map."""
+        scope = self._validate_scope(scope)
+        data = self._ensure_data()
+        if (
+            self.cluster_centers is None
+            or self.cluster_edges is None
+            or self.cluster_result is None
+            or self.cluster_result.sizes is None
+        ):
+            raise RuntimeError("No clusters have been generated.")
+        if not self.cluster_features:
+            raise RuntimeError("No cluster feature columns are available.")
+        if "Cluster" not in data.columns:
+            raise RuntimeError(
+                "No cluster labels are available. Call multimaps.cluster(...) first."
+            )
+
+        if "region" not in data.columns:
+            data.loc[:, "region"] = self._collect_contactspace_column("region")
+
+        if scope == "global":
+            selected_indexes = self._select_cluster_centroids(data, region=region)
+        else:
+            per_map_indexes = []
+            for data_slice in self._slices:
+                selected = self._select_cluster_centroids(
+                    data.iloc[data_slice],
+                    region=region,
+                )
+                if selected.size:
+                    per_map_indexes.append(selected)
+            selected_indexes = (
+                np.concatenate(per_map_indexes).astype(np.int64, copy=False)
+                if per_map_indexes
+                else np.array([], dtype=np.int64)
+            )
+
+        self._register_global_special_points(
+            selected_indexes,
+            kind=kind,
+            iteration=iteration,
+            label_status=label_status,
+            replace_kind=replace_kind,
+        )
+        special = self.get_special_points(kind=kind, label_status=None)
+        if special.empty:
+            return special
+        return special.loc[special["global_point_index"].isin(selected_indexes)].reset_index(
+            drop=True
+        )
 
     def build_graph(
         self,
@@ -292,43 +723,17 @@ class MultiMaps:
         self.graph_result = result
         return result
 
-    def rank_layers(
-        self,
-        *,
-        feature_columns: list[str] | None = None,
-        scale_features: bool = True,
-        completeness_weight: float = 1.0,
-        variance_weight: float = 1.0,
-        min_points: int = 1,
-    ) -> pd.DataFrame:
-        self._ensure_data()
-
-        frames: list[pd.DataFrame] = []
-        for map_index, (name, maps) in enumerate(zip(self.names, self.maps, strict=False)):
-            ranking = maps.rank_layers(
-                feature_columns=feature_columns,
-                scale_features=scale_features,
-                completeness_weight=completeness_weight,
-                variance_weight=variance_weight,
-                min_points=min_points,
-            ).copy()
-            ranking.insert(0, "system", name)
-            ranking.insert(0, "map_index", map_index)
-            frames.append(ranking)
-
-        result = pd.concat(frames, ignore_index=True)
-        self.layer_ranking = result.copy()
-        return result
-
     def select_archetypes(
         self,
         n_archetypes: int,
         *,
+        scope: str = "global",
         feature_columns: list[str] | None = None,
         graph: GraphResult | None = None,
         probability_column: str = "probability",
         region: int | None = None,
-        layer: int | Sequence[int] | None = None,
+        core_only: bool = False,
+        max_core_distance: float | None = None,
         min_probability: float | None = None,
         min_probability_quantile: float | None = 0.75,
         scale_features: bool = True,
@@ -345,6 +750,37 @@ class MultiMaps:
         label_status: str = "unlabeled",
         replace_kind: bool = True,
     ) -> ArchetypeSelectionResult:
+        scope = self._validate_scope(scope)
+        if scope == "per_map":
+            if graph is not None:
+                raise ValueError(
+                    "scope='per_map' does not accept a global graph. "
+                    "Build graphs on the child maps or omit graph."
+                )
+            return self._select_archetypes_per_map(
+                n_archetypes=n_archetypes,
+                feature_columns=feature_columns,
+                probability_column=probability_column,
+                region=region,
+                core_only=core_only,
+                max_core_distance=max_core_distance,
+                min_probability=min_probability,
+                min_probability_quantile=min_probability_quantile,
+                scale_features=scale_features,
+                selection_mode=selection_mode,
+                probability_weight=probability_weight,
+                extremeness_weight=extremeness_weight,
+                diversity_weight=diversity_weight,
+                endpointness_weight=endpointness_weight,
+                geodesic_weight=geodesic_weight,
+                branching_weight=branching_weight,
+                register=register,
+                kind=kind,
+                iteration=iteration,
+                label_status=label_status,
+                replace_kind=replace_kind,
+            )
+
         data = self._ensure_data()
         resolved_feature_columns = (
             list(feature_columns) if feature_columns is not None else list(self.features)
@@ -357,18 +793,22 @@ class MultiMaps:
             )
 
         candidate_mask: np.ndarray[Any, np.dtype[np.bool_]] | None = None
-        if region is not None or layer is not None:
+        if region is not None or core_only or max_core_distance is not None:
             candidate_mask = np.ones(len(point_table), dtype=bool)
             if region is not None:
                 candidate_mask &= (
                     self._collect_contactspace_column("region").astype(np.int64) == region
                 )
-            if layer is not None:
-                layer_values = self._collect_contactspace_column("layer").astype(np.int64)
-                requested_layers = _coerce_layer_values(layer)
-                candidate_mask &= np.isin(layer_values, requested_layers)
-                if min_probability is None and min_probability_quantile == 0.75:
-                    min_probability_quantile = None
+            candidate_mask &= self._core_selection_mask(
+                core_only=core_only,
+                max_core_distance=max_core_distance,
+            )
+            if (
+                (core_only or max_core_distance is not None)
+                and min_probability is None
+                and min_probability_quantile == 0.75
+            ):
+                min_probability_quantile = None
 
         selected_graph = graph if graph is not None else self.graph_result
         if selection_mode == "graph_endpoint" and selected_graph is None:
@@ -410,6 +850,170 @@ class MultiMaps:
             )
 
         return result
+
+    def select_special_points(
+        self,
+        npoints: int,
+        *,
+        scope: str = "global",
+        kind: str,
+        iteration: int | None = None,
+        label_status: str = "unlabeled",
+        replace_kind: bool = False,
+        store_selection_metadata: bool = True,
+        feature_columns: list[str] | None = None,
+        energy_column: str | None = None,
+        uncertainty_column: str | None = None,
+        special_point_indexes: npt.ArrayLike | None = None,
+        centroid_indexes: npt.ArrayLike | None = None,
+        region: int | None = None,
+        real_space_weight: float = 0.0,
+        feature_space_weight: float = 1.0,
+        energy_weight: float = 0.0,
+        uncertainty_weight: float = 0.0,
+        scale_features: bool = True,
+        energy_selection_mode: str = "global_minimum",
+        gradient_columns: list[str] | None = None,
+        gradient_norm_column: str | None = None,
+        curvature_columns: list[str] | None = None,
+        stationary_orders: int | Sequence[int] = 0,
+        gradient_tolerance: float = 1.0e-6,
+        curvature_tolerance: float = 1.0e-8,
+        **metadata: Any,
+    ) -> pd.DataFrame:
+        """Select and register special points either globally or independently per map."""
+        scope = self._validate_scope(scope)
+        if scope == "per_map":
+            frames: list[pd.DataFrame] = []
+            self._ensure_data()
+            for map_index, (name, maps) in enumerate(zip(self.names, self.maps, strict=False)):
+                selected = maps.select_special_points(
+                    npoints=npoints,
+                    kind=kind,
+                    iteration=iteration,
+                    label_status=label_status,
+                    replace_kind=replace_kind,
+                    store_selection_metadata=store_selection_metadata,
+                    feature_columns=feature_columns,
+                    energy_column=energy_column,
+                    uncertainty_column=uncertainty_column,
+                    special_point_indexes=special_point_indexes,
+                    centroid_indexes=centroid_indexes,
+                    region=region,
+                    real_space_weight=real_space_weight,
+                    feature_space_weight=feature_space_weight,
+                    energy_weight=energy_weight,
+                    uncertainty_weight=uncertainty_weight,
+                    scale_features=scale_features,
+                    energy_selection_mode=energy_selection_mode,
+                    gradient_columns=gradient_columns,
+                    gradient_norm_column=gradient_norm_column,
+                    curvature_columns=curvature_columns,
+                    stationary_orders=stationary_orders,
+                    gradient_tolerance=gradient_tolerance,
+                    curvature_tolerance=curvature_tolerance,
+                    **metadata,
+                )
+                frames.append(
+                    self._with_map_identity(
+                        selected,
+                        map_index=map_index,
+                        system_name=name,
+                        global_index_column=True,
+                    )
+                )
+            return self._combine_frames(frames)
+
+        selected = self._select_points_global(
+            npoints=npoints,
+            feature_columns=feature_columns,
+            energy_column=energy_column,
+            uncertainty_column=uncertainty_column,
+            special_point_indexes=special_point_indexes,
+            centroid_indexes=centroid_indexes,
+            region=region,
+            real_space_weight=real_space_weight,
+            feature_space_weight=feature_space_weight,
+            energy_weight=energy_weight,
+            uncertainty_weight=uncertainty_weight,
+            scale_features=scale_features,
+            energy_selection_mode=energy_selection_mode,
+            gradient_columns=gradient_columns,
+            gradient_norm_column=gradient_norm_column,
+            curvature_columns=curvature_columns,
+            stationary_orders=stationary_orders,
+            gradient_tolerance=gradient_tolerance,
+            curvature_tolerance=curvature_tolerance,
+        )
+
+        selected_global_indexes = selected.index.to_numpy(dtype=np.int64)
+        add_metadata = dict(metadata)
+        if store_selection_metadata:
+            for column in [
+                "selection_rank",
+                "selection_score",
+                "real_space_score",
+                "feature_space_score",
+                "energy_score",
+                "uncertainty_score",
+            ]:
+                if column in selected.columns and column not in add_metadata:
+                    add_metadata[column] = selected[column].to_numpy()
+
+        if replace_kind:
+            for maps in self.maps:
+                maps.special_points.remove(kind=kind)
+
+        for map_index, group in selected.groupby("map_index", sort=False):
+            group_positions = selected.index.get_indexer(group.index)
+            local_metadata: dict[str, Any] = {}
+            for column, value in add_metadata.items():
+                if np.isscalar(value) or value is None:
+                    local_metadata[column] = value
+                    continue
+                values = np.asarray(value, dtype=object).reshape(-1)
+                if values.size == len(selected):
+                    local_metadata[column] = values[group_positions]
+                else:
+                    local_metadata[column] = value
+
+            self.maps[int(map_index)].add_special_points(
+                group["point_index"].to_numpy(dtype=np.int64),
+                kind=kind,
+                iteration=iteration,
+                label_status=label_status,
+                replace_kind=False,
+                **local_metadata,
+            )
+
+        special = self.get_special_points(kind=kind, label_status=None)
+        if special.empty:
+            return special
+        special = special.loc[special["global_point_index"].isin(selected_global_indexes)].copy()
+        if "selection_rank" in special.columns:
+            return special.sort_values("selection_rank").reset_index(drop=True)
+        return special.reset_index(drop=True)
+
+    def get_special_points(
+        self,
+        *,
+        kind: str | None = None,
+        label_status: str | Sequence[str] | None = None,
+    ) -> pd.DataFrame:
+        """Return special points from all child maps with map and global indexes attached."""
+        self._ensure_data()
+        frames = []
+        for map_index, (name, maps) in enumerate(zip(self.names, self.maps, strict=False)):
+            frame = maps.get_special_points(kind=kind, label_status=label_status)
+            frames.append(
+                self._with_map_identity(
+                    frame,
+                    map_index=map_index,
+                    system_name=name,
+                    global_index_column=True,
+                )
+            )
+        return self._combine_frames(frames)
 
     def propagate_archetypes(
         self,
@@ -511,6 +1115,801 @@ class MultiMaps:
 
         return result
 
+    def _compute_feature_targets_serial(
+        self,
+        targets: Sequence[int],
+        *,
+        point_workers: int | None,
+        checkpoint: str | Path | None,
+        checkpoint_every: int,
+        release_contactspace_cache: bool,
+        checkpoint_mode: str,
+        progress: bool,
+        threadpool_threads: int | None,
+    ) -> None:
+        if checkpoint_every <= 0:
+            raise ValueError("checkpoint_every must be positive")
+
+        for completed, index in enumerate(targets, start=1):
+            maps = self.maps[index]
+            if maps.contactspace is None:
+                raise RuntimeError("Each Maps instance must define a contact space")
+            self._feature_progress(
+                progress,
+                (
+                    f"starting map {index} ({self._map_name(index)}) "
+                    f"{completed}/{len(targets)} with point_workers={point_workers}"
+                ),
+            )
+            start = time.perf_counter()
+            with _threadpool_context(threadpool_threads):
+                maps.atcontactspace(
+                    workers=point_workers,
+                    release_contactspace_cache=release_contactspace_cache,
+                )
+            elapsed = time.perf_counter() - start
+            npoints = 0 if maps.data is None else len(maps.data)
+            self._feature_progress(
+                progress,
+                (
+                    f"finished map {index} ({self._map_name(index)}) "
+                    f"{completed}/{len(targets)} in {elapsed:.1f}s ({npoints} points)"
+                ),
+            )
+            self.data = None
+            if checkpoint is not None and completed % checkpoint_every == 0:
+                checkpoint_start = time.perf_counter()
+                if checkpoint_mode == "maps":
+                    path = self._save_map_feature_checkpoint(checkpoint, index)
+                else:
+                    path = self._save_feature_checkpoint(checkpoint)
+                self._feature_progress(
+                    progress,
+                    (
+                        f"checkpointed map {index} in "
+                        f"{time.perf_counter() - checkpoint_start:.1f}s -> {path}"
+                    ),
+                )
+
+    def _feature_target_indexes(
+        self,
+        *,
+        recompute: bool,
+        map_indexes: npt.ArrayLike | None,
+    ) -> list[int]:
+        if map_indexes is None:
+            selected = list(range(len(self.maps)))
+        else:
+            selected = [int(index) for index in np.asarray(map_indexes, dtype=np.int64).reshape(-1)]
+
+        targets = []
+        for index in selected:
+            if index < 0 or index >= len(self.maps):
+                raise IndexError(f"map index {index} out of range for {len(self.maps)} maps")
+            if recompute or self.maps[index].data is None:
+                targets.append(index)
+        return targets
+
+    def _all_maps_have_data(self) -> bool:
+        return all(maps.data is not None for maps in self.maps)
+
+    def _partial_feature_dataset(self) -> pd.DataFrame:
+        frames: list[pd.DataFrame] = []
+        reference_features: list[str] | None = None
+        for index, (name, maps) in enumerate(zip(self.names, self.maps, strict=False)):
+            if maps.data is None:
+                continue
+            frame = maps.data.copy()
+            self._attach_map_metadata(index, maps, frame)
+            current_features = self._get_map_features(maps)
+            if reference_features is None:
+                reference_features = current_features
+            elif set(current_features) != set(reference_features):
+                raise ValueError("All completed maps must expose the same feature columns")
+            metadata_columns = [
+                column
+                for column in self._METADATA_COLUMNS
+                if column in frame.columns and column not in current_features
+            ]
+            ordered = frame.loc[:, ["x", "y", "z", *metadata_columns, *current_features]].copy()
+            ordered.insert(0, "point_index", np.arange(len(ordered), dtype=np.int64))
+            ordered.insert(0, "map_index", index)
+            ordered.insert(0, "system", name)
+            frames.append(ordered)
+
+        if not frames:
+            return pd.DataFrame()
+        return pd.concat(frames, ignore_index=True)
+
+    def _save_feature_checkpoint(self, checkpoint: str | Path) -> Path:
+        current_data = self.data
+        self.data = None if not self._all_maps_have_data() else self.data
+        try:
+            return self.save(checkpoint)
+        finally:
+            self.data = current_data
+
+    def _save_map_feature_checkpoint(self, checkpoint: str | Path, index: int) -> Path:
+        directory = self._map_checkpoint_directory(checkpoint)
+        directory.mkdir(parents=True, exist_ok=True)
+        return self.maps[index].save(self._map_checkpoint_path(checkpoint, index))
+
+    def _load_map_feature_checkpoints(
+        self,
+        checkpoint: str | Path,
+        *,
+        map_indexes: npt.ArrayLike | None,
+    ) -> None:
+        indexes = self._feature_target_indexes(
+            recompute=True,
+            map_indexes=map_indexes,
+        )
+        for index in indexes:
+            path = self._map_checkpoint_path(checkpoint, index)
+            if not path.exists():
+                continue
+            loaded = self.maps[index].__class__.load(path)
+            if loaded.data is not None:
+                self.maps[index] = loaded
+
+    @staticmethod
+    def _map_checkpoint_directory(checkpoint: str | Path) -> Path:
+        path = Path(checkpoint).expanduser().resolve()
+        return path.with_name(f"{path.name}.maps")
+
+    @classmethod
+    def _map_checkpoint_path(cls, checkpoint: str | Path, index: int) -> Path:
+        return cls._map_checkpoint_directory(checkpoint) / f"map_{index:05d}.pkl"
+
+    @staticmethod
+    def _normalize_feature_parallelism(parallel: str | bool) -> str:
+        if isinstance(parallel, bool):
+            return "maps" if parallel else "none"
+        normalized = str(parallel).lower()
+        aliases = {
+            "false": "none",
+            "no": "none",
+            "off": "none",
+            "serial": "none",
+            "map": "maps",
+            "per_map": "maps",
+            "structures": "maps",
+            "structure": "maps",
+            "point": "points",
+        }
+        normalized = aliases.get(normalized, normalized)
+        if normalized not in {"points", "maps", "none"}:
+            raise ValueError(
+                "parallel must be one of 'points', 'maps', or 'none', " f"got {parallel!r}."
+            )
+        return normalized
+
+    @staticmethod
+    def _normalize_checkpoint_mode(checkpoint_mode: str) -> str:
+        normalized = str(checkpoint_mode).lower()
+        aliases = {
+            "object": "full",
+            "global": "full",
+            "whole": "full",
+            "map": "maps",
+            "per_map": "maps",
+            "sidecar": "maps",
+        }
+        normalized = aliases.get(normalized, normalized)
+        if normalized not in {"full", "maps"}:
+            raise ValueError(
+                "checkpoint_mode must be either 'full' or 'maps', " f"got {checkpoint_mode!r}."
+            )
+        return normalized
+
+    @staticmethod
+    def _resolve_feature_workers(workers: int | None, ntargets: int) -> int:
+        if ntargets <= 1:
+            return 1
+        if workers is None:
+            return max(1, min(4, os.cpu_count() or 1, ntargets))
+        if workers <= 0:
+            return max(1, min(4, os.cpu_count() or 1, ntargets))
+        return max(1, min(int(workers), ntargets))
+
+    def _select_archetypes_per_map(
+        self,
+        *,
+        n_archetypes: int,
+        feature_columns: list[str] | None,
+        probability_column: str,
+        region: int | None,
+        core_only: bool,
+        max_core_distance: float | None,
+        min_probability: float | None,
+        min_probability_quantile: float | None,
+        scale_features: bool,
+        selection_mode: ArchetypeSelectionMode,
+        probability_weight: float,
+        extremeness_weight: float,
+        diversity_weight: float,
+        endpointness_weight: float,
+        geodesic_weight: float,
+        branching_weight: float,
+        register: bool,
+        kind: str,
+        iteration: int | None,
+        label_status: str,
+        replace_kind: bool,
+    ) -> ArchetypeSelectionResult:
+        self._ensure_data()
+        candidate_frames: list[pd.DataFrame] = []
+        archetype_frames: list[pd.DataFrame] = []
+        candidate_indexes: list[np.ndarray[Any, np.dtype[np.int64]]] = []
+        selected_indexes: list[np.ndarray[Any, np.dtype[np.int64]]] = []
+        feature_result: list[str] | None = None
+        metadata: dict[str, Any] | None = None
+
+        for map_index, (name, maps) in enumerate(zip(self.names, self.maps, strict=False)):
+            result = maps.select_archetypes(
+                n_archetypes=n_archetypes,
+                feature_columns=feature_columns,
+                probability_column=probability_column,
+                region=region,
+                core_only=core_only,
+                max_core_distance=max_core_distance,
+                min_probability=min_probability,
+                min_probability_quantile=min_probability_quantile,
+                scale_features=scale_features,
+                selection_mode=selection_mode,
+                probability_weight=probability_weight,
+                extremeness_weight=extremeness_weight,
+                diversity_weight=diversity_weight,
+                endpointness_weight=endpointness_weight,
+                geodesic_weight=geodesic_weight,
+                branching_weight=branching_weight,
+                register=register,
+                kind=kind,
+                iteration=iteration,
+                label_status=label_status,
+                replace_kind=replace_kind,
+            )
+
+            candidate_frame = self._with_map_identity(
+                result.candidate_table,
+                map_index=map_index,
+                system_name=name,
+                global_index_column=True,
+            )
+            archetype_frame = self._with_map_identity(
+                result.archetype_table,
+                map_index=map_index,
+                system_name=name,
+                global_index_column=True,
+            )
+            candidate_frames.append(candidate_frame)
+            archetype_frames.append(archetype_frame)
+            candidate_indexes.append(candidate_frame["global_point_index"].to_numpy(dtype=np.int64))
+            selected_indexes.append(archetype_frame["global_point_index"].to_numpy(dtype=np.int64))
+            if feature_result is None:
+                feature_result = list(result.feature_columns)
+            if metadata is None:
+                metadata = dict(result.metadata or {})
+
+        combined_candidates = self._combine_frames(candidate_frames)
+        combined_archetypes = self._combine_frames(archetype_frames)
+        if "selection_rank" in combined_archetypes.columns:
+            combined_archetypes = combined_archetypes.sort_values(
+                ["map_index", "selection_rank"]
+            ).reset_index(drop=True)
+
+        combined_result = ArchetypeSelectionResult(
+            feature_columns=feature_result or list(feature_columns or self.features),
+            probability_column=probability_column,
+            candidate_indexes=(
+                np.concatenate(candidate_indexes).astype(np.int64, copy=False)
+                if candidate_indexes
+                else np.array([], dtype=np.int64)
+            ),
+            selected_indexes=(
+                np.concatenate(selected_indexes).astype(np.int64, copy=False)
+                if selected_indexes
+                else np.array([], dtype=np.int64)
+            ),
+            candidate_table=combined_candidates,
+            archetype_table=combined_archetypes,
+            metadata={
+                **(metadata or {}),
+                "scope": "per_map",
+                "n_archetypes_per_map": n_archetypes,
+                "point_index_column": "global_point_index",
+            },
+        )
+        self.archetype_selection_result = combined_result
+        return combined_result
+
+    def _select_points_global(
+        self,
+        *,
+        npoints: int,
+        feature_columns: list[str] | None,
+        energy_column: str | None,
+        uncertainty_column: str | None,
+        special_point_indexes: npt.ArrayLike | None,
+        centroid_indexes: npt.ArrayLike | None,
+        region: int | None,
+        real_space_weight: float,
+        feature_space_weight: float,
+        energy_weight: float,
+        uncertainty_weight: float,
+        scale_features: bool,
+        energy_selection_mode: str,
+        gradient_columns: list[str] | None,
+        gradient_norm_column: str | None,
+        curvature_columns: list[str] | None,
+        stationary_orders: int | Sequence[int],
+        gradient_tolerance: float,
+        curvature_tolerance: float,
+    ) -> pd.DataFrame:
+        if npoints <= 0:
+            raise ValueError("npoints must be positive")
+
+        data = self._ensure_data()
+        weights = np.array(
+            [real_space_weight, feature_space_weight, energy_weight, uncertainty_weight],
+            dtype=np.float64,
+        )
+        if np.any(weights < 0.0):
+            raise ValueError("Selection weights must be non-negative")
+        if not np.any(weights > 0.0):
+            raise ValueError("At least one selection weight must be positive")
+
+        frame = data.copy()
+        if region is not None:
+            if "region" not in frame.columns:
+                frame.loc[:, "region"] = self._collect_contactspace_column("region")
+            frame = frame.loc[frame["region"].to_numpy(dtype=np.int64) == region].copy()
+
+        if frame.empty:
+            raise RuntimeError("No candidate points available for selection")
+
+        seed_source = (
+            special_point_indexes if special_point_indexes is not None else centroid_indexes
+        )
+        if seed_source is None:
+            seed_indexes = self._global_special_point_indexes()
+        else:
+            seed_indexes = np.asarray(seed_source, dtype=np.int64).reshape(-1)
+        seed_indexes = seed_indexes[np.isin(seed_indexes, frame.index.to_numpy())]
+
+        candidate_frame = frame.drop(index=seed_indexes, errors="ignore").copy()
+        if candidate_frame.empty:
+            raise RuntimeError("No candidate points remain after excluding seed points")
+        if npoints > len(candidate_frame):
+            raise ValueError(
+                f"Requested {npoints} points, but only {len(candidate_frame)} candidates are available."
+            )
+
+        resolved_feature_columns = self._resolve_selection_feature_columns(
+            feature_columns,
+            energy_column=energy_column,
+            uncertainty_column=uncertainty_column,
+            feature_space_weight=feature_space_weight,
+        )
+
+        real_candidates = candidate_frame[["x", "y", "z"]].to_numpy(dtype=np.float64)
+        real_seeds = frame.loc[seed_indexes, ["x", "y", "z"]].to_numpy(dtype=np.float64)
+
+        if resolved_feature_columns:
+            full_features = frame.loc[:, resolved_feature_columns].to_numpy(dtype=np.float64)
+            if scale_features:
+                full_features = StandardScaler().fit_transform(full_features)
+            feature_frame = pd.DataFrame(
+                full_features,
+                index=frame.index,
+                columns=resolved_feature_columns,
+            )
+            feature_candidates = feature_frame.loc[candidate_frame.index].to_numpy(dtype=np.float64)
+            feature_seeds = feature_frame.loc[seed_indexes].to_numpy(dtype=np.float64)
+        else:
+            feature_candidates = np.zeros((len(candidate_frame), 0), dtype=np.float64)
+            feature_seeds = np.zeros((len(seed_indexes), 0), dtype=np.float64)
+
+        energy_values = (
+            candidate_frame[energy_column].to_numpy(dtype=np.float64)
+            if energy_column is not None
+            else np.zeros(len(candidate_frame), dtype=np.float64)
+        )
+        uncertainty_values = (
+            candidate_frame[uncertainty_column].to_numpy(dtype=np.float64)
+            if uncertainty_column is not None
+            else np.zeros(len(candidate_frame), dtype=np.float64)
+        )
+
+        remaining = np.arange(len(candidate_frame), dtype=np.int64)
+        selected_local: list[int] = []
+        selected_real: list[npt.NDArray[np.float64]] = []
+        selected_feature: list[npt.NDArray[np.float64]] = []
+        records: list[dict[str, Any]] = []
+
+        for rank in range(npoints):
+            current_real = real_candidates[remaining]
+            current_feature = feature_candidates[remaining]
+            current_energy = energy_values[remaining]
+            current_uncertainty = uncertainty_values[remaining]
+
+            real_refs = self._stack_references(real_seeds, selected_real, width=3)
+            feature_refs = self._stack_references(
+                feature_seeds,
+                selected_feature,
+                width=feature_candidates.shape[1],
+            )
+
+            real_component = (
+                self._normalize_component(self._min_distance_to_references(current_real, real_refs))
+                if real_space_weight > 0.0
+                else np.zeros(len(remaining), dtype=np.float64)
+            )
+            feature_component = (
+                self._normalize_component(
+                    self._min_distance_to_references(current_feature, feature_refs)
+                )
+                if feature_space_weight > 0.0
+                else np.zeros(len(remaining), dtype=np.float64)
+            )
+            energy_component = (
+                self._energy_component(
+                    candidate_frame.iloc[remaining],
+                    energy_values=current_energy,
+                    energy_column=energy_column,
+                    energy_selection_mode=energy_selection_mode,
+                    gradient_columns=gradient_columns,
+                    gradient_norm_column=gradient_norm_column,
+                    curvature_columns=curvature_columns,
+                    stationary_orders=stationary_orders,
+                    gradient_tolerance=gradient_tolerance,
+                    curvature_tolerance=curvature_tolerance,
+                )
+                if energy_weight > 0.0
+                else np.zeros(len(remaining), dtype=np.float64)
+            )
+            uncertainty_component = (
+                self._normalize_component(current_uncertainty)
+                if uncertainty_weight > 0.0
+                else np.zeros(len(remaining), dtype=np.float64)
+            )
+
+            total_score = (
+                real_space_weight * real_component
+                + feature_space_weight * feature_component
+                + energy_weight * energy_component
+                + uncertainty_weight * uncertainty_component
+            )
+
+            best_position = int(np.argmax(total_score))
+            best_local = int(remaining[best_position])
+            best_index = candidate_frame.index[best_local]
+
+            selected_local.append(best_local)
+            selected_real.append(real_candidates[best_local])
+            if feature_candidates.shape[1] > 0:
+                selected_feature.append(feature_candidates[best_local])
+
+            records.append(
+                {
+                    "selection_rank": rank,
+                    "selection_score": float(total_score[best_position]),
+                    "real_space_score": float(real_component[best_position]),
+                    "feature_space_score": float(feature_component[best_position]),
+                    "energy_score": float(energy_component[best_position]),
+                    "uncertainty_score": float(uncertainty_component[best_position]),
+                    "global_point_index": int(best_index),
+                }
+            )
+
+            remaining = np.delete(remaining, best_position)
+
+        selection = candidate_frame.loc[[record["global_point_index"] for record in records]].copy()
+        selection.loc[:, "global_point_index"] = selection.index.to_numpy(dtype=np.int64)
+        selection.loc[:, "selection_rank"] = [record["selection_rank"] for record in records]
+        selection.loc[:, "selection_score"] = [record["selection_score"] for record in records]
+        selection.loc[:, "real_space_score"] = [record["real_space_score"] for record in records]
+        selection.loc[:, "feature_space_score"] = [
+            record["feature_space_score"] for record in records
+        ]
+        selection.loc[:, "energy_score"] = [record["energy_score"] for record in records]
+        selection.loc[:, "uncertainty_score"] = [record["uncertainty_score"] for record in records]
+        return selection.sort_values("selection_rank")
+
+    def _resolve_selection_feature_columns(
+        self,
+        feature_columns: list[str] | None,
+        *,
+        energy_column: str | None,
+        uncertainty_column: str | None,
+        feature_space_weight: float,
+    ) -> list[str]:
+        if feature_columns is not None:
+            return list(feature_columns)
+        if feature_space_weight <= 0.0:
+            return []
+
+        if self.cluster_features:
+            return list(self.cluster_features)
+
+        excluded = {"Cluster"}
+        if energy_column is not None:
+            excluded.add(energy_column)
+        if uncertainty_column is not None:
+            excluded.add(uncertainty_column)
+        return [column for column in self.features if column not in excluded]
+
+    def _global_special_point_indexes(self) -> np.ndarray[Any, np.dtype[np.int64]]:
+        indexes: list[np.ndarray[Any, np.dtype[np.int64]]] = []
+        self._ensure_data()
+        for maps, data_slice in zip(self.maps, self._slices, strict=False):
+            local_indexes = maps.special_points.reference_indexes()
+            if local_indexes.size == 0:
+                continue
+            indexes.append(local_indexes.astype(np.int64, copy=False) + data_slice.start)
+        if not indexes:
+            return np.array([], dtype=np.int64)
+        return np.unique(np.concatenate(indexes).astype(np.int64, copy=False))
+
+    def _select_cluster_centroids(
+        self,
+        frame: pd.DataFrame,
+        *,
+        region: int,
+    ) -> np.ndarray[Any, np.dtype[np.int64]]:
+        if (
+            self.cluster_centers is None
+            or self.cluster_edges is None
+            or self.cluster_result is None
+        ):
+            raise RuntimeError("No clusters have been generated.")
+        cluster_sizes = self.cluster_result.sizes
+        if cluster_sizes is None:
+            raise RuntimeError("No cluster sizes are available.")
+
+        filterdata = frame.loc[frame["region"].to_numpy(dtype=np.int64) == region].copy()
+        if filterdata.empty:
+            return np.array([], dtype=np.int64)
+
+        centroid_indexes = []
+        cluster_values = np.unique(filterdata["Cluster"].to_numpy(dtype=np.int64))
+        for cluster_index in cluster_values:
+            if cluster_index < 0:
+                continue
+            cluster_data = filterdata.loc[filterdata["Cluster"] == cluster_index]
+            if cluster_data.empty:
+                continue
+
+            cluster_points = cluster_data[self.cluster_features].to_numpy(dtype=np.float64)
+            cluster_global_indexes = cluster_data.index.to_numpy(dtype=np.int64)
+            dist = distance.cdist(cluster_points, self.cluster_centers)
+            connected_indexes = np.where(self.cluster_edges[cluster_index, :] != 0)[0]
+            if connected_indexes.size == 0:
+                cluster_centroid = int(np.argmin(dist[:, cluster_index]))
+            else:
+                full_dist = np.sum(
+                    cluster_sizes[connected_indexes] / dist[:, connected_indexes] ** 2,
+                    axis=1,
+                )
+                cluster_centroid = int(np.argmin(full_dist))
+            centroid_indexes.append(cluster_global_indexes[cluster_centroid])
+
+        if not centroid_indexes:
+            return np.array([], dtype=np.int64)
+        return np.asarray(centroid_indexes, dtype=np.int64)
+
+    def _register_global_special_points(
+        self,
+        global_point_indexes: npt.ArrayLike,
+        *,
+        kind: str,
+        iteration: int | None,
+        label_status: str,
+        replace_kind: bool,
+    ) -> None:
+        indexes = np.asarray(global_point_indexes, dtype=np.int64).reshape(-1)
+        if replace_kind:
+            for maps in self.maps:
+                maps.special_points.remove(kind=kind)
+        if indexes.size == 0:
+            return
+
+        data = self._ensure_data()
+        selected = data.loc[indexes, ["map_index", "point_index"]].copy()
+        for map_index, group in selected.groupby("map_index", sort=False):
+            self.maps[int(map_index)].add_special_points(
+                group["point_index"].to_numpy(dtype=np.int64),
+                kind=kind,
+                iteration=iteration,
+                label_status=label_status,
+                replace_kind=False,
+            )
+
+    def _with_map_identity(
+        self,
+        frame: pd.DataFrame,
+        *,
+        map_index: int,
+        system_name: str,
+        global_index_column: bool = False,
+    ) -> pd.DataFrame:
+        result = frame.copy()
+        if "system" in result.columns:
+            result.loc[:, "system"] = system_name
+        else:
+            result.insert(0, "system", system_name)
+        if "map_index" in result.columns:
+            result.loc[:, "map_index"] = map_index
+        else:
+            result.insert(1, "map_index", map_index)
+
+        if global_index_column and "point_index" in result.columns:
+            local_indexes = result["point_index"].to_numpy(dtype=np.int64)
+            global_indexes = local_indexes + self._slices[map_index].start
+            if "global_point_index" in result.columns:
+                result.loc[:, "global_point_index"] = global_indexes
+            else:
+                result.insert(2, "global_point_index", global_indexes)
+        return result
+
+    @staticmethod
+    def _combine_frames(frames: Sequence[pd.DataFrame]) -> pd.DataFrame:
+        nonempty = [frame for frame in frames if not frame.empty]
+        if nonempty:
+            return pd.concat(nonempty, ignore_index=True)
+        return pd.DataFrame()
+
+    @staticmethod
+    def _validate_scope(scope: str) -> str:
+        normalized = scope.lower()
+        if normalized not in {"global", "per_map"}:
+            raise ValueError(f"scope must be 'global' or 'per_map', got {scope!r}.")
+        return normalized
+
+    def _energy_component(
+        self,
+        frame: pd.DataFrame,
+        *,
+        energy_values: npt.NDArray[np.float64],
+        energy_column: str | None,
+        energy_selection_mode: str,
+        gradient_columns: list[str] | None,
+        gradient_norm_column: str | None,
+        curvature_columns: list[str] | None,
+        stationary_orders: int | Sequence[int],
+        gradient_tolerance: float,
+        curvature_tolerance: float,
+    ) -> npt.NDArray[np.float64]:
+        if energy_column is None:
+            raise ValueError("energy_column is required when energy_weight > 0")
+
+        mode = energy_selection_mode.lower()
+        if mode == "global_minimum":
+            return self._normalize_component(-energy_values)
+        if mode != "stationary":
+            raise ValueError(
+                "energy_selection_mode must be 'global_minimum' or 'stationary', "
+                f"got {energy_selection_mode!r}."
+            )
+
+        stationary_mask = self._stationary_mask(
+            frame,
+            gradient_columns=gradient_columns,
+            gradient_norm_column=gradient_norm_column,
+            curvature_columns=curvature_columns,
+            stationary_orders=stationary_orders,
+            gradient_tolerance=gradient_tolerance,
+            curvature_tolerance=curvature_tolerance,
+        )
+        component = np.zeros(len(frame), dtype=np.float64)
+        if not np.any(stationary_mask):
+            return component
+
+        stationary_energies = energy_values[stationary_mask]
+        if stationary_energies.size == 1:
+            component[stationary_mask] = 1.0
+            return component
+
+        component[stationary_mask] = 0.5 + 0.5 * self._normalize_component(-stationary_energies)
+        return component
+
+    def _stationary_mask(
+        self,
+        frame: pd.DataFrame,
+        *,
+        gradient_columns: list[str] | None,
+        gradient_norm_column: str | None,
+        curvature_columns: list[str] | None,
+        stationary_orders: int | Sequence[int],
+        gradient_tolerance: float,
+        curvature_tolerance: float,
+    ) -> npt.NDArray[np.bool_]:
+        gradient_norm = self._gradient_norm(
+            frame,
+            gradient_columns=gradient_columns,
+            gradient_norm_column=gradient_norm_column,
+        )
+        curvature_values = self._curvature_values(frame, curvature_columns=curvature_columns)
+        negative_counts = np.sum(curvature_values < -curvature_tolerance, axis=1)
+        positive_counts = np.sum(curvature_values > curvature_tolerance, axis=1)
+        fully_classified = (negative_counts + positive_counts) == curvature_values.shape[1]
+
+        if isinstance(stationary_orders, int):
+            orders = {stationary_orders}
+        else:
+            orders = {int(order) for order in stationary_orders}
+        if any(order < 0 for order in orders):
+            raise ValueError("stationary_orders must be non-negative")
+
+        return (
+            (gradient_norm <= gradient_tolerance)
+            & fully_classified
+            & np.isin(negative_counts, list(orders))
+        )
+
+    @staticmethod
+    def _gradient_norm(
+        frame: pd.DataFrame,
+        *,
+        gradient_columns: list[str] | None,
+        gradient_norm_column: str | None,
+    ) -> npt.NDArray[np.float64]:
+        if gradient_norm_column is not None:
+            return np.abs(frame[gradient_norm_column].to_numpy(dtype=np.float64))
+        if gradient_columns is not None:
+            gradient_values = frame.loc[:, gradient_columns].to_numpy(dtype=np.float64)
+            return np.linalg.norm(gradient_values, axis=1)
+        raise ValueError(
+            "Stationary-point energy selection requires gradient_norm_column or gradient_columns."
+        )
+
+    @staticmethod
+    def _curvature_values(
+        frame: pd.DataFrame,
+        *,
+        curvature_columns: list[str] | None,
+    ) -> npt.NDArray[np.float64]:
+        if not curvature_columns:
+            raise ValueError("Stationary-point energy selection requires curvature_columns.")
+        return frame.loc[:, curvature_columns].to_numpy(dtype=np.float64)
+
+    @staticmethod
+    def _normalize_component(
+        values: npt.NDArray[np.float64],
+    ) -> npt.NDArray[np.float64]:
+        if values.size == 0:
+            return values
+        vmin = float(np.min(values))
+        vmax = float(np.max(values))
+        if np.isclose(vmax, vmin):
+            return np.zeros_like(values)
+        return (values - vmin) / (vmax - vmin)
+
+    @staticmethod
+    def _min_distance_to_references(
+        points: npt.NDArray[np.float64],
+        references: npt.NDArray[np.float64],
+    ) -> npt.NDArray[np.float64]:
+        if points.size == 0:
+            return np.zeros(0, dtype=np.float64)
+        if references.size == 0:
+            return np.zeros(points.shape[0], dtype=np.float64)
+        return np.min(distance.cdist(points, references), axis=1)
+
+    @staticmethod
+    def _stack_references(
+        seeds: npt.NDArray[np.float64],
+        selected: list[npt.NDArray[np.float64]],
+        *,
+        width: int,
+    ) -> npt.NDArray[np.float64]:
+        selected_array = np.vstack(selected) if selected else np.zeros((0, width), dtype=np.float64)
+        if seeds.size == 0:
+            return selected_array
+        if selected_array.size == 0:
+            return seeds
+        return np.vstack([seeds, selected_array])
+
     def _build_dataset(self, recompute: bool) -> pd.DataFrame:
         frames: list[pd.DataFrame] = []
         reference_features: list[str] | None = None
@@ -552,6 +1951,68 @@ class MultiMaps:
         if self.data is None:
             return self._build_dataset(recompute=False)
         return self.data
+
+    def _core_selection_mask(
+        self,
+        *,
+        core_only: bool = False,
+        max_core_distance: float | None = None,
+    ) -> np.ndarray[Any, np.dtype[np.bool_]]:
+        data = self._ensure_data()
+        mask = np.ones(len(data), dtype=bool)
+        if not core_only and max_core_distance is None:
+            return mask
+
+        if core_only:
+            if "is_core" in data.columns:
+                mask &= data["is_core"].to_numpy(dtype=bool)
+            else:
+                values: list[np.ndarray[Any, np.dtype[np.bool_]]] = []
+                for maps in self.maps:
+                    if maps.contactspace is None or "is_core" not in maps.contactspace.data.columns:
+                        raise ValueError(
+                            "core_only=True requires the is_core annotation. "
+                            "Set core_tolerance during contact-space generation or use max_core_distance."
+                        )
+                    values.append(maps.contactspace.data["is_core"].to_numpy(dtype=bool))
+                mask &= np.concatenate(values)
+
+        if max_core_distance is not None:
+            mask &= self._collect_contactspace_column("core_distance").astype(np.float64) <= float(
+                max_core_distance
+            )
+
+        return mask
+
+    @staticmethod
+    def _subset_graph_result(
+        graph: GraphResult,
+        mask: np.ndarray[Any, np.dtype[np.bool_]],
+    ) -> GraphResult:
+        indexes = np.flatnonzero(mask).astype(np.int64, copy=False)
+        remap = -np.ones(len(mask), dtype=np.int64)
+        remap[indexes] = np.arange(len(indexes), dtype=np.int64)
+
+        edge_table = graph.edge_table.copy()
+        if not edge_table.empty:
+            sources = edge_table["source"].to_numpy(dtype=np.int64)
+            targets = edge_table["target"].to_numpy(dtype=np.int64)
+            edge_mask = np.isin(sources, indexes) & np.isin(targets, indexes)
+            edge_table = edge_table.loc[edge_mask].copy()
+            edge_table.loc[:, "source"] = remap[edge_table["source"].to_numpy(dtype=np.int64)]
+            edge_table.loc[:, "target"] = remap[edge_table["target"].to_numpy(dtype=np.int64)]
+            edge_table = edge_table.reset_index(drop=True)
+
+        return GraphResult(
+            mode=graph.mode,
+            feature_columns=list(graph.feature_columns),
+            node_weight_column=graph.node_weight_column,
+            node_table=graph.node_table.iloc[indexes].reset_index(drop=True).copy(),
+            node_weights=graph.node_weights[indexes].astype(np.float64, copy=True),
+            edge_table=edge_table,
+            matrix=graph.matrix[indexes][:, indexes].tocsr(),
+            metadata=deepcopy(graph.metadata),
+        )
 
     def _get_map_frame(self, maps: "Maps", recompute: bool) -> pd.DataFrame:
         if recompute or maps.data is None:
@@ -694,14 +2155,10 @@ class MultiMaps:
 
 class MultiMapsFromFile(MultiMaps):
     def __init__(self, filename: str) -> None:
-        from mapsy.io.parser import ContactSpaceGenerator, SystemParser
+        from mapsy.io.parser import SystemParser
         from mapsy.maps import (
-            Maps,
-            _namespace_contactspace,
-            _namespace_symmetryfunctions,
             _namespace_system,
         )
-        from mapsy.symfunc.parser import SymmetryFunctionsParser
 
         with open(Path(filename).expanduser().resolve()) as handle:
             params = load(handle, SafeLoader) or {}
@@ -729,16 +2186,16 @@ class MultiMapsFromFile(MultiMaps):
                 "MultiMapsFromFile does not support per-system properties yet."
             )
 
-        maps_list = []
-        for path in system_files:
-            system = system_parser.parse_file(path)
-            parsed_symmetryfunctions = SymmetryFunctionsParser(
-                _namespace_symmetryfunctions(symmetryfunctions)
-            ).parse()
-            parsed_contactspace = ContactSpaceGenerator(
-                _namespace_contactspace(contactspace)
-            ).generate(system)
-            maps_list.append(Maps(system, parsed_symmetryfunctions, parsed_contactspace))
+        workers = _resolve_multimaps_workers(control, len(system_files))
+        tasks = [
+            (path, str(basepath), system, symmetryfunctions, contactspace) for path in system_files
+        ]
+
+        if workers > 1:
+            with ProcessingPool(nodes=workers) as pool:
+                maps_list = list(pool.map(_build_maps_from_file_worker, tasks))
+        else:
+            maps_list = [_build_maps_from_file_worker(task) for task in tasks]
 
         super().__init__(
             maps_list,
@@ -747,3 +2204,4 @@ class MultiMapsFromFile(MultiMaps):
         )
         self.debug = bool(control.get("debug", False))
         self.verbosity = int(control.get("verbosity", 0))
+        self.workers = workers

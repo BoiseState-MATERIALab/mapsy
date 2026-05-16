@@ -21,7 +21,7 @@ from mapsy.io.parser import resolve_file_model, resolve_file_records
 
 
 class FakeMaps:
-    _metadata_columns = {"region", "layer"}
+    _metadata_columns = {"region", "core_distance", "is_core"}
 
     def __init__(self, frame: pd.DataFrame) -> None:
         self._frame = frame
@@ -75,7 +75,8 @@ def test_multimaps_combines_contact_space_data() -> None:
                 "y": [0.0, 1.0],
                 "z": [0.0, 0.0],
                 "region": [0, 0],
-                "layer": [1, 1],
+                "core_distance": [0.1, 0.2],
+                "is_core": [True, True],
                 "f1": [0.1, 0.2],
                 "f2": [1.0, 1.1],
             }
@@ -88,7 +89,8 @@ def test_multimaps_combines_contact_space_data() -> None:
                 "y": [2.0, 3.0],
                 "z": [0.0, 0.0],
                 "region": [1, 1],
-                "layer": [0, 1],
+                "core_distance": [0.3, 0.4],
+                "is_core": [False, False],
                 "f1": [0.3, 0.4],
                 "f2": [1.2, 1.3],
             }
@@ -100,12 +102,14 @@ def test_multimaps_combines_contact_space_data() -> None:
 
     assert multimaps.features == ["f1", "f2"]
     assert "region" not in multimaps.features
-    assert "layer" not in multimaps.features
+    assert "core_distance" not in multimaps.features
+    assert "is_core" not in multimaps.features
     assert combined["system"].tolist() == ["a", "a", "b", "b"]
     assert combined["map_index"].tolist() == [0, 0, 1, 1]
     assert combined["point_index"].tolist() == [0, 1, 0, 1]
     assert combined["region"].tolist() == [0, 0, 1, 1]
-    assert combined["layer"].tolist() == [1, 1, 0, 1]
+    assert combined["core_distance"].tolist() == [0.1, 0.2, 0.3, 0.4]
+    assert combined["is_core"].tolist() == [True, True, False, False]
 
 
 def test_multimaps_save_and_load_roundtrip_preserves_cached_data(tmp_path: Path) -> None:
@@ -116,7 +120,8 @@ def test_multimaps_save_and_load_roundtrip_preserves_cached_data(tmp_path: Path)
                 "y": [0.0, 1.0],
                 "z": [0.0, 0.0],
                 "region": [0, 0],
-                "layer": [1, 1],
+                "core_distance": [0.1, 0.2],
+                "is_core": [True, True],
                 "f1": [0.1, 0.2],
             }
         )
@@ -128,7 +133,8 @@ def test_multimaps_save_and_load_roundtrip_preserves_cached_data(tmp_path: Path)
                 "y": [2.0, 3.0],
                 "z": [0.0, 0.0],
                 "region": [1, 1],
-                "layer": [0, 1],
+                "core_distance": [0.3, 0.4],
+                "is_core": [False, False],
                 "f1": [0.3, 0.4],
             }
         )
@@ -212,6 +218,46 @@ def test_multimaps_reduce_propagates_pca_columns() -> None:
     assert {"pca0", "pca1"}.issubset(map_b.data.columns)
 
 
+def test_multimaps_reduce_can_fit_pca_on_core_points_only() -> None:
+    map_a = FakeMaps(
+        pd.DataFrame(
+            {
+                "x": [0.0, 0.1],
+                "y": [0.0, 0.1],
+                "z": [0.0, 0.0],
+                "is_core": [True, False],
+                "f1": [0.0, 100.0],
+                "f2": [1.0, 50.0],
+            }
+        )
+    )
+    map_b = FakeMaps(
+        pd.DataFrame(
+            {
+                "x": [1.0, 1.1],
+                "y": [1.0, 1.1],
+                "z": [0.0, 0.0],
+                "is_core": [True, False],
+                "f1": [2.0, 200.0],
+                "f2": [1.0, 60.0],
+            }
+        )
+    )
+
+    multimaps = MultiMaps([map_a, map_b])
+    multimaps.atcontactspace()
+    result = multimaps.reduce(npca=1, core_only=True)
+
+    assert multimaps.pca_analysis_result is not None
+    np.testing.assert_allclose(
+        multimaps.pca_analysis_result.estimator.mean_,
+        np.array([1.0, 1.0], dtype=np.float64),
+    )
+    assert result.transformed_values.shape == (4, 1)
+    assert multimaps.data is not None
+    assert "pca0" in multimaps.data.columns
+
+
 @pytest.mark.parametrize(
     "method",
     ["spectral", "gaussian_mixture", "kmeans", "agglomerative"],
@@ -255,6 +301,44 @@ def test_multimaps_cluster_propagates_labels(method: str) -> None:
     assert map_b.data is not None
     assert "Cluster" in map_a.data.columns
     assert "Cluster" in map_b.data.columns
+
+
+def test_multimaps_cluster_can_restrict_to_core_points() -> None:
+    map_a = FakeMaps(
+        pd.DataFrame(
+            {
+                "x": [0.0, 0.1],
+                "y": [0.0, 0.1],
+                "z": [0.0, 0.0],
+                "is_core": [True, False],
+                "f1": [0.0, 100.0],
+            }
+        )
+    )
+    map_b = FakeMaps(
+        pd.DataFrame(
+            {
+                "x": [1.0, 1.1],
+                "y": [1.0, 1.1],
+                "z": [0.0, 0.0],
+                "is_core": [True, False],
+                "f1": [10.0, 200.0],
+            }
+        )
+    )
+
+    multimaps = MultiMaps([map_a, map_b])
+    multimaps.atcontactspace()
+    result = multimaps.cluster(nclusters=2, method="kmeans", random_state=0, core_only=True)
+
+    assert result.labels.tolist().count(-1) == 2
+    assert set(result.labels[result.labels >= 0].tolist()) == {0, 1}
+    assert multimaps.data is not None
+    assert multimaps.data["Cluster"].tolist().count(-1) == 2
+    assert map_a.data is not None
+    assert map_b.data is not None
+    assert map_a.data["Cluster"].tolist().count(-1) == 1
+    assert map_b.data["Cluster"].tolist().count(-1) == 1
 
 
 def test_multimaps_cluster_screening_tracks_method() -> None:
@@ -434,6 +518,51 @@ def test_multimaps_from_file_loads_multiple_systems(tmp_path: Path) -> None:
 
     assert not combined.empty
     assert combined["system"].isin(["sample_a", "sample_b"]).all()
+
+
+def test_multimaps_from_file_rejects_unknown_contactspace_keys(tmp_path: Path) -> None:
+    systems_dir = tmp_path / "systems"
+    systems_dir.mkdir()
+    _write_xyz(systems_dir / "sample_a.xyz", 1.0)
+
+    input_file = tmp_path / "multimaps.yaml"
+    input_file.write_text(
+        dedent(
+            """
+            system:
+              systemtype: ions
+              file:
+                fileformat: xyz+
+                folder: systems
+                root: sample_
+                units: angstrom
+              dimension: 2
+              axis: 2
+
+            contactspace:
+              mode: system
+              distance: 0.5
+              spread: 0.5
+              cutoff: 2
+              threshold: 0.1
+              assign_layers: true
+
+            symmetryfunctions:
+              functions:
+                - type: ac
+                  cutoff: cos
+                  radius: 2.0
+                  order: 1
+                  compositional: false
+                  structural: true
+                  radial: true
+            """
+        ).strip()
+        + "\n"
+    )
+
+    with pytest.raises(Exception, match="assign_layers|extra fields not permitted"):
+        MultiMapsFromFile(str(input_file))
 
 
 def test_multimaps_from_file_preserves_source_folder_metadata(tmp_path: Path) -> None:

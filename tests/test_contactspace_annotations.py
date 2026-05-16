@@ -80,10 +80,10 @@ def test_maps_atcontactspace_includes_contactspace_feature_annotations() -> None
 
     assert "ionic_distance" in data.columns
     assert "region" in data.columns
-    assert "layer" in data.columns
+    assert "core_distance" in data.columns
     assert maps.features == ["ionic_distance"]
     assert "region" not in maps.features
-    assert "layer" not in maps.features
+    assert "core_distance" not in maps.features
     np.testing.assert_allclose(data["ionic_distance"].to_numpy(), annotation)
 
 
@@ -111,15 +111,15 @@ def test_contactspace_data_includes_boundary_derived_columns() -> None:
     assert set(contactspace.feature_columns).isdisjoint(expected)
 
 
-def test_contactspace_layer_assignment_groups_points_by_boundary_sheet() -> None:
+def test_contactspace_core_distance_tracks_distance_from_interface() -> None:
     grid = Grid(scalars=[2, 2, 1], cell=np.diag([2.0, 2.0, 1.0]))
     boundary = DummyBoundary(mode="system", grid=grid)
 
     switch = ScalarField(grid)
     switch[:] = np.array(
         [
-            [[0.0], [0.0]],
-            [[1.0], [1.0]],
+            [[0.25], [0.50]],
+            [[0.75], [0.50]],
         ]
     )
     boundary.switch[:] = switch
@@ -133,59 +133,46 @@ def test_contactspace_layer_assignment_groups_points_by_boundary_sheet() -> None
     contactspace = ContactSpace(
         boundary,
         tol=0.1,
-        assign_layers=True,
-        layer_switch_tolerance=0.1,
-        layer_gradient_cosine_min=0.99,
-        layer_orthogonality_tolerance=0.1,
+        core_epsilon=1.0e-12,
     )
 
-    assert "layer" in contactspace.data.columns
-    assert "layer" in contactspace.annotation_columns
-    assert "layer" not in contactspace.feature_columns
-    assert contactspace.nlayers == 2
-
-    frame = contactspace.data.copy()
-    layers_by_x = frame.groupby("x")["layer"].nunique()
-    assert layers_by_x.loc[0.0] == 1
-    assert layers_by_x.loc[1.0] == 1
-    assert (
-        frame.loc[frame["x"] == 0.0, "layer"].iloc[0]
-        != frame.loc[frame["x"] == 1.0, "layer"].iloc[0]
+    assert "core_distance" in contactspace.data.columns
+    assert "core_distance" in contactspace.annotation_columns
+    assert "core_distance" not in contactspace.feature_columns
+    np.testing.assert_allclose(
+        np.sort(contactspace.data["core_distance"].to_numpy()),
+        np.array([0.0, 0.0, 0.25, 0.25]),
     )
 
 
-def test_contactspace_layer_assignment_connects_diagonal_tangent_neighbors() -> None:
+def test_contactspace_core_tolerance_defines_is_core_annotation() -> None:
     grid = Grid(scalars=[2, 2, 1], cell=np.diag([2.0, 2.0, 1.0]))
     boundary = DummyBoundary(mode="system", grid=grid)
 
     switch = ScalarField(grid)
     switch[:] = np.array(
         [
-            [[0.0], [1.0]],
-            [[1.0], [2.0]],
+            [[0.40], [0.50]],
+            [[0.70], [0.50]],
         ]
     )
     boundary.switch[:] = switch
 
     gradient = GradientField(grid)
-    diagonal_normal = 1.0 / np.sqrt(2.0)
-    gradient[0, :, :, :] = diagonal_normal
-    gradient[1, :, :, :] = diagonal_normal
+    gradient[0, :, :, :] = 1.0
+    gradient[1, :, :, :] = 0.0
     gradient[2, :, :, :] = 0.0
     boundary.gradient[:] = gradient
 
     contactspace = ContactSpace(
         boundary,
         tol=0.1,
-        assign_layers=True,
-        layer_switch_tolerance=0.1,
-        layer_gradient_cosine_min=0.99,
-        layer_orthogonality_tolerance=0.1,
+        core_tolerance=0.15,
     )
 
-    assert contactspace.nlayers == 3
-    frame = contactspace.data.set_index(["x", "y"])
-    assert frame.loc[(0.0, 1.0), "layer"] == frame.loc[(1.0, 0.0), "layer"]
+    assert "is_core" in contactspace.data.columns
+    assert "is_core" in contactspace.annotation_columns
+    assert contactspace.data["is_core"].tolist().count(True) == 3
 
 
 def test_maps_annotate_ionic_distance_updates_contactspace_and_maps_data() -> None:
@@ -223,7 +210,7 @@ def test_maps_save_and_load_roundtrip_preserves_cached_data(tmp_path) -> None:
     )
     contactspace = StubContactSpace(positions)
     contactspace.data.loc[:, "region"] = np.array([0, 1], dtype=np.int64)
-    contactspace.data.loc[:, "layer"] = np.array([2, 3], dtype=np.int64)
+    contactspace.data.loc[:, "core_distance"] = np.array([0.2, 0.3], dtype=np.float64)
 
     maps = Maps(system, [], contactspace)
     maps.data = pd.DataFrame(
@@ -232,7 +219,7 @@ def test_maps_save_and_load_roundtrip_preserves_cached_data(tmp_path) -> None:
             "y": positions[:, 1],
             "z": positions[:, 2],
             "region": [0, 1],
-            "layer": [2, 3],
+            "core_distance": [0.2, 0.3],
             "f1": [0.1, 0.2],
         }
     )

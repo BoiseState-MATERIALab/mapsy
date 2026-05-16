@@ -213,14 +213,8 @@ class ContactSpaceGenerator:
         self.cutoff = csmodel.cutoff
         self.threshold = csmodel.threshold
         self.side = csmodel.side
-        self.assign_layers = getattr(csmodel, "assign_layers", False)
-        self.layer_switch_tolerance = getattr(csmodel, "layer_switch_tolerance", 0.25)
-        self.layer_gradient_cosine_min = getattr(csmodel, "layer_gradient_cosine_min", 0.9)
-        self.layer_orthogonality_tolerance = getattr(
-            csmodel,
-            "layer_orthogonality_tolerance",
-            0.25,
-        )
+        self.core_epsilon = getattr(csmodel, "core_epsilon", 1.0e-12)
+        self.core_tolerance = getattr(csmodel, "core_tolerance", None)
 
         self.spread = csmodel.spread
         if csmodel.mode == "system":
@@ -284,9 +278,19 @@ class ContactSpaceGenerator:
         contactspace: ContactSpace = ContactSpace(
             self.boundary,
             self.threshold,
-            assign_layers=self.assign_layers,
-            layer_switch_tolerance=self.layer_switch_tolerance,
-            layer_gradient_cosine_min=self.layer_gradient_cosine_min,
-            layer_orthogonality_tolerance=self.layer_orthogonality_tolerance,
+            core_epsilon=self.core_epsilon,
+            core_tolerance=self.core_tolerance,
         )
+        self._release_boundary_function_caches(self.boundary)
         return contactspace
+
+    @staticmethod
+    def _release_boundary_function_caches(boundary: Boundary) -> None:
+        """Drop per-function full-grid derivative caches after ContactSpace copies them out."""
+        soft_spheres = getattr(boundary, "soft_spheres", None)
+        if soft_spheres is not None and hasattr(soft_spheres, "reset_derivatives"):
+            soft_spheres.reset_derivatives()
+
+        simple = getattr(boundary, "simple", None)
+        if simple is not None and hasattr(simple, "reset_derivatives"):
+            simple.reset_derivatives()
