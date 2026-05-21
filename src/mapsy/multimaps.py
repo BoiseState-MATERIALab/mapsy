@@ -11,10 +11,14 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 import dill
+import matplotlib as mpl
+import matplotlib.pyplot as plt
 import numpy as np
 import numpy.typing as npt
 import pandas as pd
 import scipy.spatial.distance as distance
+from matplotlib.figure import Figure
+from matplotlib.lines import Line2D
 from pathos.multiprocessing import ProcessingPool
 from sklearn.preprocessing import StandardScaler
 from threadpoolctl import threadpool_limits
@@ -482,6 +486,277 @@ class MultiMaps:
                 f"Pickle at {path} contains {type(loaded).__name__}, expected {cls.__name__}."
             )
         return loaded
+
+    def scatter(
+        self,
+        feature: str | None = None,
+        index: int | None = None,
+        axes: Sequence[str] | None = None,
+        region: int | None = 0,
+        *,
+        layer: int | Sequence[int] | None = None,
+        map_indexes: npt.ArrayLike | None = None,
+        categorical: bool = False,
+        centroids: bool = False,
+        categories: Sequence[Any] | None = None,
+        ncols: int | None = None,
+        figsize: tuple[float, float] | None = None,
+        panel_size: tuple[float, float] = (4.5, 4.0),
+        cmap: str | mpl.colors.Colormap | None = None,
+        colorbar: bool = True,
+        legend: bool = True,
+        sharex: bool = False,
+        sharey: bool = False,
+        set_aspect: str = "scaled",
+        **kwargs: Any,
+    ) -> tuple[Figure, npt.NDArray[np.object_]]:
+        """Scatter a feature for multiple maps with one shared color scale or legend."""
+        data = self._ensure_data()
+        frame = data.copy()
+        if feature is not None:
+            if feature not in frame.columns:
+                frame.loc[:, feature] = self._collect_contactspace_column(feature)
+        elif index is not None:
+            if index >= len(self.features) or index < 0:
+                raise ValueError(f"Index {index} out of bounds.")
+            feature = self.features[index]
+            logger.info("Plotting feature %s", feature)
+        else:
+            raise ValueError("Either feature or index must be provided.")
+        if feature not in frame.columns:
+            raise ValueError(f"Feature {feature} not found in multimaps data.")
+
+        resolved_axes = list(axes) if axes is not None else ["x", "y"]
+        if len(resolved_axes) != 2:
+            raise ValueError("axes must contain exactly two columns.")
+        for axis in resolved_axes:
+            if axis not in frame.columns:
+                frame.loc[:, axis] = self._collect_contactspace_column(axis)
+
+        if set_aspect not in ["on", "off", "equal", "scaled"]:
+            raise ValueError("set_aspect must be one of ['on','off','equal','scaled']")
+
+        if map_indexes is None:
+            selected_maps = np.arange(len(self.maps), dtype=np.int64)
+        else:
+            selected_maps = np.asarray(map_indexes, dtype=np.int64).reshape(-1)
+        if selected_maps.size == 0:
+            raise ValueError("map_indexes must select at least one map.")
+        invalid_maps = selected_maps[(selected_maps < 0) | (selected_maps >= len(self.maps))]
+        if invalid_maps.size:
+            raise ValueError(f"map_indexes contains invalid indexes: {invalid_maps.tolist()}.")
+
+        if "map_index" not in frame.columns:
+            raise RuntimeError("MultiMaps data is missing the 'map_index' column.")
+        mask = np.isin(frame["map_index"].to_numpy(dtype=np.int64), selected_maps)
+
+        if region is not None:
+            if "region" not in frame.columns:
+                frame.loc[:, "region"] = self._collect_contactspace_column("region").astype(
+                    np.int64
+                )
+            mask &= frame["region"].to_numpy(dtype=np.int64) == int(region)
+
+        if layer is not None:
+            if "layer" not in frame.columns:
+                frame.loc[:, "layer"] = self._collect_contactspace_column("layer").astype(np.int64)
+            mask &= np.isin(frame["layer"].to_numpy(dtype=np.int64), _coerce_layer_values(layer))
+
+        plotdata = frame.loc[mask].copy()
+        if plotdata.empty:
+            raise ValueError("No points available after applying the map/region/layer filters.")
+
+        nmaps = int(selected_maps.size)
+        if ncols is None:
+            ncols = min(4, int(np.ceil(np.sqrt(nmaps))))
+        ncols = max(1, min(int(ncols), nmaps))
+        nrows = int(np.ceil(nmaps / ncols))
+        if figsize is None:
+            extra_width = 1.7 if categorical and legend else 0.8 if colorbar else 0.0
+            figsize = (panel_size[0] * ncols + extra_width, panel_size[1] * nrows)
+
+        fig, axs = plt.subplots(
+            nrows,
+            ncols,
+            figsize=figsize,
+            sharex=sharex,
+            sharey=sharey,
+            squeeze=False,
+        )
+        axslist = axs.reshape(-1)
+
+        scatter_kwargs = dict(kwargs)
+        scatter_artist = None
+        legend_handles: list[Line2D] = []
+        centroid_frame = pd.DataFrame()
+        if centroids:
+            centroid_frame = self.get_special_points(kind="centroid", label_status=None)
+            if centroid_frame.empty:
+                raise RuntimeError("No centroids available.")
+            if region is not None and "region" in centroid_frame.columns:
+                centroid_frame = centroid_frame.loc[
+                    centroid_frame["region"].to_numpy(dtype=np.int64) == int(region)
+                ]
+            if layer is not None and "layer" in centroid_frame.columns:
+                centroid_frame = centroid_frame.loc[
+                    np.isin(
+                        centroid_frame["layer"].to_numpy(dtype=np.int64),
+                        _coerce_layer_values(layer),
+                    )
+                ]
+
+        if categorical:
+            scatter_kwargs.pop("c", None)
+            scatter_kwargs.pop("color", None)
+            observed_categories = pd.unique(plotdata[feature].dropna())
+            if categories is not None:
+                category_values = np.array(list(categories), dtype=object)
+            elif feature == "Cluster" and self.nclusters > 0:
+                category_values = np.arange(self.nclusters, dtype=np.int64)
+                observed_numeric = np.asarray(observed_categories, dtype=np.float64)
+                if observed_numeric.size and np.any(observed_numeric < 0):
+                    category_values = np.concatenate(
+                        [np.array([-1], dtype=np.int64), category_values]
+                    )
+            else:
+                category_values = observed_categories
+            if category_values.size == 0:
+                raise ValueError(f"Feature {feature!r} does not contain plottable values.")
+            if np.issubdtype(category_values.dtype, np.number):
+                category_values = np.sort(category_values.astype(np.float64, copy=False))
+            color_map = (
+                cmap if isinstance(cmap, mpl.colors.Colormap) else mpl.colormaps[cmap or "tab20"]
+            )
+            if feature == "Cluster" and self.nclusters > 0:
+                cluster_colors = color_map(np.linspace(0, 1, self.nclusters, endpoint=False))
+                fallback_colors = color_map(np.linspace(0, 1, len(category_values), endpoint=False))
+                category_colors = {}
+                for fallback_index, category in enumerate(category_values):
+                    category_color = fallback_colors[fallback_index]
+                    if isinstance(category, (int, float, np.integer, np.floating)):
+                        category_number = float(category)
+                        if category_number.is_integer():
+                            cluster_index = int(category_number)
+                            if cluster_index == -1:
+                                category_color = (0.6, 0.6, 0.6, 1.0)
+                            elif 0 <= cluster_index < self.nclusters:
+                                category_color = cluster_colors[cluster_index]
+                    category_colors[category] = category_color
+            else:
+                colors = color_map(np.linspace(0, 1, len(category_values), endpoint=False))
+                category_colors = dict(zip(category_values.tolist(), colors, strict=False))
+            for category in category_values:
+                label = (
+                    str(int(category))
+                    if isinstance(category, float) and category.is_integer()
+                    else str(category)
+                )
+                legend_handles.append(
+                    Line2D(
+                        [0],
+                        [0],
+                        marker="o",
+                        linestyle="",
+                        markerfacecolor=category_colors[category],
+                        markeredgecolor="none",
+                        label=f"{feature} = {label}",
+                    )
+                )
+        else:
+            values = plotdata[feature].to_numpy(dtype=np.float64)
+            if "norm" in scatter_kwargs:
+                norm = scatter_kwargs.pop("norm")
+            else:
+                vmin = scatter_kwargs.pop("vmin", float(np.nanmin(values)))
+                vmax = scatter_kwargs.pop("vmax", float(np.nanmax(values)))
+                norm = mpl.colors.Normalize(vmin=vmin, vmax=vmax)
+            color_map = (
+                cmap
+                if isinstance(cmap, mpl.colors.Colormap)
+                else mpl.colormaps[cmap or scatter_kwargs.pop("cmap", "viridis")]
+            )
+
+        for ax, map_index in zip(axslist, selected_maps, strict=False):
+            map_data = plotdata.loc[plotdata["map_index"].to_numpy(dtype=np.int64) == map_index]
+            ax.set_title(self._map_name(int(map_index)))
+            ax.set_xlabel(resolved_axes[0])
+            ax.set_ylabel(resolved_axes[1])
+            if map_data.empty:
+                ax.axis(set_aspect)
+                continue
+
+            x1 = map_data[resolved_axes[0]].to_numpy(dtype=np.float64)
+            x2 = map_data[resolved_axes[1]].to_numpy(dtype=np.float64)
+            if categorical:
+                map_values = map_data[feature].to_numpy()
+                for category in category_values:
+                    category_mask = map_values == category
+                    if not np.any(category_mask):
+                        continue
+                    scatter_artist = ax.scatter(
+                        x1[category_mask],
+                        x2[category_mask],
+                        color=category_colors[category],
+                        **scatter_kwargs,
+                    )
+            else:
+                scatter_artist = ax.scatter(
+                    x1,
+                    x2,
+                    c=map_data[feature].to_numpy(dtype=np.float64),
+                    cmap=color_map,
+                    norm=norm,
+                    **scatter_kwargs,
+                )
+
+            if centroids:
+                map_centroids = centroid_frame.loc[
+                    centroid_frame["map_index"].to_numpy(dtype=np.int64) == map_index
+                ]
+                if not map_centroids.empty:
+                    ax.scatter(
+                        map_centroids[resolved_axes[0]].to_numpy(dtype=np.float64),
+                        map_centroids[resolved_axes[1]].to_numpy(dtype=np.float64),
+                        c="black",
+                        marker="x",
+                        s=max(float(scatter_kwargs.get("s", 20)) * 2.0, 30.0),
+                        label="Centroids",
+                    )
+            ax.axis(set_aspect)
+
+        for ax in axslist[nmaps:]:
+            ax.axis("off")
+
+        visible_axes = axslist[:nmaps].tolist()
+        if categorical:
+            if centroids:
+                legend_handles.append(
+                    Line2D(
+                        [0],
+                        [0],
+                        marker="x",
+                        linestyle="",
+                        color="black",
+                        label="Centroids",
+                    )
+                )
+            if legend:
+                fig.legend(
+                    handles=legend_handles,
+                    bbox_to_anchor=(0.995, 0.5),
+                    loc="center right",
+                    borderaxespad=0.0,
+                )
+                fig.tight_layout(rect=(0.0, 0.0, 0.86, 1.0))
+            else:
+                fig.tight_layout()
+        else:
+            fig.tight_layout()
+            if colorbar and scatter_artist is not None:
+                cbar = fig.colorbar(scatter_artist, ax=visible_axes)
+                cbar.set_label(feature)
+                cbar.solids.set_alpha(1.0)
+        return fig, axs
 
     def analyze_pca(
         self,

@@ -392,6 +392,50 @@ def test_multimaps_cluster_can_propagate_layer_labels() -> None:
     assert labels[0] != labels[3]
 
 
+def test_multimaps_scatter_uses_shared_categorical_legend() -> None:
+    plt.switch_backend("Agg")
+    map_a = FakeMaps(
+        pd.DataFrame(
+            {
+                "x": [0.0, 1.0],
+                "y": [0.0, 0.0],
+                "z": [0.0, 0.0],
+                "region": [0, 0],
+                "Cluster": [0, 1],
+                "f1": [0.0, 1.0],
+            }
+        )
+    )
+    map_b = FakeMaps(
+        pd.DataFrame(
+            {
+                "x": [2.0, 3.0],
+                "y": [0.0, 0.0],
+                "z": [0.0, 0.0],
+                "region": [0, 0],
+                "Cluster": [1, 2],
+                "f1": [2.0, 3.0],
+            }
+        )
+    )
+
+    multimaps = MultiMaps([map_a, map_b], names=["a", "b"])
+    multimaps.atcontactspace()
+    multimaps.nclusters = 3
+    fig, axs = multimaps.scatter(
+        feature="Cluster",
+        categorical=True,
+        map_indexes=[0],
+        s=10,
+    )
+
+    assert axs.shape == (1, 1)
+    assert len(fig.legends) == 1
+    labels = [text.get_text() for text in fig.legends[0].get_texts()]
+    assert labels == ["Cluster = 0", "Cluster = 1", "Cluster = 2"]
+    plt.close(fig)
+
+
 def test_multimaps_sites_can_select_one_site_per_cluster_and_layer() -> None:
     map_a = FakeMaps(
         pd.DataFrame(
