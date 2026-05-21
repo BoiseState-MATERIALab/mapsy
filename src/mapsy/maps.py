@@ -30,6 +30,7 @@ from mapsy.analysis import (
     fit_clusters,
     fit_pca_analysis,
     project_pca,
+    propagate_cluster_labels,
     screen_clusters,
 )
 from mapsy.analysis import (
@@ -88,6 +89,12 @@ def _chunk_positions(
     if n_chunks <= 1:
         return [np.asarray(positions, dtype=np.float64)]
     return [np.asarray(a, dtype=np.float64) for a in np.array_split(positions, n_chunks, axis=0)]
+
+
+def _coerce_layer_values(layer: int | Sequence[int]) -> list[int]:
+    if isinstance(layer, (int, np.integer)):
+        return [int(layer)]
+    return [int(value) for value in layer]
 
 
 class SpecialPointRegistry:
@@ -285,8 +292,14 @@ class SpecialPointRegistry:
 class Maps:
     _METADATA_COLUMNS = {
         "region",
+        "signed_distance",
         "core_distance",
-        "is_core",
+        "patch",
+        "layer",
+        "patch_size",
+        "layer_size",
+        "patch_mean_distance",
+        "layer_mean_distance",
         "source_file",
         "source_file_name",
         "source_file_stem",
@@ -858,8 +871,7 @@ class Maps:
         plane: tuple[str, str] = ("x", "y"),
         selector: str = "core",
         region: int | None = 0,
-        core_only: bool = True,
-        max_core_distance: float | None = None,
+        layer: int | Sequence[int] | None = 0,
         categorical: bool = False,
         set_aspect: str = "on",
         **kwargs: dict[str, Any],
@@ -878,7 +890,12 @@ class Maps:
             raise ValueError("set_aspect must be one of ['on','off','equal','scaled']")
 
         frame = self.data.copy()
-        required_columns = {feature, *plane, "core_distance", "probability"}
+        required_columns = {
+            feature,
+            *plane,
+            "core_distance",
+            "probability",
+        }
         for column in required_columns:
             if column is None or column in frame.columns:
                 continue
@@ -906,14 +923,23 @@ class Maps:
             raise ValueError(f"plane must be a subset of ('x', 'y', 'z'), got {plane!r}.")
         normal_axis = remaining_axes[0]
 
-        mask = self._core_selection_mask(
-            core_only=core_only,
-            max_core_distance=max_core_distance,
-        )
+        mask = np.ones(len(frame), dtype=bool)
         if region is not None:
             mask &= self.contactspace.data["region"].to_numpy(dtype=np.int64) == region
+        if layer is not None:
+            mask &= np.isin(
+                self.contactspace.data["layer"].to_numpy(dtype=np.int64),
+                _coerce_layer_values(layer),
+            )
 
-        columns = [plane[0], plane[1], normal_axis, feature, "core_distance", "probability"]
+        columns = [
+            plane[0],
+            plane[1],
+            normal_axis,
+            feature,
+            "core_distance",
+            "probability",
+        ]
         projected_input = frame.loc[mask, columns].copy()
         if projected_input.empty:
             raise ValueError("No points available after applying the projection filters.")
@@ -1126,8 +1152,7 @@ class Maps:
         self,
         scale: bool = False,
         *,
-        core_only: bool = False,
-        max_core_distance: float | None = None,
+        layer: int | Sequence[int] | None = None,
     ) -> PCAAnalysisResult:
         # Check that contact space exists
         if self.contactspace is None:
@@ -1135,13 +1160,15 @@ class Maps:
         # Check that contact space maps have been generated
         if self.data is None:
             raise RuntimeError("No contact space data available.")
-        mask = self._core_selection_mask(
-            core_only=core_only,
-            max_core_distance=max_core_distance,
-        )
+        mask = np.ones(len(self.data), dtype=bool)
+        if layer is not None:
+            mask &= np.isin(
+                self.contactspace.data["layer"].to_numpy(dtype=np.int64),
+                _coerce_layer_values(layer),
+            )
         X = self.data.loc[mask, self.features].values.astype(np.float64)
         if len(X) == 0:
-            raise ValueError("No points available after applying the core filter for PCA.")
+            raise ValueError("No points available after applying the layer filter for PCA.")
         result = fit_pca_analysis(X, feature_columns=list(self.features), scale=scale)
         self.pca_analysis_result = result
         return result
@@ -1151,21 +1178,18 @@ class Maps:
         npca: int | None = None,
         scale: bool = False,
         *,
-        core_only: bool = False,
-        max_core_distance: float | None = None,
+        layer: int | Sequence[int] | None = None,
     ) -> PCAAnalysisResult | PCAResult:
         if npca is None:
             return self.analyze_pca(
                 scale=scale,
-                core_only=core_only,
-                max_core_distance=max_core_distance,
+                layer=layer,
             )
         if self.data is None:
             raise RuntimeError("No contact space data available.")
         analysis = self.analyze_pca(
             scale=scale,
-            core_only=core_only,
-            max_core_distance=max_core_distance,
+            layer=layer,
         )
         data = self.data
         result = project_pca(analysis, data[self.features].values.astype(np.float64), npca=npca)
@@ -1184,8 +1208,17 @@ class Maps:
         random_state: int | None = None,
         scale: bool = False,
         graph: GraphResult | None = None,
-        core_only: bool = False,
-        max_core_distance: float | None = None,
+        layer: int | Sequence[int] | None = None,
+        propagate: bool = False,
+        propagation_mode: ArchetypePropagationMode = "diffusion",
+        propagation_alpha: float = 0.9,
+        propagation_max_iter: int = 500,
+        propagation_tol: float = 1.0e-8,
+        propagation_confidence_threshold: float = 0.0,
+        propagation_margin_threshold: float = 0.0,
+        propagation_realspace_scale: float = 1.0,
+        propagation_feature_scale: float = 1.0,
+        propagation_use_node_weights: bool = False,
     ) -> ClusterResult | ClusterScreeningResult:
         """ """
         # Check that contact space exists
@@ -1200,18 +1233,21 @@ class Maps:
         else:
             self.cluster_features = features
         self.cluster_method = normalize_cluster_method(method)
-        core_mask = self._core_selection_mask(
-            core_only=core_only,
-            max_core_distance=max_core_distance,
-        )
-        X = self.data.loc[core_mask, self.cluster_features].values.astype(np.float64)
+        selected_mask = np.ones(len(self.data), dtype=bool)
+        if layer is not None:
+            selected_mask &= np.isin(
+                self.contactspace.data["layer"].to_numpy(dtype=np.int64),
+                _coerce_layer_values(layer),
+            )
+        X = self.data.loc[selected_mask, self.cluster_features].values.astype(np.float64)
         if len(X) == 0:
-            raise ValueError("No points available after applying the core filter for clustering.")
+            raise ValueError("No points available after applying the layer filter for clustering.")
         selected_graph = (
-            self._subset_graph_result(graph, core_mask)
-            if graph is not None and not np.all(core_mask)
+            self._subset_graph_result(graph, selected_mask)
+            if graph is not None and not np.all(selected_mask)
             else graph
         )
+        full_graph = graph if graph is not None else self.graph_result
         if graph is not None and graph.matrix.shape[0] != len(self.data):
             raise ValueError(
                 f"graph has {graph.matrix.shape[0]} nodes, expected {len(self.data)} to match maps.data."
@@ -1276,9 +1312,55 @@ class Maps:
                 screening=screening_result,
                 graph=selected_graph,
             )
-            full_labels = np.full(len(self.data), -1, dtype=np.int64)
-            full_labels[core_mask] = result.labels
+            if propagate:
+                if full_graph is None:
+                    raise RuntimeError(
+                        "No graph available for cluster propagation. "
+                        "Call maps.build_graph(...) first or pass graph explicitly."
+                    )
+                if full_graph.matrix.shape[0] != len(self.data):
+                    raise ValueError(
+                        f"graph has {full_graph.matrix.shape[0]} nodes, expected {len(self.data)} to match maps.data."
+                    )
+                seed_labels = np.full(len(self.data), -1, dtype=np.int64)
+                seed_labels[selected_mask] = result.labels
+                (
+                    full_labels,
+                    cluster_confidence,
+                    cluster_margin,
+                    cluster_ambiguous,
+                    cluster_scores,
+                ) = propagate_cluster_labels(
+                    full_graph,
+                    seed_mask=selected_mask,
+                    seed_labels=seed_labels,
+                    propagation_mode=propagation_mode,
+                    alpha=propagation_alpha,
+                    max_iter=propagation_max_iter,
+                    tol=propagation_tol,
+                    confidence_threshold=propagation_confidence_threshold,
+                    margin_threshold=propagation_margin_threshold,
+                    propagation_realspace_scale=propagation_realspace_scale,
+                    propagation_feature_scale=propagation_feature_scale,
+                    propagation_use_node_weights=propagation_use_node_weights,
+                )
+            else:
+                full_labels = np.full(len(self.data), -1, dtype=np.int64)
+                full_labels[selected_mask] = result.labels
+                cluster_confidence = np.zeros(len(self.data), dtype=np.float64)
+                cluster_margin = np.zeros(len(self.data), dtype=np.float64)
+                cluster_ambiguous = np.ones(len(self.data), dtype=bool)
+                cluster_confidence[selected_mask] = 1.0
+                cluster_margin[selected_mask] = 1.0
+                cluster_ambiguous[selected_mask] = False
+                cluster_scores = None
             self.data["Cluster"] = full_labels
+            self.data["cluster_confidence"] = cluster_confidence
+            self.data["cluster_margin"] = cluster_margin
+            self.data["cluster_is_ambiguous"] = cluster_ambiguous
+            if cluster_scores is not None:
+                for cluster_id in range(cluster_scores.shape[1]):
+                    self.data[f"cluster_score_{cluster_id}"] = cluster_scores[:, cluster_id]
             # Store number of clusters
             self.nclusters = nclusters
             self.cluster_result = result
@@ -1298,9 +1380,10 @@ class Maps:
             result.edges = self.cluster_edges
             result.metadata = {
                 **(result.metadata or {}),
-                "core_only": core_only,
-                "max_core_distance": max_core_distance,
-                "n_selected_points": int(np.count_nonzero(core_mask)),
+                "layer": list(_coerce_layer_values(layer)) if layer is not None else None,
+                "propagate": propagate,
+                "propagation_mode": propagation_mode if propagate else None,
+                "n_selected_points": int(np.count_nonzero(selected_mask)),
             }
             return result
         else:
@@ -1397,8 +1480,7 @@ class Maps:
         graph: GraphResult | None = None,
         probability_column: str = "probability",
         region: int | None = None,
-        core_only: bool = False,
-        max_core_distance: float | None = None,
+        layer: int | Sequence[int] | None = None,
         min_probability: float | None = None,
         min_probability_quantile: float | None = 0.75,
         scale_features: bool = True,
@@ -1437,24 +1519,19 @@ class Maps:
             ].to_numpy()
 
         candidate_mask: npt.NDArray[np.bool_] | None = None
-        if region is not None or core_only or max_core_distance is not None:
+        if region is not None or layer is not None:
             if self.contactspace is None:
                 raise RuntimeError(
-                    "Trying to filter archetypes by region or core_distance without contact space"
+                    "Trying to filter archetypes by region or layer without contact space"
                 )
             candidate_mask = np.ones(len(point_table), dtype=bool)
             if region is not None:
                 region_values = self.contactspace.data["region"].to_numpy(dtype=np.int64)
                 candidate_mask &= region_values == region
-            candidate_mask &= self._core_selection_mask(
-                core_only=core_only,
-                max_core_distance=max_core_distance,
-            )
-            if (
-                (core_only or max_core_distance is not None)
-                and min_probability is None
-                and min_probability_quantile == 0.75
-            ):
+            if layer is not None:
+                layer_values = self.contactspace.data["layer"].to_numpy(dtype=np.int64)
+                candidate_mask &= np.isin(layer_values, _coerce_layer_values(layer))
+            if layer is not None and min_probability is None and min_probability_quantile == 0.75:
                 min_probability_quantile = None
 
         selected_graph = graph if graph is not None else self.graph_result
@@ -1617,7 +1694,7 @@ class Maps:
 
         return result
 
-    def sites(self, region: int = 0) -> None:
+    def sites(self, region: int = 0, *, per_layer: bool = False) -> None:
         # Check that contact space exists
         if self.contactspace is None:
             raise RuntimeError("Trying to use maps.cluster() without contact space")
@@ -1637,31 +1714,54 @@ class Maps:
             or self.cluster_sizes is None
         ):
             raise RuntimeError("No clusters have been generated.")
-        # Compute the cluster centroids
-        centroid_indexes = []
-        cluster_sizes = np.unique(filterdata["Cluster"].values)
-        for cluster_index in cluster_sizes:
-            # Select points that belong to the cluster and save their global indexes
-            cluster_points = filterdata[filterdata["Cluster"] == cluster_index][
-                self.cluster_features
-            ].values.astype(np.float64)
-            cluster_indexes = filterdata[filterdata["Cluster"] == cluster_index].index.values
-            # Compute the distance between the cluster points and the cluster centers
-            dist = distance.cdist(cluster_points, self.cluster_centers)
-            # Only consider the clusters that are connected to the current one
-            indexes = np.where(self.cluster_edges[cluster_index, :] != 0)[0]
-            # Minimize the sum of the inverse distances to the connected clusters
-            full_dist = np.sum(self.cluster_sizes[indexes] / dist[:, indexes] ** 2, axis=1)
-            cluster_centroid = np.argmin(full_dist)
-            # Save the global index of the cluster centroid
-            centroid_indexes.append(cluster_indexes[cluster_centroid])
-        # Convert the list of indexes to a numpy array
+        if per_layer and "layer" not in filterdata.columns:
+            raise RuntimeError("per_layer=True requires a 'layer' column in maps.data.")
+
+        selected_indexes: list[int] = []
+        selected_clusters: list[int] = []
+        selected_layers: list[int] = []
+        cluster_values = np.unique(filterdata["Cluster"].to_numpy(dtype=np.int64))
+        for cluster_index in cluster_values:
+            if cluster_index < 0:
+                continue
+            cluster_data = filterdata.loc[filterdata["Cluster"] == cluster_index]
+            if cluster_data.empty:
+                continue
+
+            if per_layer:
+                subgroups = [subgroup for _, subgroup in cluster_data.groupby("layer", sort=True)]
+            else:
+                subgroups = [cluster_data]
+
+            for subgroup in subgroups:
+                if subgroup.empty:
+                    continue
+                cluster_points = subgroup[self.cluster_features].to_numpy(dtype=np.float64)
+                cluster_indexes = subgroup.index.to_numpy(dtype=np.int64)
+                dist = distance.cdist(cluster_points, self.cluster_centers)
+                connected_indexes = np.where(self.cluster_edges[cluster_index, :] != 0)[0]
+                if connected_indexes.size == 0:
+                    cluster_centroid = int(np.argmin(dist[:, cluster_index]))
+                else:
+                    full_dist = np.sum(
+                        self.cluster_sizes[connected_indexes] / dist[:, connected_indexes] ** 2,
+                        axis=1,
+                    )
+                    cluster_centroid = int(np.argmin(full_dist))
+                selected_indexes.append(int(cluster_indexes[cluster_centroid]))
+                selected_clusters.append(int(cluster_index))
+                selected_layers.append(
+                    int(subgroup["layer"].iloc[0]) if "layer" in subgroup.columns else -1
+                )
+
         self.add_special_points(
-            np.array(centroid_indexes, dtype=np.int64),
+            np.array(selected_indexes, dtype=np.int64),
             kind="centroid",
             iteration=0,
             label_status="unlabeled",
             replace_kind=True,
+            cluster=np.array(selected_clusters, dtype=np.int64),
+            layer=np.array(selected_layers, dtype=np.int64),
         )
         return None
 
@@ -1966,38 +2066,6 @@ class Maps:
             if column not in {"x", "y", "z", *self._METADATA_COLUMNS}
         ]
 
-    def _core_selection_mask(
-        self,
-        *,
-        core_only: bool = False,
-        max_core_distance: float | None = None,
-    ) -> npt.NDArray[np.bool_]:
-        if self.data is None:
-            raise RuntimeError("No contact space data available.")
-
-        mask = np.ones(len(self.data), dtype=bool)
-        if not core_only and max_core_distance is None:
-            return mask
-        if self.contactspace is None:
-            raise RuntimeError("Trying to filter by core without contact space")
-
-        if core_only:
-            if "is_core" in self.data.columns:
-                mask &= self.data["is_core"].to_numpy(dtype=bool)
-            elif "is_core" in self.contactspace.data.columns:
-                mask &= self.contactspace.data["is_core"].to_numpy(dtype=bool)
-            else:
-                raise ValueError(
-                    "core_only=True requires the is_core annotation. "
-                    "Set core_tolerance during contact-space generation or use max_core_distance."
-                )
-
-        if max_core_distance is not None:
-            core_distance = self.contactspace.data["core_distance"].to_numpy(dtype=np.float64)
-            mask &= core_distance <= float(max_core_distance)
-
-        return mask
-
     @staticmethod
     def _subset_graph_result(
         graph: GraphResult,
@@ -2296,7 +2364,11 @@ def _namespace_contactspace(contactspace: dict[str, Any]) -> Any:
         "threshold",
         "side",
         "core_epsilon",
-        "core_tolerance",
+        "layer_distance_tolerance",
+        "layer_gradient_cosine_min",
+        "layer_tangent_tolerance",
+        "n_layers",
+        "layer_min_patch_size",
     }
     unexpected = sorted(set(contactspace) - allowed_keys)
     if unexpected:
@@ -2314,7 +2386,11 @@ def _namespace_contactspace(contactspace: dict[str, Any]) -> Any:
         threshold=contactspace.get("threshold", 0.1),
         side=contactspace.get("side", 1.0),
         core_epsilon=contactspace.get("core_epsilon", 1.0e-12),
-        core_tolerance=contactspace.get("core_tolerance"),
+        layer_distance_tolerance=contactspace.get("layer_distance_tolerance"),
+        layer_gradient_cosine_min=contactspace.get("layer_gradient_cosine_min", 0.94),
+        layer_tangent_tolerance=contactspace.get("layer_tangent_tolerance", 0.35),
+        n_layers=contactspace.get("n_layers", "auto"),
+        layer_min_patch_size=contactspace.get("layer_min_patch_size", 2),
     )
 
 

@@ -1,7 +1,9 @@
+from typing import Literal
+
 from pydantic import (
     BaseModel as PydanticBaseModel,
 )
-from pydantic import NonNegativeFloat, NonNegativeInt, PositiveFloat, PositiveInt
+from pydantic import NonNegativeInt, PositiveFloat, PositiveInt
 
 from mapsy.io.input.keytypes import (
     ContactSpaceMode,
@@ -80,4 +82,8 @@ class ContactSpaceModel(BaseModel):
     threshold: NonZeroFloat = 0.1
     side: NonZeroFloat = 1.0
     core_epsilon: PositiveFloat = 1.0e-12
-    core_tolerance: NonNegativeFloat | None = None
+    layer_distance_tolerance: PositiveFloat | None = None
+    layer_gradient_cosine_min: float = 0.94
+    layer_tangent_tolerance: PositiveFloat = 0.35
+    n_layers: PositiveInt | Literal["auto"] = "auto"
+    layer_min_patch_size: PositiveInt = 2

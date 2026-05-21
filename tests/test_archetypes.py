@@ -18,7 +18,7 @@ class StubContactSpace:
         probabilities: np.ndarray,
         neighbors: list[np.ndarray],
         core_distance: np.ndarray | None = None,
-        is_core: np.ndarray | None = None,
+        layer: np.ndarray | None = None,
     ) -> None:
         self.nm = len(positions)
         self.neighbors = [np.asarray(row, dtype=np.int64) for row in neighbors]
@@ -30,8 +30,11 @@ class StubContactSpace:
             if core_distance is not None
             else np.ones(self.nm, dtype=np.float64)
         )
-        if is_core is not None:
-            self.data.loc[:, "is_core"] = np.asarray(is_core, dtype=bool)
+        self.data.loc[:, "layer"] = (
+            np.asarray(layer, dtype=np.int64)
+            if layer is not None
+            else np.zeros(self.nm, dtype=np.int64)
+        )
         self._feature_columns: list[str] = []
 
     @property
@@ -99,7 +102,7 @@ def test_maps_select_archetypes_prefers_high_probability_extremes() -> None:
     assert set(special["point_index"].tolist()) == {1, 3}
 
 
-def test_maps_select_archetypes_can_filter_candidates_by_core_distance() -> None:
+def test_maps_select_archetypes_can_filter_candidates_by_layer() -> None:
     positions = np.array(
         [
             [0.0, 0.0, 0.0],
@@ -115,50 +118,7 @@ def test_maps_select_archetypes_can_filter_candidates_by_core_distance() -> None
         np.array([1, 3, -1, -1, -1, -1]),
         np.array([2, -1, -1, -1, -1, -1]),
     ]
-    core_distance = np.array([0.6, 0.4, 0.2, 0.1], dtype=np.float64)
-    maps = Maps(
-        _build_system(),
-        [],
-        StubContactSpace(positions, probabilities, neighbors, core_distance),
-    )
-    maps.data = pd.DataFrame(
-        {
-            "x": positions[:, 0],
-            "y": positions[:, 1],
-            "z": positions[:, 2],
-            "f1": [0.0, 1.0, 10.0, 11.0],
-        }
-    )
-    maps.features = ["f1"]
-
-    result = maps.select_archetypes(
-        1,
-        feature_columns=["f1"],
-        max_core_distance=0.25,
-    )
-
-    assert result.candidate_indexes.tolist() == [2, 3]
-    assert result.selected_indexes.tolist() == [3]
-    assert result.metadata is not None
-    assert result.metadata["min_probability_quantile"] is None
-
-
-def test_maps_select_archetypes_can_filter_candidates_by_is_core() -> None:
-    positions = np.array(
-        [
-            [0.0, 0.0, 0.0],
-            [1.0, 0.0, 0.0],
-            [2.0, 0.0, 0.0],
-            [3.0, 0.0, 0.0],
-        ]
-    )
-    probabilities = np.array([0.1, 0.9, 0.2, 0.8], dtype=np.float64)
-    neighbors = [
-        np.array([1, -1, -1, -1, -1, -1]),
-        np.array([0, 2, -1, -1, -1, -1]),
-        np.array([1, 3, -1, -1, -1, -1]),
-        np.array([2, -1, -1, -1, -1, -1]),
-    ]
+    layer = np.array([0, 0, 1, 1], dtype=np.int64)
     maps = Maps(
         _build_system(),
         [],
@@ -167,7 +127,7 @@ def test_maps_select_archetypes_can_filter_candidates_by_is_core() -> None:
             probabilities,
             neighbors,
             np.array([0.6, 0.4, 0.2, 0.1], dtype=np.float64),
-            np.array([False, False, True, True], dtype=bool),
+            layer,
         ),
     )
     maps.data = pd.DataFrame(
@@ -176,12 +136,12 @@ def test_maps_select_archetypes_can_filter_candidates_by_is_core() -> None:
             "y": positions[:, 1],
             "z": positions[:, 2],
             "f1": [0.0, 1.0, 10.0, 11.0],
-            "is_core": [False, False, True, True],
+            "layer": layer,
         }
     )
     maps.features = ["f1"]
 
-    result = maps.select_archetypes(1, feature_columns=["f1"], core_only=True)
+    result = maps.select_archetypes(1, feature_columns=["f1"], layer=1)
 
     assert result.candidate_indexes.tolist() == [2, 3]
     assert result.selected_indexes.tolist() == [3]
@@ -189,7 +149,7 @@ def test_maps_select_archetypes_can_filter_candidates_by_is_core() -> None:
     assert result.metadata["min_probability_quantile"] is None
 
 
-def test_maps_reduce_can_fit_pca_on_core_points_only() -> None:
+def test_maps_reduce_can_fit_pca_on_layer() -> None:
     positions = np.array(
         [
             [0.0, 0.0, 0.0],
@@ -200,6 +160,7 @@ def test_maps_reduce_can_fit_pca_on_core_points_only() -> None:
     )
     probabilities = np.ones(len(positions), dtype=np.float64)
     neighbors = [np.full(6, -1, dtype=np.int64) for _ in range(len(positions))]
+    layer = np.array([0, 0, 1, 1], dtype=np.int64)
     maps = Maps(
         _build_system(),
         [],
@@ -208,7 +169,7 @@ def test_maps_reduce_can_fit_pca_on_core_points_only() -> None:
             probabilities,
             neighbors,
             np.array([0.9, 0.1, 0.2, 0.8], dtype=np.float64),
-            np.array([False, True, True, False], dtype=bool),
+            layer,
         ),
     )
     maps.data = pd.DataFrame(
@@ -218,23 +179,23 @@ def test_maps_reduce_can_fit_pca_on_core_points_only() -> None:
             "z": positions[:, 2],
             "f1": [100.0, 0.0, 2.0, 200.0],
             "f2": [50.0, 1.0, 1.0, 60.0],
-            "is_core": [False, True, True, False],
+            "layer": layer,
         }
     )
     maps.features = ["f1", "f2"]
 
-    result = maps.reduce(npca=1, core_only=True)
+    result = maps.reduce(npca=1, layer=0)
 
+    assert result.npca == 1
     assert maps.pca_analysis_result is not None
     np.testing.assert_allclose(
         maps.pca_analysis_result.estimator.mean_,
-        np.array([1.0, 1.0], dtype=np.float64),
+        np.array([50.0, 25.5], dtype=np.float64),
     )
-    assert result.transformed_values.shape == (4, 1)
     assert "pca0" in maps.data.columns
 
 
-def test_maps_cluster_can_restrict_to_core_points() -> None:
+def test_maps_cluster_can_fit_on_layer() -> None:
     positions = np.array(
         [
             [0.0, 0.0, 0.0],
@@ -250,6 +211,7 @@ def test_maps_cluster_can_restrict_to_core_points() -> None:
         np.array([1, 3, -1, -1, -1, -1]),
         np.array([2, -1, -1, -1, -1, -1]),
     ]
+    layer = np.array([0, 0, 1, 1], dtype=np.int64)
     maps = Maps(
         _build_system(),
         [],
@@ -258,7 +220,7 @@ def test_maps_cluster_can_restrict_to_core_points() -> None:
             probabilities,
             neighbors,
             np.array([0.8, 0.1, 0.2, 0.7], dtype=np.float64),
-            np.array([False, True, True, False], dtype=bool),
+            layer,
         ),
     )
     maps.data = pd.DataFrame(
@@ -267,19 +229,125 @@ def test_maps_cluster_can_restrict_to_core_points() -> None:
             "y": positions[:, 1],
             "z": positions[:, 2],
             "f1": [100.0, 0.0, 10.0, 200.0],
-            "is_core": [False, True, True, False],
+            "layer": layer,
         }
     )
     maps.features = ["f1"]
 
-    result = maps.cluster(nclusters=2, method="kmeans", random_state=0, core_only=True)
+    result = maps.cluster(nclusters=2, method="kmeans", random_state=0, layer=1)
 
-    assert result.labels.tolist().count(-1) == 2
-    assert set(result.labels[result.labels >= 0].tolist()) == {0, 1}
-    assert maps.data["Cluster"].tolist().count(-1) == 2
     assert result.metadata is not None
-    assert result.metadata["core_only"] is True
-    assert result.metadata["n_selected_points"] == 2
+    assert result.metadata["layer"] == [1]
+    np.testing.assert_array_equal(
+        maps.data["Cluster"].to_numpy(dtype=np.int64), np.array([-1, -1, 0, 1])
+    )
+
+
+def test_maps_cluster_can_propagate_layer_labels() -> None:
+    positions = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [3.0, 0.0, 0.0],
+        ]
+    )
+    probabilities = np.ones(len(positions), dtype=np.float64)
+    neighbors = [
+        np.array([1, -1, -1, -1, -1, -1]),
+        np.array([0, 2, -1, -1, -1, -1]),
+        np.array([1, 3, -1, -1, -1, -1]),
+        np.array([2, -1, -1, -1, -1, -1]),
+    ]
+    layer = np.array([0, 1, 1, 0], dtype=np.int64)
+    maps = Maps(
+        _build_system(),
+        [],
+        StubContactSpace(
+            positions,
+            probabilities,
+            neighbors,
+            np.array([0.8, 0.1, 0.2, 0.7], dtype=np.float64),
+            layer,
+        ),
+    )
+    maps.data = pd.DataFrame(
+        {
+            "x": positions[:, 0],
+            "y": positions[:, 1],
+            "z": positions[:, 2],
+            "f1": [100.0, 0.0, 10.0, 200.0],
+            "layer": layer,
+        }
+    )
+    maps.features = ["f1"]
+    maps.build_graph(mode="realspace", feature_columns=["f1"])
+
+    result = maps.cluster(
+        nclusters=2,
+        method="kmeans",
+        random_state=0,
+        layer=1,
+        propagate=True,
+        propagation_mode="region_grow",
+    )
+
+    labels = maps.data["Cluster"].to_numpy(dtype=np.int64)
+    assert np.all(labels >= 0)
+    assert labels[0] == labels[1]
+    assert labels[2] == labels[3]
+    assert labels[0] != labels[3]
+    assert result.metadata is not None
+    assert result.metadata["propagate"] is True
+    assert "cluster_confidence" in maps.data.columns
+
+
+def test_maps_sites_can_select_one_site_per_cluster_and_layer() -> None:
+    positions = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [3.0, 0.0, 0.0],
+        ]
+    )
+    probabilities = np.ones(len(positions), dtype=np.float64)
+    neighbors = [np.full(6, -1, dtype=np.int64) for _ in range(len(positions))]
+    layer = np.array([0, 1, 0, 1], dtype=np.int64)
+    maps = Maps(
+        _build_system(),
+        [],
+        StubContactSpace(
+            positions,
+            probabilities,
+            neighbors,
+            np.ones(len(positions), dtype=np.float64),
+            layer,
+        ),
+    )
+    maps.data = pd.DataFrame(
+        {
+            "x": positions[:, 0],
+            "y": positions[:, 1],
+            "z": positions[:, 2],
+            "f1": [0.0, 0.5, 10.0, 9.5],
+            "Cluster": [0, 0, 1, 1],
+            "layer": layer,
+        }
+    )
+    maps.features = ["f1"]
+    maps.cluster_features = ["f1"]
+    maps.cluster_centers = np.array([[0.0], [10.0]], dtype=np.float64)
+    maps.cluster_graph = np.zeros((2, 2), dtype=np.int64)
+    maps.cluster_edges = np.zeros((2, 2), dtype=np.int64)
+    maps.cluster_sizes = np.array([2, 2], dtype=np.int64)
+
+    maps.sites(region=0, per_layer=True)
+
+    special = maps.get_special_points(kind="centroid")
+    assert special["point_index"].tolist() == [0, 1, 2, 3]
+    assert special["layer"].tolist() == [0, 1, 0, 1]
+    assert special["cluster"].tolist() == [0, 0, 1, 1]
 
 
 def test_maps_scatter_can_plot_contactspace_core_mask_categorically() -> None:
@@ -306,9 +374,9 @@ def test_maps_scatter_can_plot_contactspace_core_mask_categorically() -> None:
             probabilities,
             neighbors,
             np.array([0.6, 0.4, 0.2, 0.1], dtype=np.float64),
-            np.array([False, False, True, True], dtype=bool),
         ),
     )
+    maps.contactspace.data.loc[:, "is_core"] = np.array([False, False, True, True], dtype=bool)
     maps.data = pd.DataFrame(
         {
             "x": positions[:, 0],
@@ -346,7 +414,6 @@ def test_maps_scatter_core_projection_prefers_smallest_core_distance() -> None:
             probabilities,
             neighbors,
             np.array([0.4, 0.1, 0.2], dtype=np.float64),
-            np.array([True, True, True], dtype=bool),
         ),
     )
     maps.data = pd.DataFrame(
@@ -355,7 +422,6 @@ def test_maps_scatter_core_projection_prefers_smallest_core_distance() -> None:
             "y": positions[:, 1],
             "z": positions[:, 2],
             "f1": [10.0, 20.0, 30.0],
-            "is_core": [True, True, True],
         }
     )
     maps.features = ["f1"]
@@ -387,7 +453,6 @@ def test_maps_scatter_core_projection_can_weighted_average_duplicates() -> None:
             probabilities,
             neighbors,
             np.array([0.4, 0.1, 0.2], dtype=np.float64),
-            np.array([True, True, True], dtype=bool),
         ),
     )
     maps.data = pd.DataFrame(
@@ -396,7 +461,6 @@ def test_maps_scatter_core_projection_can_weighted_average_duplicates() -> None:
             "y": positions[:, 1],
             "z": positions[:, 2],
             "f1": [10.0, 20.0, 30.0],
-            "is_core": [True, True, True],
         }
     )
     maps.features = ["f1"]
@@ -410,6 +474,46 @@ def test_maps_scatter_core_projection_can_weighted_average_duplicates() -> None:
 
     values = np.sort(np.asarray(ax.collections[0].get_array(), dtype=np.float64))
     np.testing.assert_allclose(values, np.array([17.5, 30.0], dtype=np.float64))
+    plt.close(fig)
+
+
+def test_maps_scatter_core_projection_can_filter_to_layer() -> None:
+    positions = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [1.0, 0.0, 0.0],
+        ]
+    )
+    probabilities = np.array([1.0, 2.0, 1.0], dtype=np.float64)
+    neighbors = [np.full(6, -1, dtype=np.int64) for _ in range(len(positions))]
+    maps = Maps(
+        _build_system(),
+        [],
+        StubContactSpace(
+            positions,
+            probabilities,
+            neighbors,
+            np.array([0.4, 0.1, 0.2], dtype=np.float64),
+            np.array([1, 0, 1], dtype=np.int64),
+        ),
+    )
+    maps.data = pd.DataFrame(
+        {
+            "x": positions[:, 0],
+            "y": positions[:, 1],
+            "z": positions[:, 2],
+            "f1": [10.0, 20.0, 30.0],
+        }
+    )
+    maps.features = ["f1"]
+
+    fig, ax = maps.scatter_core_projection(feature="f1", plane=("x", "y"), region=None, layer=1)
+
+    offsets = ax.collections[0].get_offsets()
+    values = np.sort(np.asarray(ax.collections[0].get_array(), dtype=np.float64))
+    assert offsets.shape[0] == 2
+    np.testing.assert_allclose(values, np.array([10.0, 30.0], dtype=np.float64))
     plt.close(fig)
 
 
