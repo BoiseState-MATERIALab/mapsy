@@ -6,6 +6,7 @@ import time
 from collections.abc import Mapping, Sequence
 from contextlib import AbstractContextManager, nullcontext
 from copy import deepcopy
+from inspect import Parameter, signature
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -146,6 +147,25 @@ def _threadpool_context(threadpool_threads: int | None) -> AbstractContextManage
     )
 
 
+def _call_maps_atcontactspace(
+    maps: Any,
+    *,
+    workers: int | None,
+    release_contactspace_cache: bool,
+) -> pd.DataFrame:
+    method = maps.atcontactspace
+    parameters = signature(method).parameters
+    accepts_kwargs = any(
+        parameter.kind == Parameter.VAR_KEYWORD for parameter in parameters.values()
+    )
+    kwargs: dict[str, Any] = {}
+    if accepts_kwargs or "workers" in parameters:
+        kwargs["workers"] = workers
+    if accepts_kwargs or "release_contactspace_cache" in parameters:
+        kwargs["release_contactspace_cache"] = release_contactspace_cache
+    return cast(pd.DataFrame, method(**kwargs))
+
+
 def _compute_map_features_worker(
     task: tuple[int, Any, int | None, bool, str | None, int | None],
 ) -> tuple[int, Any, float, int]:
@@ -169,7 +189,8 @@ def _compute_map_features_worker(
     )
     try:
         with _threadpool_context(threadpool_threads):
-            maps.atcontactspace(
+            _call_maps_atcontactspace(
+                maps,
                 workers=point_workers,
                 release_contactspace_cache=release_contactspace_cache,
             )
@@ -257,6 +278,9 @@ class MultiMaps:
         self.cluster_screening: pd.DataFrame | None = None
 
         self._slices: list[slice] = []
+        self._special_points = pd.DataFrame(
+            columns=["global_point_index", "kind", "iteration", "label_status"]
+        )
 
     def atcontactspace(
         self,
@@ -612,6 +636,50 @@ class MultiMaps:
                     propagation_feature_scale=propagation_feature_scale,
                     propagation_use_node_weights=propagation_use_node_weights,
                 )
+                unassigned_mask = full_labels < 0
+                if np.any(unassigned_mask):
+                    seed_indexes = np.flatnonzero(selected_mask)
+                    for map_index in np.unique(data.loc[unassigned_mask, "map_index"]):
+                        map_unassigned = np.flatnonzero(
+                            unassigned_mask
+                            & (data["map_index"].to_numpy(dtype=np.int64) == int(map_index))
+                        )
+                        map_seed_indexes = seed_indexes[
+                            data.loc[seed_indexes, "map_index"].to_numpy(dtype=np.int64)
+                            == int(map_index)
+                        ]
+                        if map_seed_indexes.size == 0:
+                            continue
+                        nearest_seed_positions = np.argmin(
+                            distance.cdist(
+                                data.loc[map_unassigned, self.cluster_features].to_numpy(
+                                    dtype=np.float64
+                                ),
+                                data.loc[map_seed_indexes, self.cluster_features].to_numpy(
+                                    dtype=np.float64
+                                ),
+                            ),
+                            axis=1,
+                        )
+                        full_labels[map_unassigned] = seed_labels[
+                            map_seed_indexes[nearest_seed_positions]
+                        ].astype(np.int64, copy=False)
+
+                    remaining_mask = full_labels < 0
+                    if np.any(remaining_mask):
+                        nearest_labels = np.argmin(
+                            distance.cdist(
+                                data.loc[remaining_mask, self.cluster_features].to_numpy(
+                                    dtype=np.float64
+                                ),
+                                result.centers,
+                            ),
+                            axis=1,
+                        )
+                        full_labels[remaining_mask] = nearest_labels.astype(
+                            np.int64,
+                            copy=False,
+                        )
             else:
                 full_labels = np.full(len(data), -1, dtype=np.int64)
                 full_labels[selected_mask] = result.labels
@@ -1085,6 +1153,9 @@ class MultiMaps:
     ) -> pd.DataFrame:
         """Return special points from all child maps with map and global indexes attached."""
         self._ensure_data()
+        if not all(hasattr(maps, "get_special_points") for maps in self.maps):
+            return self._global_special_points_frame(kind=kind, label_status=label_status)
+
         frames = []
         for map_index, (name, maps) in enumerate(zip(self.names, self.maps, strict=False)):
             frame = maps.get_special_points(kind=kind, label_status=label_status)
@@ -1226,7 +1297,8 @@ class MultiMaps:
             )
             start = time.perf_counter()
             with _threadpool_context(threadpool_threads):
-                maps.atcontactspace(
+                _call_maps_atcontactspace(
+                    maps,
                     workers=point_workers,
                     release_contactspace_cache=release_contactspace_cache,
                 )
@@ -1800,14 +1872,45 @@ class MultiMaps:
     ) -> None:
         indexes = np.asarray(global_point_indexes, dtype=np.int64).reshape(-1)
         if replace_kind:
+            self._special_points = self._special_points.loc[
+                self._special_points["kind"] != kind
+            ].reset_index(drop=True)
             for maps in self.maps:
-                maps.special_points.remove(kind=kind)
+                special_points = getattr(maps, "special_points", None)
+                if special_points is not None:
+                    special_points.remove(kind=kind)
         if indexes.size == 0:
             return
 
         data = self._ensure_data()
+        rows = pd.DataFrame(
+            {
+                "global_point_index": indexes,
+                "kind": kind,
+                "iteration": iteration,
+                "label_status": label_status,
+            }
+        )
+        for key, values in metadata.items():
+            if values is None:
+                continue
+            array = np.asarray(values, dtype=object).reshape(-1)
+            if array.size != indexes.size:
+                raise ValueError(
+                    f"Metadata column {key!r} has length {array.size}, expected {indexes.size}."
+                )
+            rows.loc[:, key] = array
+        self._special_points = pd.concat([self._special_points, rows], ignore_index=True)
+        self._special_points = self._special_points.drop_duplicates(
+            subset=["global_point_index", "kind"],
+            keep="last",
+        )
+
         selected = data.loc[indexes, ["map_index", "point_index"]].copy()
         for map_index, group in selected.groupby("map_index", sort=False):
+            add_special_points = getattr(self.maps[int(map_index)], "add_special_points", None)
+            if add_special_points is None:
+                continue
             group_metadata: dict[str, Any] = {}
             for key, values in metadata.items():
                 if values is None:
@@ -1821,7 +1924,7 @@ class MultiMaps:
                     selected["map_index"].to_numpy(dtype=np.int64) == int(map_index)
                 ]
                 group_metadata[key] = local_values
-            self.maps[int(map_index)].add_special_points(
+            add_special_points(
                 group["point_index"].to_numpy(dtype=np.int64),
                 kind=kind,
                 iteration=iteration,
@@ -1829,6 +1932,32 @@ class MultiMaps:
                 replace_kind=False,
                 **group_metadata,
             )
+
+    def _global_special_points_frame(
+        self,
+        *,
+        kind: str | None,
+        label_status: str | Sequence[str] | None,
+    ) -> pd.DataFrame:
+        frame = self._special_points
+        if kind is not None:
+            frame = frame.loc[frame["kind"] == kind]
+        if label_status is not None:
+            statuses = [label_status] if isinstance(label_status, str) else list(label_status)
+            frame = frame.loc[frame["label_status"].isin(statuses)]
+        frame = frame.copy()
+        if frame.empty:
+            return frame
+
+        data = self._ensure_data()
+        duplicate_columns = [
+            column
+            for column in frame.columns
+            if column != "global_point_index" and column in data.columns
+        ]
+        point_data = data.drop(columns=duplicate_columns).copy()
+        point_data.index.name = "global_point_index"
+        return frame.merge(point_data, on="global_point_index", how="left")
 
     def _with_map_identity(
         self,
@@ -2152,11 +2281,17 @@ class MultiMaps:
         for maps in self.maps:
             if maps.contactspace is None:
                 raise RuntimeError("Each Maps instance must define a contact space")
-            if column not in maps.contactspace.data.columns:
-                raise ValueError(
-                    f"node_weight_column {column!r} not present in child contactspace.data."
-                )
-            values.append(maps.contactspace.data[column].to_numpy(dtype=np.float64))
+            contactspace_data = getattr(maps.contactspace, "data", None)
+            if contactspace_data is not None and column in contactspace_data.columns:
+                values.append(contactspace_data[column].to_numpy(dtype=np.float64))
+                continue
+            maps_data = getattr(maps, "data", None)
+            if maps_data is not None and column in maps_data.columns:
+                values.append(maps_data[column].to_numpy(dtype=np.float64))
+                continue
+            raise ValueError(
+                f"node_weight_column {column!r} not present in child contactspace.data."
+            )
         return np.concatenate(values).astype(np.float64, copy=False)
 
     def _register_archetypes_on_children(

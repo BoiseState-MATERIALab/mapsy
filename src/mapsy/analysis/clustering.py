@@ -45,6 +45,7 @@ def fit_clusters(
         random_state=effective_random_state,
         graph_matrix=graph.matrix if graph is not None else None,
     )
+    labels = _renumber_labels_by_cluster_center(X, labels)
     centers = _cluster_centers(X, labels, feature_columns)
     sizes = _cluster_sizes(labels)
     return ClusterResult(
@@ -131,6 +132,23 @@ def _cluster_centers(
     frame = pd.DataFrame(X, columns=feature_columns)
     frame.loc[:, "Cluster"] = labels
     return frame.groupby("Cluster")[feature_columns].mean().to_numpy(dtype=np.float64)
+
+
+def _renumber_labels_by_cluster_center(
+    X: npt.NDArray[np.float64],
+    labels: npt.NDArray[np.int64],
+) -> npt.NDArray[np.int64]:
+    unique_labels = np.unique(labels)
+    centers = np.vstack([np.mean(X[labels == label], axis=0) for label in unique_labels]).astype(
+        np.float64, copy=False
+    )
+    sort_keys = tuple(centers[:, column] for column in range(centers.shape[1] - 1, -1, -1))
+    label_order = np.lexsort(sort_keys)
+    remap = {
+        int(unique_labels[old_index]): int(new_label)
+        for new_label, old_index in enumerate(label_order)
+    }
+    return np.array([remap[int(label)] for label in labels], dtype=np.int64)
 
 
 def _cluster_sizes(labels: npt.NDArray[np.int64]) -> npt.NDArray[np.int64]:

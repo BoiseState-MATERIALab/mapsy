@@ -570,7 +570,12 @@ class Maps:
         if self.data is None or frame.empty:
             return frame
 
-        point_data = self.data.copy()
+        duplicate_columns = [
+            column
+            for column in frame.columns
+            if column != "point_index" and column in self.data.columns
+        ]
+        point_data = self.data.drop(columns=duplicate_columns).copy()
         point_data.index.name = "point_index"
         return frame.merge(point_data, on="point_index", how="left")
 
@@ -1344,6 +1349,18 @@ class Maps:
                     propagation_feature_scale=propagation_feature_scale,
                     propagation_use_node_weights=propagation_use_node_weights,
                 )
+                unassigned_mask = full_labels < 0
+                if np.any(unassigned_mask):
+                    nearest_labels = np.argmin(
+                        distance.cdist(
+                            self.data.loc[unassigned_mask, self.cluster_features].to_numpy(
+                                dtype=np.float64
+                            ),
+                            result.centers,
+                        ),
+                        axis=1,
+                    )
+                    full_labels[unassigned_mask] = nearest_labels.astype(np.int64, copy=False)
             else:
                 full_labels = np.full(len(self.data), -1, dtype=np.int64)
                 full_labels[selected_mask] = result.labels
