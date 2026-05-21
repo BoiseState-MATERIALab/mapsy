@@ -4,7 +4,12 @@ from .archetypes import (
     propagate_archetypes,
     select_archetypes,
 )
-from .clustering import aggregate_cluster_graph, fit_clusters, screen_clusters
+from .clustering import (
+    aggregate_cluster_graph,
+    fit_clusters,
+    propagate_cluster_labels,
+    screen_clusters,
+)
 from .decomposition import fit_pca_analysis, project_pca
 from .graphs import FeatureConnectivityMode, GraphMode, build_point_graph
 
@@ -18,6 +23,7 @@ __all__ = [
     "fit_clusters",
     "fit_pca_analysis",
     "propagate_archetypes",
+    "propagate_cluster_labels",
     "project_pca",
     "select_archetypes",
     "screen_clusters",

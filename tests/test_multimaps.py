@@ -21,7 +21,17 @@ from mapsy.io.parser import resolve_file_model, resolve_file_records
 
 
 class FakeMaps:
-    _metadata_columns = {"region", "core_distance", "is_core"}
+    _metadata_columns = {
+        "region",
+        "signed_distance",
+        "core_distance",
+        "patch",
+        "layer",
+        "patch_size",
+        "layer_size",
+        "patch_mean_distance",
+        "layer_mean_distance",
+    }
 
     def __init__(self, frame: pd.DataFrame) -> None:
         self._frame = frame
@@ -76,7 +86,6 @@ def test_multimaps_combines_contact_space_data() -> None:
                 "z": [0.0, 0.0],
                 "region": [0, 0],
                 "core_distance": [0.1, 0.2],
-                "is_core": [True, True],
                 "f1": [0.1, 0.2],
                 "f2": [1.0, 1.1],
             }
@@ -90,7 +99,6 @@ def test_multimaps_combines_contact_space_data() -> None:
                 "z": [0.0, 0.0],
                 "region": [1, 1],
                 "core_distance": [0.3, 0.4],
-                "is_core": [False, False],
                 "f1": [0.3, 0.4],
                 "f2": [1.2, 1.3],
             }
@@ -103,13 +111,11 @@ def test_multimaps_combines_contact_space_data() -> None:
     assert multimaps.features == ["f1", "f2"]
     assert "region" not in multimaps.features
     assert "core_distance" not in multimaps.features
-    assert "is_core" not in multimaps.features
     assert combined["system"].tolist() == ["a", "a", "b", "b"]
     assert combined["map_index"].tolist() == [0, 0, 1, 1]
     assert combined["point_index"].tolist() == [0, 1, 0, 1]
     assert combined["region"].tolist() == [0, 0, 1, 1]
     assert combined["core_distance"].tolist() == [0.1, 0.2, 0.3, 0.4]
-    assert combined["is_core"].tolist() == [True, True, False, False]
 
 
 def test_multimaps_save_and_load_roundtrip_preserves_cached_data(tmp_path: Path) -> None:
@@ -121,7 +127,6 @@ def test_multimaps_save_and_load_roundtrip_preserves_cached_data(tmp_path: Path)
                 "z": [0.0, 0.0],
                 "region": [0, 0],
                 "core_distance": [0.1, 0.2],
-                "is_core": [True, True],
                 "f1": [0.1, 0.2],
             }
         )
@@ -134,7 +139,6 @@ def test_multimaps_save_and_load_roundtrip_preserves_cached_data(tmp_path: Path)
                 "z": [0.0, 0.0],
                 "region": [1, 1],
                 "core_distance": [0.3, 0.4],
-                "is_core": [False, False],
                 "f1": [0.3, 0.4],
             }
         )
@@ -218,14 +222,14 @@ def test_multimaps_reduce_propagates_pca_columns() -> None:
     assert {"pca0", "pca1"}.issubset(map_b.data.columns)
 
 
-def test_multimaps_reduce_can_fit_pca_on_core_points_only() -> None:
+def test_multimaps_reduce_can_fit_pca_on_layer() -> None:
     map_a = FakeMaps(
         pd.DataFrame(
             {
                 "x": [0.0, 0.1],
                 "y": [0.0, 0.1],
                 "z": [0.0, 0.0],
-                "is_core": [True, False],
+                "layer": [0, 1],
                 "f1": [0.0, 100.0],
                 "f2": [1.0, 50.0],
             }
@@ -237,7 +241,7 @@ def test_multimaps_reduce_can_fit_pca_on_core_points_only() -> None:
                 "x": [1.0, 1.1],
                 "y": [1.0, 1.1],
                 "z": [0.0, 0.0],
-                "is_core": [True, False],
+                "layer": [0, 1],
                 "f1": [2.0, 200.0],
                 "f2": [1.0, 60.0],
             }
@@ -246,14 +250,14 @@ def test_multimaps_reduce_can_fit_pca_on_core_points_only() -> None:
 
     multimaps = MultiMaps([map_a, map_b])
     multimaps.atcontactspace()
-    result = multimaps.reduce(npca=1, core_only=True)
+    result = multimaps.reduce(npca=1, layer=0)
 
+    assert result.npca == 1
     assert multimaps.pca_analysis_result is not None
     np.testing.assert_allclose(
         multimaps.pca_analysis_result.estimator.mean_,
         np.array([1.0, 1.0], dtype=np.float64),
     )
-    assert result.transformed_values.shape == (4, 1)
     assert multimaps.data is not None
     assert "pca0" in multimaps.data.columns
 
@@ -303,14 +307,14 @@ def test_multimaps_cluster_propagates_labels(method: str) -> None:
     assert "Cluster" in map_b.data.columns
 
 
-def test_multimaps_cluster_can_restrict_to_core_points() -> None:
+def test_multimaps_cluster_can_fit_on_layer() -> None:
     map_a = FakeMaps(
         pd.DataFrame(
             {
                 "x": [0.0, 0.1],
                 "y": [0.0, 0.1],
                 "z": [0.0, 0.0],
-                "is_core": [True, False],
+                "layer": [0, 1],
                 "f1": [0.0, 100.0],
             }
         )
@@ -321,7 +325,7 @@ def test_multimaps_cluster_can_restrict_to_core_points() -> None:
                 "x": [1.0, 1.1],
                 "y": [1.0, 1.1],
                 "z": [0.0, 0.0],
-                "is_core": [True, False],
+                "layer": [0, 1],
                 "f1": [10.0, 200.0],
             }
         )
@@ -329,16 +333,116 @@ def test_multimaps_cluster_can_restrict_to_core_points() -> None:
 
     multimaps = MultiMaps([map_a, map_b])
     multimaps.atcontactspace()
-    result = multimaps.cluster(nclusters=2, method="kmeans", random_state=0, core_only=True)
+    result = multimaps.cluster(nclusters=2, method="kmeans", random_state=0, layer=1)
 
-    assert result.labels.tolist().count(-1) == 2
-    assert set(result.labels[result.labels >= 0].tolist()) == {0, 1}
+    assert result.metadata is not None
+    assert result.metadata["layer"] == [1]
     assert multimaps.data is not None
-    assert multimaps.data["Cluster"].tolist().count(-1) == 2
-    assert map_a.data is not None
-    assert map_b.data is not None
-    assert map_a.data["Cluster"].tolist().count(-1) == 1
-    assert map_b.data["Cluster"].tolist().count(-1) == 1
+    np.testing.assert_array_equal(
+        multimaps.data["Cluster"].to_numpy(dtype=np.int64),
+        np.array([-1, 0, -1, 1], dtype=np.int64),
+    )
+
+
+def test_multimaps_cluster_can_propagate_layer_labels() -> None:
+    map_a = FakeMaps(
+        pd.DataFrame(
+            {
+                "x": [0.0, 1.0],
+                "y": [0.0, 0.0],
+                "z": [0.0, 0.0],
+                "probability": [1.0, 1.0],
+                "layer": [0, 1],
+                "f1": [100.0, 0.0],
+            }
+        )
+    )
+    map_b = FakeMaps(
+        pd.DataFrame(
+            {
+                "x": [2.0, 3.0],
+                "y": [0.0, 0.0],
+                "z": [0.0, 0.0],
+                "probability": [1.0, 1.0],
+                "layer": [1, 0],
+                "f1": [10.0, 200.0],
+            }
+        )
+    )
+
+    multimaps = MultiMaps([map_a, map_b])
+    multimaps.atcontactspace()
+    multimaps.build_graph(mode="realspace", feature_columns=["f1"])
+    result = multimaps.cluster(
+        nclusters=2,
+        method="kmeans",
+        random_state=0,
+        layer=1,
+        propagate=True,
+        propagation_mode="region_grow",
+    )
+
+    assert result.metadata is not None
+    assert result.metadata["propagate"] is True
+    assert multimaps.data is not None
+    labels = multimaps.data["Cluster"].to_numpy(dtype=np.int64)
+    assert np.all(labels >= 0)
+    assert labels[0] == labels[1]
+    assert labels[2] == labels[3]
+    assert labels[0] != labels[3]
+
+
+def test_multimaps_sites_can_select_one_site_per_cluster_and_layer() -> None:
+    map_a = FakeMaps(
+        pd.DataFrame(
+            {
+                "x": [0.0, 1.0],
+                "y": [0.0, 0.0],
+                "z": [0.0, 0.0],
+                "region": [0, 0],
+                "layer": [0, 1],
+                "f1": [0.0, 0.5],
+                "Cluster": [0, 0],
+            }
+        )
+    )
+    map_b = FakeMaps(
+        pd.DataFrame(
+            {
+                "x": [2.0, 3.0],
+                "y": [0.0, 0.0],
+                "z": [0.0, 0.0],
+                "region": [0, 0],
+                "layer": [0, 1],
+                "f1": [10.0, 9.5],
+                "Cluster": [1, 1],
+            }
+        )
+    )
+
+    multimaps = MultiMaps([map_a, map_b], names=["a", "b"])
+    multimaps.atcontactspace()
+    multimaps.cluster_features = ["f1"]
+    multimaps.cluster_centers = np.array([[0.0], [10.0]], dtype=np.float64)
+    multimaps.cluster_graph = np.zeros((2, 2), dtype=np.int64)
+    multimaps.cluster_edges = np.zeros((2, 2), dtype=np.int64)
+    multimaps.cluster_result = ClusterResult(
+        method="kmeans",
+        feature_columns=["f1"],
+        scale=False,
+        nclusters=2,
+        labels=np.array([0, 0, 1, 1], dtype=np.int64),
+        centers=np.array([[0.0], [10.0]], dtype=np.float64),
+        sizes=np.array([2, 2], dtype=np.int64),
+        random_state=0,
+        metadata={},
+    )
+
+    selected = multimaps.sites(region=0, per_layer=True)
+
+    assert selected["global_point_index"].tolist() == [0, 1, 2, 3]
+    assert selected["layer"].tolist() == [0, 1, 0, 1]
+    assert selected["cluster"].tolist() == [0, 0, 1, 1]
 
 
 def test_multimaps_cluster_screening_tracks_method() -> None:
@@ -545,7 +649,7 @@ def test_multimaps_from_file_rejects_unknown_contactspace_keys(tmp_path: Path) -
               spread: 0.5
               cutoff: 2
               threshold: 0.1
-              assign_layers: true
+              layer_switch_tolerance: 0.1
 
             symmetryfunctions:
               functions:
@@ -561,7 +665,7 @@ def test_multimaps_from_file_rejects_unknown_contactspace_keys(tmp_path: Path) -
         + "\n"
     )
 
-    with pytest.raises(Exception, match="assign_layers|extra fields not permitted"):
+    with pytest.raises(Exception, match="layer_switch_tolerance|extra fields not permitted"):
         MultiMapsFromFile(str(input_file))
 
 

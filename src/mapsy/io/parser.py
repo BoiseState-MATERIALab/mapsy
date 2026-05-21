@@ -214,7 +214,11 @@ class ContactSpaceGenerator:
         self.threshold = csmodel.threshold
         self.side = csmodel.side
         self.core_epsilon = getattr(csmodel, "core_epsilon", 1.0e-12)
-        self.core_tolerance = getattr(csmodel, "core_tolerance", None)
+        self.layer_distance_tolerance = getattr(csmodel, "layer_distance_tolerance", None)
+        self.layer_gradient_cosine_min = getattr(csmodel, "layer_gradient_cosine_min", 0.94)
+        self.layer_tangent_tolerance = getattr(csmodel, "layer_tangent_tolerance", 0.35)
+        self.n_layers = getattr(csmodel, "n_layers", "auto")
+        self.layer_min_patch_size = getattr(csmodel, "layer_min_patch_size", 2)
 
         self.spread = csmodel.spread
         if csmodel.mode == "system":
@@ -279,7 +283,11 @@ class ContactSpaceGenerator:
             self.boundary,
             self.threshold,
             core_epsilon=self.core_epsilon,
-            core_tolerance=self.core_tolerance,
+            layer_distance_tolerance=self.layer_distance_tolerance,
+            layer_gradient_cosine_min=self.layer_gradient_cosine_min,
+            layer_tangent_tolerance=self.layer_tangent_tolerance,
+            n_layers=self.n_layers,
+            layer_min_patch_size=self.layer_min_patch_size,
         )
         self._release_boundary_function_caches(self.boundary)
         return contactspace
