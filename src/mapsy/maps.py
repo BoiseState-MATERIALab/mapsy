@@ -868,6 +868,170 @@ class Maps:
             colorbar.solids.set_alpha(1.0)
         return fig, axs
 
+    def min_projection(
+        self,
+        feature: str | None = None,
+        index: int | None = None,
+        *,
+        minimize: str | None = None,
+        plane: tuple[str, str] = ("x", "y"),
+        region: int | None = 0,
+        layer: int | Sequence[int] | None = None,
+        coordinate_decimals: int | None = None,
+    ) -> pd.DataFrame:
+        """Project points onto a plane by selecting the minimum value along the normal."""
+        if self.data is None:
+            raise RuntimeError("No contact space data available.")
+        if len(plane) != 2 or plane[0] == plane[1]:
+            raise ValueError(f"plane must contain two distinct axes, got {plane!r}.")
+
+        frame = self.data.copy()
+        if "point_index" not in frame.columns:
+            frame.insert(0, "point_index", frame.index.to_numpy(dtype=np.int64))
+        if feature is not None:
+            resolved_feature = feature
+        elif index is not None:
+            if index >= len(self.features) or index < 0:
+                raise ValueError(f"Index {index} out of bounds.")
+            resolved_feature = self.features[index]
+            logger.info(f"Plotting feature {resolved_feature}")
+        else:
+            raise ValueError("Either feature or index must be provided.")
+        minimize_column = minimize or resolved_feature
+
+        remaining_axes = [axis for axis in ["x", "y", "z"] if axis not in plane]
+        if len(remaining_axes) != 1:
+            raise ValueError(f"plane must be a subset of ('x', 'y', 'z'), got {plane!r}.")
+        normal_axis = remaining_axes[0]
+
+        required_columns = {
+            resolved_feature,
+            minimize_column,
+            *plane,
+            normal_axis,
+        }
+        if region is not None:
+            required_columns.add("region")
+        if layer is not None:
+            required_columns.add("layer")
+
+        contactspace_data = getattr(getattr(self, "contactspace", None), "data", None)
+        for column in required_columns:
+            if column in frame.columns:
+                continue
+            if contactspace_data is not None and column in contactspace_data.columns:
+                frame.loc[:, column] = contactspace_data[column].to_numpy()
+            else:
+                raise ValueError(f"Column {column!r} not found in maps data or contactspace data.")
+        if contactspace_data is not None and "probability" in contactspace_data.columns:
+            frame.loc[:, "probability"] = contactspace_data["probability"].to_numpy()
+        elif "probability" not in frame.columns:
+            frame.loc[:, "probability"] = 1.0
+
+        mask = np.ones(len(frame), dtype=bool)
+        if region is not None:
+            mask &= frame["region"].to_numpy(dtype=np.int64) == int(region)
+        if layer is not None:
+            mask &= np.isin(frame["layer"].to_numpy(dtype=np.int64), _coerce_layer_values(layer))
+
+        columns = []
+        for column in [
+            plane[0],
+            plane[1],
+            normal_axis,
+            "point_index",
+            resolved_feature,
+            minimize_column,
+            "probability",
+        ]:
+            if column not in columns:
+                columns.append(column)
+        projected_input = frame.loc[mask, columns].copy()
+        if projected_input.empty:
+            raise ValueError("No points available after applying the projection filters.")
+        projected_input.loc[:, minimize_column] = pd.to_numeric(
+            projected_input[minimize_column],
+            errors="raise",
+        ).to_numpy(dtype=np.float64)
+
+        group_columns = list(plane)
+        if coordinate_decimals is not None:
+            group_columns = [f"__{axis}_projection_key" for axis in plane]
+            for axis, group_column in zip(plane, group_columns, strict=False):
+                projected_input.loc[:, group_column] = projected_input[axis].round(
+                    int(coordinate_decimals)
+                )
+
+        ordered = projected_input.sort_values(
+            [minimize_column, "probability", normal_axis],
+            ascending=[True, False, True],
+            kind="mergesort",
+        )
+        projected = ordered.groupby(group_columns, sort=False, as_index=False).first()
+        counts = (
+            projected_input.groupby(group_columns, sort=False)
+            .size()
+            .rename("multiplicity")
+            .reset_index()
+        )
+        projected = projected.merge(counts, on=group_columns, how="left")
+        drop_columns = [column for column in group_columns if column.startswith("__")]
+        if drop_columns:
+            projected = projected.drop(columns=drop_columns)
+        projected.loc[:, "projection_normal_axis"] = normal_axis
+        projected.loc[:, "minimized_column"] = minimize_column
+        return projected
+
+    def scatter_min_projection(
+        self,
+        feature: str | None = None,
+        index: int | None = None,
+        *,
+        minimize: str | None = None,
+        plane: tuple[str, str] = ("x", "y"),
+        region: int | None = 0,
+        layer: int | Sequence[int] | None = None,
+        coordinate_decimals: int | None = None,
+        set_aspect: str = "scaled",
+        return_projection: bool = False,
+        **kwargs: dict[str, Any],
+    ) -> tuple[Figure, Axes] | tuple[Figure, Axes, pd.DataFrame]:
+        """Scatter a plane projection selected by the minimum feature value."""
+        if set_aspect not in ["on", "off", "equal", "scaled"]:
+            raise ValueError("set_aspect must be one of ['on','off','equal','scaled']")
+
+        projected = self.min_projection(
+            feature=feature,
+            index=index,
+            minimize=minimize,
+            plane=plane,
+            region=region,
+            layer=layer,
+            coordinate_decimals=coordinate_decimals,
+        )
+        if feature is None:
+            if index is None:
+                raise ValueError("Either feature or index must be provided.")
+            feature = self.features[index]
+        minimize_column = minimize or feature
+
+        x = projected[plane[0]].to_numpy(dtype=np.float64)
+        y = projected[plane[1]].to_numpy(dtype=np.float64)
+        values = projected[feature].to_numpy(dtype=np.float64)
+
+        fig, ax = plt.subplots(1, 1, figsize=(8, 4))
+        ax.set_title(f"Minimum {minimize_column} projection on {plane[0]}-{plane[1]}")
+        ax.set_xlabel(plane[0])
+        ax.set_ylabel(plane[1])
+        scatter = ax.scatter(x, y, c=values, **kwargs)
+        colorbar = fig.colorbar(scatter, ax=ax)
+        colorbar.set_label(feature)
+        colorbar.solids.set_alpha(1.0)
+        ax.axis(set_aspect)
+        if return_projection:
+            return fig, ax, projected
+        return fig, ax
+
     def scatter_core_projection(
         self,
         feature: str | None = None,
@@ -875,6 +1039,7 @@ class Maps:
         *,
         plane: tuple[str, str] = ("x", "y"),
         selector: str = "core",
+        distance_column: str = "core_distance",
         region: int | None = 0,
         layer: int | Sequence[int] | None = 0,
         categorical: bool = False,
@@ -887,8 +1052,13 @@ class Maps:
             raise RuntimeError("No contact space data available.")
         if len(plane) != 2 or plane[0] == plane[1]:
             raise ValueError(f"plane must contain two distinct axes, got {plane!r}.")
-        if selector not in {"core", "top", "bottom", "weighted_mean"}:
-            raise ValueError("selector must be one of {'core', 'top', 'bottom', 'weighted_mean'}.")
+        center_selectors = {"core", "center", "distance"}
+        valid_selectors = center_selectors | {"top", "bottom", "weighted_mean"}
+        if selector not in valid_selectors:
+            raise ValueError(
+                "selector must be one of "
+                "{'core', 'center', 'distance', 'top', 'bottom', 'weighted_mean'}."
+            )
         if categorical and selector == "weighted_mean":
             raise ValueError("selector='weighted_mean' is only valid for numeric features.")
         if set_aspect not in ["on", "off", "equal", "scaled"]:
@@ -898,7 +1068,7 @@ class Maps:
         required_columns = {
             feature,
             *plane,
-            "core_distance",
+            distance_column,
             "probability",
         }
         for column in required_columns:
@@ -942,10 +1112,10 @@ class Maps:
             plane[1],
             normal_axis,
             feature,
-            "core_distance",
+            distance_column,
             "probability",
         ]
-        projected_input = frame.loc[mask, columns].copy()
+        projected_input = frame.loc[mask, list(dict.fromkeys(columns))].copy()
         if projected_input.empty:
             raise ValueError("No points available after applying the projection filters.")
 
@@ -965,8 +1135,8 @@ class Maps:
                         weights=weights,
                     ),
                     feature: np.average(group[feature].to_numpy(dtype=np.float64), weights=weights),
-                    "core_distance": float(
-                        np.min(group["core_distance"].to_numpy(dtype=np.float64))
+                    distance_column: float(
+                        np.min(group[distance_column].to_numpy(dtype=np.float64))
                     ),
                     "probability": float(np.max(weights)),
                     "multiplicity": int(len(group)),
@@ -976,13 +1146,17 @@ class Maps:
         else:
             ascending = {
                 "core": [True, False, False],
+                "center": [True, False, False],
+                "distance": [True, False, False],
                 "top": [False, True, False],
                 "bottom": [True, True, False],
             }[selector]
             sort_columns = {
-                "core": ["core_distance", "probability", normal_axis],
-                "top": [normal_axis, "core_distance", "probability"],
-                "bottom": [normal_axis, "core_distance", "probability"],
+                "core": [distance_column, "probability", normal_axis],
+                "center": [distance_column, "probability", normal_axis],
+                "distance": [distance_column, "probability", normal_axis],
+                "top": [normal_axis, distance_column, "probability"],
+                "bottom": [normal_axis, distance_column, "probability"],
             }[selector]
             ordered = projected_input.sort_values(
                 sort_columns, ascending=ascending, kind="mergesort"
@@ -1000,7 +1174,12 @@ class Maps:
         y = projected[plane[1]].to_numpy(dtype=np.float64)
 
         fig, ax = plt.subplots(1, 1, figsize=(8, 4))
-        ax.set_title(f"Core projection of {feature} on {plane[0]}-{plane[1]}")
+        title_prefix = (
+            f"Closest {distance_column}"
+            if selector in center_selectors
+            else selector.replace("_", " ").title()
+        )
+        ax.set_title(f"{title_prefix} projection of {feature} on {plane[0]}-{plane[1]}")
         ax.set_xlabel(plane[0])
         ax.set_ylabel(plane[1])
 

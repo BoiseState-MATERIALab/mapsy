@@ -436,6 +436,61 @@ def test_multimaps_scatter_uses_shared_categorical_legend() -> None:
     plt.close(fig)
 
 
+def test_multimaps_scatter_core_projection_selects_center_per_map() -> None:
+    plt.switch_backend("Agg")
+    map_a = FakeMaps(
+        pd.DataFrame(
+            {
+                "x": [0.0, 0.0, 1.0],
+                "y": [0.0, 0.0, 0.0],
+                "z": [0.0, 1.0, 0.0],
+                "region": [0, 0, 0],
+                "layer": [0, 0, 0],
+                "probability": [1.0, 2.0, 1.0],
+                "interface_center_distance": [0.4, 0.1, 0.2],
+                "f1": [10.0, 20.0, 30.0],
+            }
+        )
+    )
+    map_b = FakeMaps(
+        pd.DataFrame(
+            {
+                "x": [0.0, 0.0, 1.0],
+                "y": [0.0, 0.0, 0.0],
+                "z": [0.0, 1.0, 0.0],
+                "region": [0, 0, 0],
+                "layer": [0, 0, 0],
+                "probability": [1.0, 1.0, 1.0],
+                "interface_center_distance": [0.3, 0.05, 0.6],
+                "f1": [100.0, 200.0, 300.0],
+            }
+        )
+    )
+
+    multimaps = MultiMaps([map_a, map_b], names=["a", "b"])
+    multimaps.atcontactspace()
+    fig, axs, projection = multimaps.scatter_core_projection(
+        feature="f1",
+        selector="center",
+        distance_column="interface_center_distance",
+        return_projection=True,
+        s=10,
+    )
+
+    assert axs.shape == (1, 2)
+    selected = projection.sort_values(["map_index", "x", "y"]).reset_index(drop=True)
+    np.testing.assert_allclose(
+        selected["f1"].to_numpy(dtype=np.float64),
+        np.array([20.0, 30.0, 200.0, 300.0], dtype=np.float64),
+    )
+    assert selected["multiplicity"].tolist() == [2, 1, 2, 1]
+    assert axs[0, 0].collections[0].norm.vmin == 20.0
+    assert axs[0, 0].collections[0].norm.vmax == 300.0
+    assert axs[0, 1].collections[0].norm.vmin == 20.0
+    assert axs[0, 1].collections[0].norm.vmax == 300.0
+    plt.close(fig)
+
+
 def test_multimaps_sites_can_select_one_site_per_cluster_and_layer() -> None:
     map_a = FakeMaps(
         pd.DataFrame(

@@ -435,6 +435,52 @@ def test_maps_scatter_core_projection_prefers_smallest_core_distance() -> None:
     plt.close(fig)
 
 
+def test_maps_scatter_core_projection_can_use_distance_column() -> None:
+    positions = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [1.0, 0.0, 0.0],
+        ]
+    )
+    probabilities = np.array([1.0, 2.0, 1.0], dtype=np.float64)
+    neighbors = [np.full(6, -1, dtype=np.int64) for _ in range(len(positions))]
+    maps = Maps(
+        _build_system(),
+        [],
+        StubContactSpace(
+            positions,
+            probabilities,
+            neighbors,
+            np.array([0.1, 0.4, 0.2], dtype=np.float64),
+        ),
+    )
+    maps.data = pd.DataFrame(
+        {
+            "x": positions[:, 0],
+            "y": positions[:, 1],
+            "z": positions[:, 2],
+            "f1": [10.0, 20.0, 30.0],
+            "interface_center_distance": [0.4, 0.1, 0.2],
+        }
+    )
+    maps.features = ["f1"]
+
+    fig, ax = maps.scatter_core_projection(
+        feature="f1",
+        plane=("x", "y"),
+        selector="center",
+        distance_column="interface_center_distance",
+        region=None,
+    )
+
+    offsets = ax.collections[0].get_offsets()
+    values = np.asarray(ax.collections[0].get_array(), dtype=np.float64)
+    assert offsets.shape[0] == 2
+    np.testing.assert_allclose(values, np.array([20.0, 30.0], dtype=np.float64))
+    plt.close(fig)
+
+
 def test_maps_scatter_core_projection_can_weighted_average_duplicates() -> None:
     positions = np.array(
         [
@@ -514,6 +560,80 @@ def test_maps_scatter_core_projection_can_filter_to_layer() -> None:
     values = np.sort(np.asarray(ax.collections[0].get_array(), dtype=np.float64))
     assert offsets.shape[0] == 2
     np.testing.assert_allclose(values, np.array([10.0, 30.0], dtype=np.float64))
+    plt.close(fig)
+
+
+def test_maps_min_projection_selects_lowest_energy_along_normal() -> None:
+    positions = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [1.0, 0.0, 0.0],
+        ]
+    )
+    probabilities = np.array([1.0, 2.0, 1.0], dtype=np.float64)
+    neighbors = [np.full(6, -1, dtype=np.int64) for _ in range(len(positions))]
+    maps = Maps(
+        _build_system(),
+        [],
+        StubContactSpace(positions, probabilities, neighbors),
+    )
+    maps.data = pd.DataFrame(
+        {
+            "x": positions[:, 0],
+            "y": positions[:, 1],
+            "z": positions[:, 2],
+            "energy": [-0.1, -0.3, -0.2],
+        }
+    )
+    maps.features = ["energy"]
+
+    projected = maps.min_projection(feature="energy", plane=("x", "y"), region=None)
+
+    assert projected.shape[0] == 2
+    selected = projected.sort_values(["x", "y"]).reset_index(drop=True)
+    np.testing.assert_allclose(selected["energy"], np.array([-0.3, -0.2]))
+    np.testing.assert_allclose(selected["z"], np.array([1.0, 0.0]))
+    assert selected["multiplicity"].tolist() == [2, 1]
+
+
+def test_maps_scatter_min_projection_returns_selected_energy_projection() -> None:
+    positions = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [1.0, 0.0, 0.0],
+        ]
+    )
+    probabilities = np.ones(len(positions), dtype=np.float64)
+    neighbors = [np.full(6, -1, dtype=np.int64) for _ in range(len(positions))]
+    maps = Maps(
+        _build_system(),
+        [],
+        StubContactSpace(positions, probabilities, neighbors),
+    )
+    maps.data = pd.DataFrame(
+        {
+            "x": positions[:, 0],
+            "y": positions[:, 1],
+            "z": positions[:, 2],
+            "energy": [0.4, 0.1, 0.2],
+        }
+    )
+    maps.features = ["energy"]
+
+    fig, ax, projected = maps.scatter_min_projection(
+        feature="energy",
+        plane=("x", "y"),
+        region=None,
+        return_projection=True,
+    )
+
+    offsets = ax.collections[0].get_offsets()
+    values = np.sort(np.asarray(ax.collections[0].get_array(), dtype=np.float64))
+    assert offsets.shape[0] == 2
+    np.testing.assert_allclose(values, np.array([0.1, 0.2], dtype=np.float64))
+    assert projected["multiplicity"].tolist() == [2, 1]
     plt.close(fig)
 
 

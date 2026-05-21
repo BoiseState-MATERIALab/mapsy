@@ -758,6 +758,561 @@ class MultiMaps:
                 cbar.solids.set_alpha(1.0)
         return fig, axs
 
+    def min_projection(
+        self,
+        feature: str | None = None,
+        index: int | None = None,
+        *,
+        minimize: str | None = None,
+        plane: tuple[str, str] = ("x", "y"),
+        region: int | None = 0,
+        layer: int | Sequence[int] | None = None,
+        map_indexes: npt.ArrayLike | None = None,
+        coordinate_decimals: int | None = None,
+    ) -> pd.DataFrame:
+        """Return per-map plane projections selected by the minimum value along the normal."""
+        self._ensure_data()
+        if map_indexes is None:
+            selected_maps = np.arange(len(self.maps), dtype=np.int64)
+        else:
+            selected_maps = np.asarray(map_indexes, dtype=np.int64).reshape(-1)
+        if selected_maps.size == 0:
+            raise ValueError("map_indexes must select at least one map.")
+
+        frames: list[pd.DataFrame] = []
+        for map_index in selected_maps:
+            if map_index < 0 or map_index >= len(self.maps):
+                raise ValueError(
+                    f"map index {int(map_index)} out of range for {len(self.maps)} maps"
+                )
+            maps = self.maps[int(map_index)]
+            try:
+                projected = maps.min_projection(
+                    feature=feature,
+                    index=index,
+                    minimize=minimize,
+                    plane=plane,
+                    region=region,
+                    layer=layer,
+                    coordinate_decimals=coordinate_decimals,
+                ).copy()
+            except ValueError as exc:
+                if "No points available after applying the projection filters" in str(exc):
+                    continue
+                raise
+
+            projected.insert(0, "system", self._map_name(int(map_index)))
+            projected.insert(1, "map_index", int(map_index))
+            if "point_index" in projected.columns:
+                global_indexes = (
+                    projected["point_index"].to_numpy(dtype=np.int64)
+                    + self._slices[int(map_index)].start
+                )
+                projected.insert(2, "global_point_index", global_indexes)
+            frames.append(projected)
+
+        return self._combine_frames(frames)
+
+    def core_projection(
+        self,
+        feature: str | None = None,
+        index: int | None = None,
+        *,
+        plane: tuple[str, str] = ("x", "y"),
+        selector: str = "core",
+        distance_column: str = "core_distance",
+        region: int | None = 0,
+        layer: int | Sequence[int] | None = 0,
+        map_indexes: npt.ArrayLike | None = None,
+        categorical: bool = False,
+    ) -> pd.DataFrame:
+        """Return per-map plane projections selected by distance, height, or weighted mean."""
+        frame = self._ensure_data().copy()
+        if feature is not None:
+            resolved_feature = feature
+        elif index is not None:
+            if index >= len(self.features) or index < 0:
+                raise ValueError(f"Index {index} out of bounds.")
+            resolved_feature = self.features[index]
+            logger.info("Projecting feature %s", resolved_feature)
+        else:
+            raise ValueError("Either feature or index must be provided.")
+        if len(plane) != 2 or plane[0] == plane[1]:
+            raise ValueError(f"plane must contain two distinct axes, got {plane!r}.")
+
+        center_selectors = {"core", "center", "distance"}
+        valid_selectors = center_selectors | {"top", "bottom", "weighted_mean"}
+        if selector not in valid_selectors:
+            raise ValueError(
+                "selector must be one of "
+                "{'core', 'center', 'distance', 'top', 'bottom', 'weighted_mean'}."
+            )
+        if categorical and selector == "weighted_mean":
+            raise ValueError("selector='weighted_mean' is only valid for numeric features.")
+
+        remaining_axes = [axis for axis in ["x", "y", "z"] if axis not in plane]
+        if len(remaining_axes) != 1:
+            raise ValueError(f"plane must be a subset of ('x', 'y', 'z'), got {plane!r}.")
+        normal_axis = remaining_axes[0]
+
+        if map_indexes is None:
+            selected_maps = np.arange(len(self.maps), dtype=np.int64)
+        else:
+            selected_maps = np.asarray(map_indexes, dtype=np.int64).reshape(-1)
+        if selected_maps.size == 0:
+            raise ValueError("map_indexes must select at least one map.")
+        invalid_maps = selected_maps[(selected_maps < 0) | (selected_maps >= len(self.maps))]
+        if invalid_maps.size:
+            raise ValueError(f"map_indexes contains invalid indexes: {invalid_maps.tolist()}.")
+
+        required_columns = {
+            "system",
+            "map_index",
+            "point_index",
+            resolved_feature,
+            *plane,
+            normal_axis,
+            distance_column,
+            "probability",
+        }
+        if region is not None:
+            required_columns.add("region")
+        if layer is not None:
+            required_columns.add("layer")
+        for column in required_columns:
+            if column in frame.columns:
+                continue
+            frame.loc[:, column] = self._collect_contactspace_column(column)
+
+        mask = np.isin(frame["map_index"].to_numpy(dtype=np.int64), selected_maps)
+        if region is not None:
+            mask &= frame["region"].to_numpy(dtype=np.int64) == int(region)
+        if layer is not None:
+            mask &= np.isin(frame["layer"].to_numpy(dtype=np.int64), _coerce_layer_values(layer))
+
+        columns = [
+            "system",
+            "map_index",
+            "point_index",
+            plane[0],
+            plane[1],
+            normal_axis,
+            resolved_feature,
+            distance_column,
+            "probability",
+        ]
+        projected_input = frame.loc[mask, list(dict.fromkeys(columns))].copy()
+        if projected_input.empty:
+            raise ValueError("No points available after applying the projection filters.")
+
+        group_columns = ["map_index", plane[0], plane[1]]
+        if selector == "weighted_mean":
+            feature_values = pd.to_numeric(projected_input[resolved_feature], errors="raise")
+            projected_input.loc[:, resolved_feature] = feature_values.to_numpy(dtype=np.float64)
+            groups: list[dict[str, Any]] = []
+            for coords, group in projected_input.groupby(group_columns, sort=False, dropna=False):
+                weights = group["probability"].to_numpy(dtype=np.float64)
+                if np.allclose(weights.sum(), 0.0):
+                    weights = np.ones(len(group), dtype=np.float64)
+                first = group.iloc[0]
+                row = {
+                    "system": first["system"],
+                    "map_index": int(coords[0]),
+                    "point_index": int(first["point_index"]),
+                    plane[0]: coords[1],
+                    plane[1]: coords[2],
+                    normal_axis: np.average(
+                        group[normal_axis].to_numpy(dtype=np.float64),
+                        weights=weights,
+                    ),
+                    resolved_feature: np.average(
+                        group[resolved_feature].to_numpy(dtype=np.float64),
+                        weights=weights,
+                    ),
+                    distance_column: float(
+                        np.min(group[distance_column].to_numpy(dtype=np.float64))
+                    ),
+                    "probability": float(np.max(weights)),
+                    "multiplicity": int(len(group)),
+                }
+                groups.append(row)
+            projected = pd.DataFrame(groups)
+        else:
+            ascending = {
+                "core": [True, False, False],
+                "center": [True, False, False],
+                "distance": [True, False, False],
+                "top": [False, True, False],
+                "bottom": [True, True, False],
+            }[selector]
+            sort_columns = {
+                "core": [distance_column, "probability", normal_axis],
+                "center": [distance_column, "probability", normal_axis],
+                "distance": [distance_column, "probability", normal_axis],
+                "top": [normal_axis, distance_column, "probability"],
+                "bottom": [normal_axis, distance_column, "probability"],
+            }[selector]
+            ordered = projected_input.sort_values(
+                sort_columns, ascending=ascending, kind="mergesort"
+            )
+            projected = ordered.groupby(group_columns, sort=False, as_index=False).first()
+            counts = (
+                projected_input.groupby(group_columns, sort=False)
+                .size()
+                .rename("multiplicity")
+                .reset_index()
+            )
+            projected = projected.merge(counts, on=group_columns, how="left")
+
+        projected.loc[:, "global_point_index"] = projected["point_index"].to_numpy(
+            dtype=np.int64
+        ) + np.array(
+            [self._slices[int(map_index)].start for map_index in projected["map_index"]],
+            dtype=np.int64,
+        )
+        projected.loc[:, "projection_selector"] = selector
+        projected.loc[:, "projection_distance_column"] = distance_column
+        return projected
+
+    def scatter_core_projection(
+        self,
+        feature: str | None = None,
+        index: int | None = None,
+        *,
+        plane: tuple[str, str] = ("x", "y"),
+        selector: str = "core",
+        distance_column: str = "core_distance",
+        region: int | None = 0,
+        layer: int | Sequence[int] | None = 0,
+        map_indexes: npt.ArrayLike | None = None,
+        categorical: bool = False,
+        categories: Sequence[Any] | None = None,
+        ncols: int | None = None,
+        figsize: tuple[float, float] | None = None,
+        panel_size: tuple[float, float] = (4.5, 4.0),
+        cmap: str | mpl.colors.Colormap | None = None,
+        colorbar: bool = True,
+        legend: bool = True,
+        sharex: bool = False,
+        sharey: bool = False,
+        set_aspect: str = "scaled",
+        return_projection: bool = False,
+        **kwargs: Any,
+    ) -> (
+        tuple[Figure, npt.NDArray[np.object_]]
+        | tuple[Figure, npt.NDArray[np.object_], pd.DataFrame]
+    ):
+        """Scatter core-distance plane projections for multiple maps."""
+        if set_aspect not in ["on", "off", "equal", "scaled"]:
+            raise ValueError("set_aspect must be one of ['on','off','equal','scaled']")
+        if feature is not None:
+            resolved_feature = feature
+        elif index is not None:
+            if index >= len(self.features) or index < 0:
+                raise ValueError(f"Index {index} out of bounds.")
+            resolved_feature = self.features[index]
+        else:
+            raise ValueError("Either feature or index must be provided.")
+
+        projection = self.core_projection(
+            feature=feature,
+            index=index,
+            plane=plane,
+            selector=selector,
+            distance_column=distance_column,
+            region=region,
+            layer=layer,
+            map_indexes=map_indexes,
+            categorical=categorical,
+        )
+        if projection.empty:
+            raise ValueError("No points available after applying the projection filters.")
+
+        if map_indexes is None:
+            selected_maps = np.arange(len(self.maps), dtype=np.int64)
+        else:
+            selected_maps = np.asarray(map_indexes, dtype=np.int64).reshape(-1)
+        nmaps = int(selected_maps.size)
+        if ncols is None:
+            ncols = min(4, int(np.ceil(np.sqrt(nmaps))))
+        ncols = max(1, min(int(ncols), nmaps))
+        nrows = int(np.ceil(nmaps / ncols))
+        if figsize is None:
+            extra_width = 1.7 if categorical and legend else 0.8 if colorbar else 0.0
+            figsize = (panel_size[0] * ncols + extra_width, panel_size[1] * nrows)
+
+        fig, axs = plt.subplots(
+            nrows,
+            ncols,
+            figsize=figsize,
+            sharex=sharex,
+            sharey=sharey,
+            squeeze=False,
+        )
+        axslist = axs.reshape(-1)
+
+        scatter_kwargs = dict(kwargs)
+        scatter_artist = None
+        legend_handles: list[Line2D] = []
+        if categorical:
+            scatter_kwargs.pop("c", None)
+            scatter_kwargs.pop("color", None)
+            observed_categories = pd.unique(projection[resolved_feature].dropna())
+            if categories is not None:
+                category_values = np.array(list(categories), dtype=object)
+            elif resolved_feature == "Cluster" and self.nclusters > 0:
+                category_values = np.arange(self.nclusters, dtype=np.int64)
+                observed_numeric = np.asarray(observed_categories, dtype=np.float64)
+                if observed_numeric.size and np.any(observed_numeric < 0):
+                    category_values = np.concatenate(
+                        [np.array([-1], dtype=np.int64), category_values]
+                    )
+            else:
+                category_values = observed_categories
+            if category_values.size == 0:
+                raise ValueError(f"Feature {resolved_feature!r} does not contain plottable values.")
+            if np.issubdtype(category_values.dtype, np.number):
+                category_values = np.sort(category_values.astype(np.float64, copy=False))
+            color_map = (
+                cmap if isinstance(cmap, mpl.colors.Colormap) else mpl.colormaps[cmap or "tab20"]
+            )
+            if resolved_feature == "Cluster" and self.nclusters > 0:
+                cluster_colors = color_map(np.linspace(0, 1, self.nclusters, endpoint=False))
+                fallback_colors = color_map(np.linspace(0, 1, len(category_values), endpoint=False))
+                category_colors = {}
+                for fallback_index, category in enumerate(category_values):
+                    category_color = fallback_colors[fallback_index]
+                    if isinstance(category, (int, float, np.integer, np.floating)):
+                        category_number = float(category)
+                        if category_number.is_integer():
+                            cluster_index = int(category_number)
+                            if cluster_index == -1:
+                                category_color = (0.6, 0.6, 0.6, 1.0)
+                            elif 0 <= cluster_index < self.nclusters:
+                                category_color = cluster_colors[cluster_index]
+                    category_colors[category] = category_color
+            else:
+                colors = color_map(np.linspace(0, 1, len(category_values), endpoint=False))
+                category_colors = dict(zip(category_values.tolist(), colors, strict=False))
+            for category in category_values:
+                label = (
+                    str(int(category))
+                    if isinstance(category, float) and category.is_integer()
+                    else str(category)
+                )
+                legend_handles.append(
+                    Line2D(
+                        [0],
+                        [0],
+                        marker="o",
+                        linestyle="",
+                        markerfacecolor=category_colors[category],
+                        markeredgecolor="none",
+                        label=f"{resolved_feature} = {label}",
+                    )
+                )
+        else:
+            values = projection[resolved_feature].to_numpy(dtype=np.float64)
+            if "norm" in scatter_kwargs:
+                norm = scatter_kwargs.pop("norm")
+            else:
+                vmin = scatter_kwargs.pop("vmin", float(np.nanmin(values)))
+                vmax = scatter_kwargs.pop("vmax", float(np.nanmax(values)))
+                norm = mpl.colors.Normalize(vmin=vmin, vmax=vmax)
+            color_map = (
+                cmap
+                if isinstance(cmap, mpl.colors.Colormap)
+                else mpl.colormaps[cmap or scatter_kwargs.pop("cmap", "viridis")]
+            )
+
+        for ax, map_index in zip(axslist, selected_maps, strict=False):
+            map_projection = projection.loc[
+                projection["map_index"].to_numpy(dtype=np.int64) == int(map_index)
+            ]
+            ax.set_title(self._map_name(int(map_index)))
+            ax.set_xlabel(plane[0])
+            ax.set_ylabel(plane[1])
+            if map_projection.empty:
+                ax.axis(set_aspect)
+                continue
+
+            x = map_projection[plane[0]].to_numpy(dtype=np.float64)
+            y = map_projection[plane[1]].to_numpy(dtype=np.float64)
+            if categorical:
+                map_values = map_projection[resolved_feature].to_numpy()
+                for category in category_values:
+                    category_mask = map_values == category
+                    if not np.any(category_mask):
+                        continue
+                    scatter_artist = ax.scatter(
+                        x[category_mask],
+                        y[category_mask],
+                        color=category_colors[category],
+                        **scatter_kwargs,
+                    )
+            else:
+                scatter_artist = ax.scatter(
+                    x,
+                    y,
+                    c=map_projection[resolved_feature].to_numpy(dtype=np.float64),
+                    cmap=color_map,
+                    norm=norm,
+                    **scatter_kwargs,
+                )
+            ax.axis(set_aspect)
+
+        for ax in axslist[nmaps:]:
+            ax.axis("off")
+
+        center_selectors = {"core", "center", "distance"}
+        title_prefix = (
+            f"Closest {distance_column}"
+            if selector in center_selectors
+            else selector.replace("_", " ").title()
+        )
+        fig.suptitle(f"{title_prefix} projection of {resolved_feature} on {plane[0]}-{plane[1]}")
+        visible_axes = axslist[:nmaps].tolist()
+        if categorical:
+            if legend:
+                fig.legend(
+                    handles=legend_handles,
+                    bbox_to_anchor=(0.995, 0.5),
+                    loc="center right",
+                    borderaxespad=0.0,
+                )
+                fig.tight_layout(rect=(0.0, 0.0, 0.86, 1.0))
+            else:
+                fig.tight_layout()
+        else:
+            fig.tight_layout()
+            if colorbar and scatter_artist is not None:
+                cbar = fig.colorbar(scatter_artist, ax=visible_axes)
+                cbar.set_label(resolved_feature)
+                cbar.solids.set_alpha(1.0)
+        if return_projection:
+            return fig, axs, projection
+        return fig, axs
+
+    def scatter_min_projection(
+        self,
+        feature: str | None = None,
+        index: int | None = None,
+        *,
+        minimize: str | None = None,
+        plane: tuple[str, str] = ("x", "y"),
+        region: int | None = 0,
+        layer: int | Sequence[int] | None = None,
+        map_indexes: npt.ArrayLike | None = None,
+        coordinate_decimals: int | None = None,
+        ncols: int | None = None,
+        figsize: tuple[float, float] | None = None,
+        panel_size: tuple[float, float] = (4.5, 4.0),
+        cmap: str | mpl.colors.Colormap | None = None,
+        colorbar: bool = True,
+        sharex: bool = False,
+        sharey: bool = False,
+        set_aspect: str = "scaled",
+        return_projection: bool = False,
+        **kwargs: Any,
+    ) -> (
+        tuple[Figure, npt.NDArray[np.object_]]
+        | tuple[Figure, npt.NDArray[np.object_], pd.DataFrame]
+    ):
+        """Scatter minimum-value plane projections for multiple maps with one colorbar."""
+        if set_aspect not in ["on", "off", "equal", "scaled"]:
+            raise ValueError("set_aspect must be one of ['on','off','equal','scaled']")
+        if feature is not None:
+            resolved_feature = feature
+        elif index is not None:
+            if index >= len(self.features) or index < 0:
+                raise ValueError(f"Index {index} out of bounds.")
+            resolved_feature = self.features[index]
+        else:
+            raise ValueError("Either feature or index must be provided.")
+
+        projection = self.min_projection(
+            feature=feature,
+            index=index,
+            minimize=minimize,
+            plane=plane,
+            region=region,
+            layer=layer,
+            map_indexes=map_indexes,
+            coordinate_decimals=coordinate_decimals,
+        )
+        if projection.empty:
+            raise ValueError("No points available after applying the projection filters.")
+
+        if map_indexes is None:
+            selected_maps = np.arange(len(self.maps), dtype=np.int64)
+        else:
+            selected_maps = np.asarray(map_indexes, dtype=np.int64).reshape(-1)
+        nmaps = int(selected_maps.size)
+        if ncols is None:
+            ncols = min(4, int(np.ceil(np.sqrt(nmaps))))
+        ncols = max(1, min(int(ncols), nmaps))
+        nrows = int(np.ceil(nmaps / ncols))
+        if figsize is None:
+            extra_width = 0.8 if colorbar else 0.0
+            figsize = (panel_size[0] * ncols + extra_width, panel_size[1] * nrows)
+
+        fig, axs = plt.subplots(
+            nrows,
+            ncols,
+            figsize=figsize,
+            sharex=sharex,
+            sharey=sharey,
+            squeeze=False,
+        )
+        axslist = axs.reshape(-1)
+
+        values = projection[resolved_feature].to_numpy(dtype=np.float64)
+        scatter_kwargs = dict(kwargs)
+        if "norm" in scatter_kwargs:
+            norm = scatter_kwargs.pop("norm")
+        else:
+            vmin = scatter_kwargs.pop("vmin", float(np.nanmin(values)))
+            vmax = scatter_kwargs.pop("vmax", float(np.nanmax(values)))
+            norm = mpl.colors.Normalize(vmin=vmin, vmax=vmax)
+        color_map = (
+            cmap
+            if isinstance(cmap, mpl.colors.Colormap)
+            else mpl.colormaps[cmap or scatter_kwargs.pop("cmap", "viridis")]
+        )
+
+        scatter_artist = None
+        minimized_column = minimize or resolved_feature
+        for ax, map_index in zip(axslist, selected_maps, strict=False):
+            map_projection = projection.loc[
+                projection["map_index"].to_numpy(dtype=np.int64) == int(map_index)
+            ]
+            ax.set_title(self._map_name(int(map_index)))
+            ax.set_xlabel(plane[0])
+            ax.set_ylabel(plane[1])
+            if not map_projection.empty:
+                scatter_artist = ax.scatter(
+                    map_projection[plane[0]].to_numpy(dtype=np.float64),
+                    map_projection[plane[1]].to_numpy(dtype=np.float64),
+                    c=map_projection[resolved_feature].to_numpy(dtype=np.float64),
+                    cmap=color_map,
+                    norm=norm,
+                    **scatter_kwargs,
+                )
+            ax.axis(set_aspect)
+
+        for ax in axslist[nmaps:]:
+            ax.axis("off")
+
+        fig.suptitle(f"Minimum {minimized_column} projection on {plane[0]}-{plane[1]}")
+        fig.tight_layout()
+        if colorbar and scatter_artist is not None:
+            cbar = fig.colorbar(scatter_artist, ax=axslist[:nmaps].tolist())
+            cbar.set_label(resolved_feature)
+            cbar.solids.set_alpha(1.0)
+        if return_projection:
+            return fig, axs, projection
+        return fig, axs
+
     def analyze_pca(
         self,
         scale: bool = False,
