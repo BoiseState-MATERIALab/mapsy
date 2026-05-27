@@ -89,6 +89,20 @@ def _nearest_reference_indexes(
     return nearest.kneighbors(points, return_distance=False).reshape(-1).astype(np.int64)
 
 
+def _nearest_reference_distances(
+    points: npt.NDArray[np.float64],
+    references: npt.NDArray[np.float64],
+) -> npt.NDArray[np.float64]:
+    if points.size == 0:
+        return np.zeros(points.shape[0], dtype=np.float64)
+    if references.size == 0:
+        return np.zeros(points.shape[0], dtype=np.float64)
+    nearest = NearestNeighbors(n_neighbors=1)
+    nearest.fit(references)
+    distances, _ = nearest.kneighbors(points)
+    return distances.reshape(-1).astype(np.float64)
+
+
 def _build_maps_from_file_worker(
     task: tuple[str, str, dict[str, Any], dict[str, Any], dict[str, Any]]
 ) -> Any:
@@ -2597,33 +2611,31 @@ class MultiMaps:
         )
 
         remaining = np.arange(len(candidate_frame), dtype=np.int64)
-        selected_local: list[int] = []
-        selected_real: list[npt.NDArray[np.float64]] = []
-        selected_feature: list[npt.NDArray[np.float64]] = []
         records: list[dict[str, Any]] = []
+        has_real_references = real_seeds.size > 0
+        has_feature_references = feature_seeds.size > 0
+        real_min_distances = (
+            _nearest_reference_distances(real_candidates, real_seeds)
+            if real_space_weight > 0.0 and has_real_references
+            else np.zeros(len(candidate_frame), dtype=np.float64)
+        )
+        feature_min_distances = (
+            _nearest_reference_distances(feature_candidates, feature_seeds)
+            if feature_space_weight > 0.0 and has_feature_references
+            else np.zeros(len(candidate_frame), dtype=np.float64)
+        )
 
         for rank in range(npoints):
-            current_real = real_candidates[remaining]
-            current_feature = feature_candidates[remaining]
             current_energy = energy_values[remaining]
             current_uncertainty = uncertainty_values[remaining]
 
-            real_refs = self._stack_references(real_seeds, selected_real, width=3)
-            feature_refs = self._stack_references(
-                feature_seeds,
-                selected_feature,
-                width=feature_candidates.shape[1],
-            )
-
             real_component = (
-                self._normalize_component(self._min_distance_to_references(current_real, real_refs))
+                self._normalize_component(real_min_distances[remaining])
                 if real_space_weight > 0.0
                 else np.zeros(len(remaining), dtype=np.float64)
             )
             feature_component = (
-                self._normalize_component(
-                    self._min_distance_to_references(current_feature, feature_refs)
-                )
+                self._normalize_component(feature_min_distances[remaining])
                 if feature_space_weight > 0.0
                 else np.zeros(len(remaining), dtype=np.float64)
             )
@@ -2660,11 +2672,6 @@ class MultiMaps:
             best_local = int(remaining[best_position])
             best_index = candidate_frame.index[best_local]
 
-            selected_local.append(best_local)
-            selected_real.append(real_candidates[best_local])
-            if feature_candidates.shape[1] > 0:
-                selected_feature.append(feature_candidates[best_local])
-
             records.append(
                 {
                     "selection_rank": rank,
@@ -2677,6 +2684,29 @@ class MultiMaps:
                     "global_point_index": int(best_index),
                 }
             )
+
+            if real_space_weight > 0.0:
+                new_real_distances = np.linalg.norm(
+                    real_candidates - real_candidates[best_local],
+                    axis=1,
+                )
+                real_min_distances = (
+                    np.minimum(real_min_distances, new_real_distances)
+                    if has_real_references
+                    else new_real_distances
+                )
+                has_real_references = True
+            if feature_space_weight > 0.0 and feature_candidates.shape[1] > 0:
+                new_feature_distances = np.linalg.norm(
+                    feature_candidates - feature_candidates[best_local],
+                    axis=1,
+                )
+                feature_min_distances = (
+                    np.minimum(feature_min_distances, new_feature_distances)
+                    if has_feature_references
+                    else new_feature_distances
+                )
+                has_feature_references = True
 
             remaining = np.delete(remaining, best_position)
 

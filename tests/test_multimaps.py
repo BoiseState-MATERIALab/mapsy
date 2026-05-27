@@ -604,6 +604,50 @@ def test_multimaps_sites_can_use_global_pivoted_qr_selection() -> None:
     assert map_b.get_special_points(kind="site")["point_index"].tolist() == [0]
 
 
+def test_multimaps_select_special_points_greedy_balances_cached_distances() -> None:
+    map_a = _build_selection_maps(
+        pd.DataFrame(
+            {
+                "x": [0.0, 1.0, 2.0],
+                "y": [0.0, 0.0, 0.0],
+                "z": [0.0, 0.0, 0.0],
+                "region": [0, 0, 0],
+                "f1": [0.0, 1.0, 10.0],
+            }
+        )
+    )
+    map_b = _build_selection_maps(
+        pd.DataFrame(
+            {
+                "x": [10.0, 11.0],
+                "y": [0.0, 0.0],
+                "z": [0.0, 0.0],
+                "region": [0, 0],
+                "f1": [2.0, 11.0],
+            }
+        )
+    )
+
+    multimaps = MultiMaps([map_a, map_b], names=["a", "b"])
+    multimaps.atcontactspace(recompute=False)
+    selected = multimaps.select_special_points(
+        2,
+        scope="global",
+        kind="simulation",
+        region=0,
+        feature_columns=["f1"],
+        feature_space_weight=1.0,
+        real_space_weight=0.05,
+        special_point_indexes=np.array([0], dtype=np.int64),
+        scale_features=False,
+        replace_kind=True,
+    )
+
+    assert selected["global_point_index"].tolist() == [4, 3]
+    assert selected["selection_method"].tolist() == ["greedy", "greedy"]
+    assert map_b.get_special_points(kind="simulation")["point_index"].tolist() == [1, 0]
+
+
 def test_multimaps_cluster_screening_tracks_method() -> None:
     plt.switch_backend("Agg")
     map_a = FakeMaps(
