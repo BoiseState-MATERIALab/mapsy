@@ -20,6 +20,7 @@ import scipy.spatial.distance as distance
 from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
 from pathos.multiprocessing import ProcessingPool
+from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import StandardScaler
 from threadpoolctl import threadpool_limits
 from yaml import SafeLoader, load
@@ -75,6 +76,17 @@ def _coerce_layer_values(layer: int | Sequence[int]) -> list[int]:
     if isinstance(layer, (int, np.integer)):
         return [int(layer)]
     return [int(value) for value in layer]
+
+
+def _nearest_reference_indexes(
+    points: npt.NDArray[np.float64],
+    references: npt.NDArray[np.float64],
+) -> npt.NDArray[np.int64]:
+    if references.shape[0] == 0:
+        raise ValueError("references must contain at least one row.")
+    nearest = NearestNeighbors(n_neighbors=1)
+    nearest.fit(references)
+    return nearest.kneighbors(points, return_distance=False).reshape(-1).astype(np.int64)
 
 
 def _build_maps_from_file_worker(
@@ -1487,16 +1499,13 @@ class MultiMaps:
                         ]
                         if map_seed_indexes.size == 0:
                             continue
-                        nearest_seed_positions = np.argmin(
-                            distance.cdist(
-                                data.loc[map_unassigned, self.cluster_features].to_numpy(
-                                    dtype=np.float64
-                                ),
-                                data.loc[map_seed_indexes, self.cluster_features].to_numpy(
-                                    dtype=np.float64
-                                ),
+                        nearest_seed_positions = _nearest_reference_indexes(
+                            data.loc[map_unassigned, self.cluster_features].to_numpy(
+                                dtype=np.float64
                             ),
-                            axis=1,
+                            data.loc[map_seed_indexes, self.cluster_features].to_numpy(
+                                dtype=np.float64
+                            ),
                         )
                         full_labels[map_unassigned] = seed_labels[
                             map_seed_indexes[nearest_seed_positions]
