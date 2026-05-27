@@ -6,10 +6,12 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import pytest
+from ase import Atoms
 
 from mapsy import (
     ClusterResult,
     ClusterScreeningResult,
+    Maps,
     MultiMaps,
     MultiMapsFromFile,
     PCAAnalysisResult,
@@ -17,6 +19,7 @@ from mapsy import (
     plot_cluster_screening,
     plot_pca_scree,
 )
+from mapsy.data import Grid, System
 from mapsy.io.parser import resolve_file_model, resolve_file_records
 
 
@@ -48,6 +51,18 @@ class FakeMaps:
             if column not in {"x", "y", "z", *self._metadata_columns}
         ]
         return self.data
+
+
+def _build_selection_maps(frame: pd.DataFrame) -> Maps:
+    cell = np.diag([10.0, 10.0, 10.0])
+    grid = Grid(scalars=[2, 2, 2], cell=cell)
+    atoms = Atoms("H", positions=[[5.0, 5.0, 5.0]], cell=cell, pbc=True)
+    maps = Maps(System(grid=grid, atoms=atoms), [])
+    maps.data = frame.copy()
+    maps.features = [
+        column for column in frame.columns if column not in {"x", "y", "z", "region", "layer"}
+    ]
+    return maps
 
 
 def _write_xyz(path: Path, x: float) -> None:
@@ -542,6 +557,51 @@ def test_multimaps_sites_can_select_one_site_per_cluster_and_layer() -> None:
     assert selected["global_point_index"].tolist() == [0, 1, 2, 3]
     assert selected["layer"].tolist() == [0, 1, 0, 1]
     assert selected["cluster"].tolist() == [0, 0, 1, 1]
+
+
+def test_multimaps_sites_can_use_global_pivoted_qr_selection() -> None:
+    map_a = _build_selection_maps(
+        pd.DataFrame(
+            {
+                "x": [0.0, 1.0],
+                "y": [0.0, 0.0],
+                "z": [0.0, 0.0],
+                "region": [0, 0],
+                "layer": [0, 0],
+                "f1": [1.0, 0.9],
+                "f2": [0.0, 0.1],
+            }
+        )
+    )
+    map_b = _build_selection_maps(
+        pd.DataFrame(
+            {
+                "x": [2.0, 3.0],
+                "y": [0.0, 0.0],
+                "z": [0.0, 0.0],
+                "region": [0, 0],
+                "layer": [0, 0],
+                "f1": [0.0, 0.1],
+                "f2": [1.0, 0.9],
+            }
+        )
+    )
+
+    multimaps = MultiMaps([map_a, map_b], names=["a", "b"])
+    multimaps.atcontactspace(recompute=False)
+    selected = multimaps.sites(
+        method="pivoted_qr",
+        nsites=2,
+        kind="site",
+        feature_columns=["f1", "f2"],
+        scope="global",
+        scale_features=False,
+    )
+
+    assert selected["global_point_index"].tolist() == [0, 2]
+    assert selected["selection_method"].tolist() == ["pivoted_qr", "pivoted_qr"]
+    assert map_a.get_special_points(kind="site")["point_index"].tolist() == [0]
+    assert map_b.get_special_points(kind="site")["point_index"].tolist() == [0]
 
 
 def test_multimaps_cluster_screening_tracks_method() -> None:

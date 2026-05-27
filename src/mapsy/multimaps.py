@@ -56,6 +56,13 @@ from mapsy.results import (
     PCAAnalysisResult,
     PCAResult,
 )
+from mapsy.selection import (
+    normalize_point_selection_method,
+    normalize_site_selection_method,
+    pivoted_cholesky_rbf_selection,
+    pivoted_qr_selection,
+    selection_metadata_columns,
+)
 
 if TYPE_CHECKING:
     from .maps import Maps
@@ -1577,13 +1584,40 @@ class MultiMaps:
         *,
         scope: str = "global",
         per_layer: bool = False,
+        method: str = "cluster_centroid",
+        nsites: int | None = None,
         kind: str = "centroid",
         iteration: int | None = 0,
         label_status: str = "unlabeled",
         replace_kind: bool = True,
+        feature_columns: list[str] | None = None,
+        layer: int | Sequence[int] | None = None,
+        scale_features: bool = True,
+        kernel: str = "rbf",
+        gamma: float | str | None = "median",
     ) -> pd.DataFrame:
         """Register cluster-centroid sites globally or independently within each map."""
         scope = self._validate_scope(scope)
+        method = normalize_site_selection_method(method)
+        if method != "cluster_centroid":
+            if nsites is None:
+                raise ValueError("nsites is required for non-cluster site selection methods.")
+            return self.select_special_points(
+                npoints=nsites,
+                scope=scope,
+                kind=kind,
+                iteration=iteration,
+                label_status=label_status,
+                replace_kind=replace_kind,
+                feature_columns=feature_columns,
+                region=region,
+                layer=layer,
+                scale_features=scale_features,
+                method=method,
+                kernel=kernel,
+                gamma=gamma,
+            )
+
         data = self._ensure_data()
         if (
             self.cluster_centers is None
@@ -1848,11 +1882,15 @@ class MultiMaps:
         special_point_indexes: npt.ArrayLike | None = None,
         centroid_indexes: npt.ArrayLike | None = None,
         region: int | None = None,
+        layer: int | Sequence[int] | None = None,
         real_space_weight: float = 0.0,
         feature_space_weight: float = 1.0,
         energy_weight: float = 0.0,
         uncertainty_weight: float = 0.0,
         scale_features: bool = True,
+        method: str = "greedy",
+        kernel: str = "rbf",
+        gamma: float | str | None = "median",
         energy_selection_mode: str = "global_minimum",
         gradient_columns: list[str] | None = None,
         gradient_norm_column: str | None = None,
@@ -1881,11 +1919,15 @@ class MultiMaps:
                     special_point_indexes=special_point_indexes,
                     centroid_indexes=centroid_indexes,
                     region=region,
+                    layer=layer,
                     real_space_weight=real_space_weight,
                     feature_space_weight=feature_space_weight,
                     energy_weight=energy_weight,
                     uncertainty_weight=uncertainty_weight,
                     scale_features=scale_features,
+                    method=method,
+                    kernel=kernel,
+                    gamma=gamma,
                     energy_selection_mode=energy_selection_mode,
                     gradient_columns=gradient_columns,
                     gradient_norm_column=gradient_norm_column,
@@ -1913,11 +1955,15 @@ class MultiMaps:
             special_point_indexes=special_point_indexes,
             centroid_indexes=centroid_indexes,
             region=region,
+            layer=layer,
             real_space_weight=real_space_weight,
             feature_space_weight=feature_space_weight,
             energy_weight=energy_weight,
             uncertainty_weight=uncertainty_weight,
             scale_features=scale_features,
+            method=method,
+            kernel=kernel,
+            gamma=gamma,
             energy_selection_mode=energy_selection_mode,
             gradient_columns=gradient_columns,
             gradient_norm_column=gradient_norm_column,
@@ -1930,14 +1976,7 @@ class MultiMaps:
         selected_global_indexes = selected.index.to_numpy(dtype=np.int64)
         add_metadata = dict(metadata)
         if store_selection_metadata:
-            for column in [
-                "selection_rank",
-                "selection_score",
-                "real_space_score",
-                "feature_space_score",
-                "energy_score",
-                "uncertainty_score",
-            ]:
+            for column in selection_metadata_columns(method):
                 if column in selected.columns and column not in add_metadata:
                     add_metadata[column] = selected[column].to_numpy()
 
@@ -2416,11 +2455,15 @@ class MultiMaps:
         special_point_indexes: npt.ArrayLike | None,
         centroid_indexes: npt.ArrayLike | None,
         region: int | None,
+        layer: int | Sequence[int] | None,
         real_space_weight: float,
         feature_space_weight: float,
         energy_weight: float,
         uncertainty_weight: float,
         scale_features: bool,
+        method: str,
+        kernel: str,
+        gamma: float | str | None,
         energy_selection_mode: str,
         gradient_columns: list[str] | None,
         gradient_norm_column: str | None,
@@ -2433,20 +2476,30 @@ class MultiMaps:
             raise ValueError("npoints must be positive")
 
         data = self._ensure_data()
-        weights = np.array(
-            [real_space_weight, feature_space_weight, energy_weight, uncertainty_weight],
-            dtype=np.float64,
-        )
-        if np.any(weights < 0.0):
-            raise ValueError("Selection weights must be non-negative")
-        if not np.any(weights > 0.0):
-            raise ValueError("At least one selection weight must be positive")
+        selection_method = normalize_point_selection_method(method)
+        if selection_method == "greedy":
+            weights = np.array(
+                [real_space_weight, feature_space_weight, energy_weight, uncertainty_weight],
+                dtype=np.float64,
+            )
+            if np.any(weights < 0.0):
+                raise ValueError("Selection weights must be non-negative")
+            if not np.any(weights > 0.0):
+                raise ValueError("At least one selection weight must be positive")
+        elif selection_method == "pivoted_cholesky" and str(kernel).lower() != "rbf":
+            raise ValueError("Only kernel='rbf' is supported for pivoted selection methods.")
 
         frame = data.copy()
         if region is not None:
             if "region" not in frame.columns:
                 frame.loc[:, "region"] = self._collect_contactspace_column("region")
             frame = frame.loc[frame["region"].to_numpy(dtype=np.int64) == region].copy()
+        if layer is not None:
+            if "layer" not in frame.columns:
+                frame.loc[:, "layer"] = self._collect_contactspace_column("layer").astype(np.int64)
+            frame = frame.loc[
+                np.isin(frame["layer"].to_numpy(dtype=np.int64), _coerce_layer_values(layer))
+            ].copy()
 
         if frame.empty:
             raise RuntimeError("No candidate points available for selection")
@@ -2472,7 +2525,7 @@ class MultiMaps:
             feature_columns,
             energy_column=energy_column,
             uncertainty_column=uncertainty_column,
-            feature_space_weight=feature_space_weight,
+            feature_space_weight=feature_space_weight if selection_method == "greedy" else 1.0,
         )
 
         real_candidates = candidate_frame[["x", "y", "z"]].to_numpy(dtype=np.float64)
@@ -2492,6 +2545,36 @@ class MultiMaps:
         else:
             feature_candidates = np.zeros((len(candidate_frame), 0), dtype=np.float64)
             feature_seeds = np.zeros((len(seed_indexes), 0), dtype=np.float64)
+
+        if selection_method != "greedy":
+            if selection_method == "pivoted_qr":
+                selected_local_array, pivot_scores = pivoted_qr_selection(
+                    feature_candidates,
+                    npoints,
+                    seed_features=feature_seeds,
+                )
+                kernel_gamma: float | None = None
+            else:
+                selected_local_array, pivot_scores, kernel_gamma = pivoted_cholesky_rbf_selection(
+                    feature_candidates,
+                    npoints,
+                    seed_features=feature_seeds,
+                    gamma=gamma,
+                )
+            global_indexes = candidate_frame.index[selected_local_array].to_numpy(dtype=np.int64)
+            selection = candidate_frame.loc[global_indexes].copy()
+            selection.loc[:, "global_point_index"] = selection.index.to_numpy(dtype=np.int64)
+            selection.loc[:, "selection_rank"] = np.arange(npoints, dtype=np.int64)
+            selection.loc[:, "selection_score"] = pivot_scores
+            selection.loc[:, "selection_method"] = selection_method
+            selection.loc[:, "real_space_score"] = 0.0
+            selection.loc[:, "feature_space_score"] = pivot_scores
+            selection.loc[:, "energy_score"] = 0.0
+            selection.loc[:, "uncertainty_score"] = 0.0
+            selection.loc[:, "pivot_score"] = pivot_scores
+            if kernel_gamma is not None:
+                selection.loc[:, "kernel_gamma"] = kernel_gamma
+            return selection.sort_values("selection_rank")
 
         energy_values = (
             candidate_frame[energy_column].to_numpy(dtype=np.float64)
@@ -2581,6 +2664,7 @@ class MultiMaps:
                     "feature_space_score": float(feature_component[best_position]),
                     "energy_score": float(energy_component[best_position]),
                     "uncertainty_score": float(uncertainty_component[best_position]),
+                    "selection_method": selection_method,
                     "global_point_index": int(best_index),
                 }
             )
@@ -2597,6 +2681,7 @@ class MultiMaps:
         ]
         selection.loc[:, "energy_score"] = [record["energy_score"] for record in records]
         selection.loc[:, "uncertainty_score"] = [record["uncertainty_score"] for record in records]
+        selection.loc[:, "selection_method"] = [record["selection_method"] for record in records]
         return selection.sort_values("selection_rank")
 
     def _resolve_selection_feature_columns(

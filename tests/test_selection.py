@@ -159,6 +159,60 @@ def test_select_special_points_registers_selection_for_workflow_use() -> None:
     assert registry["point_index"].tolist() == [1]
 
 
+def test_select_special_points_can_use_pivoted_qr_and_layer_filter() -> None:
+    frame = pd.DataFrame(
+        {
+            "x": [0.0, 1.0, 2.0, 3.0],
+            "y": [0.0, 0.0, 0.0, 0.0],
+            "z": [0.0, 0.0, 0.0, 0.0],
+            "layer": [0, 1, 1, 1],
+            "f1": [0.0, 1.0, 0.0, 0.9],
+            "f2": [0.0, 0.0, 1.0, 0.1],
+        }
+    )
+    maps = _build_maps(frame)
+
+    selected = maps.select_special_points(
+        npoints=2,
+        kind="site",
+        feature_columns=["f1", "f2"],
+        method="pivoted_qr",
+        layer=1,
+        scale_features=False,
+    )
+
+    assert selected["point_index"].tolist() == [1, 2]
+    assert selected["selection_method"].tolist() == ["pivoted_qr", "pivoted_qr"]
+    assert "pivot_score" in selected.columns
+
+
+def test_select_points_can_use_pivoted_cholesky_rbf() -> None:
+    frame = pd.DataFrame(
+        {
+            "x": [0.0, 1.0, 2.0],
+            "y": [0.0, 0.0, 0.0],
+            "z": [0.0, 0.0, 0.0],
+            "f1": [0.0, 1.0, 10.0],
+        }
+    )
+    maps = _build_maps(frame)
+
+    selected = maps.select_points(
+        npoints=2,
+        feature_columns=["f1"],
+        method="pivoted_cholesky",
+        gamma=0.1,
+        scale_features=False,
+    )
+
+    assert selected.index.tolist() == [0, 2]
+    assert selected["selection_method"].tolist() == [
+        "pivoted_cholesky",
+        "pivoted_cholesky",
+    ]
+    assert selected["kernel_gamma"].tolist() == [0.1, 0.1]
+
+
 def test_select_points_can_target_local_minima_instead_of_global_minimum() -> None:
     frame = pd.DataFrame(
         {
