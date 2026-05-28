@@ -112,6 +112,34 @@ def test_robust_gaussian_process_surrogate_matches_notebook_style_fit() -> None:
     assert dataset_validation["predictions"].shape == y.shape
 
 
+def test_robust_gaussian_process_surrogate_parallel_starts_match_serial_fit() -> None:
+    rng = np.random.default_rng(1)
+    X = rng.normal(size=(16, 2))
+    y = 0.7 * X[:, 0] ** 2 - 0.4 * X[:, 1] + 0.1 * X[:, 0] * X[:, 1]
+    kwargs = {
+        "name": "pes",
+        "role": "pes",
+        "feature_names": ["pc1", "distance"],
+        "target_name": "energy",
+        "n_random_starts": 2,
+        "n_cv_splits": 2,
+        "seed": 1,
+    }
+
+    serial = RobustGaussianProcessSurrogate(**kwargs)
+    parallel = RobustGaussianProcessSurrogate(**kwargs, n_jobs=2)
+
+    serial.fit(X, y)
+    parallel.fit(X, y)
+
+    assert len(parallel.fit_records_) == len(serial.fit_records_)
+    np.testing.assert_allclose(
+        parallel.best_record_.cv_rmse_mean,
+        serial.best_record_.cv_rmse_mean,
+    )
+    np.testing.assert_allclose(parallel.predict(X[:4]), serial.predict(X[:4]))
+
+
 def test_model_training_spec_validates_builder_dataset() -> None:
     frame = pd.DataFrame(
         {
