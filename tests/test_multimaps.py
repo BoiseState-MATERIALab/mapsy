@@ -21,6 +21,7 @@ from mapsy import (
 )
 from mapsy.data import Grid, System
 from mapsy.io.parser import resolve_file_model, resolve_file_records
+from mapsy.multimaps import _pandas_pickle_compatibility
 
 
 class FakeMaps:
@@ -171,6 +172,20 @@ def test_multimaps_save_and_load_roundtrip_preserves_cached_data(tmp_path: Path)
     assert loaded.names == ["a", "b"]
     assert loaded.maps[0].data is not None
     assert loaded.maps[1].data is not None
+
+
+def test_pandas_pickle_compatibility_accepts_legacy_string_array_state() -> None:
+    import pandas._libs.arrays as pd_arrays
+
+    dtype = pd.StringDtype(storage="python", na_value=np.nan)
+    state = (dtype, np.array(["x", "y"], dtype=object))
+
+    with _pandas_pickle_compatibility():
+        array = pd_arrays.__pyx_unpickle_NDArrayBacked(pd.arrays.StringArray, 82904607, None)
+        array.__setstate__(state)
+
+    assert list(array) == ["x", "y"]
+    assert isinstance(array.dtype, pd.StringDtype)
 
 
 def test_multimaps_requires_shared_features() -> None:
@@ -503,6 +518,46 @@ def test_multimaps_scatter_core_projection_selects_center_per_map() -> None:
     assert axs[0, 0].collections[0].norm.vmax == 300.0
     assert axs[0, 1].collections[0].norm.vmin == 20.0
     assert axs[0, 1].collections[0].norm.vmax == 300.0
+    plt.close(fig)
+
+
+def test_multimaps_plot_min_projection_returns_smoothed_contour_panels() -> None:
+    map_a = _build_selection_maps(
+        pd.DataFrame(
+            {
+                "x": [0.0, 0.0, 1.0, 0.0, 1.0],
+                "y": [0.0, 0.0, 0.0, 1.0, 1.0],
+                "z": [0.0, 1.0, 0.0, 0.0, 0.0],
+                "energy": [0.4, 0.1, 0.2, 0.3, 0.5],
+            }
+        )
+    )
+    map_b = _build_selection_maps(
+        pd.DataFrame(
+            {
+                "x": [0.0, 0.0, 1.0, 0.0, 1.0],
+                "y": [0.0, 0.0, 0.0, 1.0, 1.0],
+                "z": [0.0, 1.0, 0.0, 0.0, 0.0],
+                "energy": [1.4, 1.1, 1.2, 1.3, 1.5],
+            }
+        )
+    )
+    multimaps = MultiMaps([map_a, map_b], names=["a", "b"])
+
+    fig, axs, projection = multimaps.plot_min_projection(
+        feature="energy",
+        plane=("x", "y"),
+        region=None,
+        smooth_sigma=0.5,
+        levels=5,
+        ncols=2,
+        return_projection=True,
+    )
+
+    assert axs.shape == (1, 2)
+    assert projection.groupby("map_index").size().tolist() == [4, 4]
+    assert axs[0, 0].get_title() == "a"
+    assert axs[0, 1].get_title() == "b"
     plt.close(fig)
 
 

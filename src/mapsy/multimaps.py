@@ -4,7 +4,7 @@ import os
 import pickle
 import time
 from collections.abc import Mapping, Sequence
-from contextlib import AbstractContextManager, nullcontext
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from copy import deepcopy
 from inspect import Parameter, signature
 from pathlib import Path
@@ -48,6 +48,7 @@ from mapsy.clustering import (
     clustering_uses_random_state,
     normalize_cluster_method,
 )
+from mapsy.maps import _nan_gaussian_filter, _projection_grid, _resolve_contour_levels
 from mapsy.results import (
     ArchetypePropagationResult,
     ArchetypeSelectionResult,
@@ -70,6 +71,95 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+
+def _string_array_numpy_semantics_base() -> type:
+    try:
+        dtype = pd.StringDtype(storage="python", na_value=np.nan)
+        return type(pd.array([""], dtype=dtype))
+    except Exception:
+        return cast(type, pd.arrays.StringArray)
+
+
+_StringArrayNumpySemanticsBase: type = _string_array_numpy_semantics_base()
+
+
+class _PandasCompatStringArray(pd.arrays.StringArray):
+    def __setstate__(self, state: Any) -> None:
+        if isinstance(state, tuple) and len(state) == 2 and isinstance(state[0], pd.StringDtype):
+            state = (state[0], state[1], {})
+        super().__setstate__(state)
+
+
+class _PandasCompatStringArrayNumpySemantics(_StringArrayNumpySemanticsBase):
+    def __setstate__(self, state: Any) -> None:
+        if isinstance(state, tuple) and len(state) == 2 and isinstance(state[0], pd.StringDtype):
+            state = (state[0], state[1], {})
+        super().__setstate__(state)
+
+
+@contextmanager
+def _pandas_pickle_compatibility() -> Any:
+    import numpy._typing._array_like as np_array_like
+    import pandas._libs.arrays as pd_arrays
+
+    original_unpickle = pd_arrays.__pyx_unpickle_NDArrayBacked
+    had_buffer_alias = hasattr(np_array_like, "_Buffer")
+    original_buffer_alias = getattr(np_array_like, "_Buffer", None)
+    if not had_buffer_alias:
+        np_array_like._Buffer = Any
+
+    def compat_unpickle(__pyx_type: type, __pyx_checksum: int, __pyx_state: Any) -> Any:
+        type_name = getattr(__pyx_type, "__name__", "")
+        if type_name == "StringArray":
+            __pyx_type = _PandasCompatStringArray
+        elif type_name == "StringArrayNumpySemantics":
+            __pyx_type = _PandasCompatStringArrayNumpySemantics
+        return original_unpickle(__pyx_type, __pyx_checksum, __pyx_state)
+
+    pd_arrays.__pyx_unpickle_NDArrayBacked = compat_unpickle
+    try:
+        yield
+    finally:
+        pd_arrays.__pyx_unpickle_NDArrayBacked = original_unpickle
+        if had_buffer_alias:
+            np_array_like._Buffer = original_buffer_alias
+        else:
+            delattr(np_array_like, "_Buffer")
+
+
+def _normalize_dataframe_axes(frame: Any) -> None:
+    if not isinstance(frame, pd.DataFrame):
+        return
+    if _is_pandas_string_index(frame.columns):
+        frame.columns = pd.Index(
+            np.asarray(frame.columns, dtype=object),
+            name=frame.columns.name,
+        )
+    if _is_pandas_string_index(frame.index):
+        frame.index = pd.Index(
+            np.asarray(frame.index, dtype=object),
+            name=frame.index.name,
+        )
+
+
+def _is_pandas_string_index(index: Any) -> bool:
+    dtype = getattr(index, "dtype", None)
+    if isinstance(dtype, pd.StringDtype):
+        return True
+    data_type_name = type(getattr(index, "_data", None)).__name__
+    return data_type_name.startswith("_PandasCompatStringArray")
+
+
+def _normalize_loaded_pandas_axes(loaded: Any) -> None:
+    for attr in ("data", "cluster_screening", "best_clusters", "_special_points"):
+        _normalize_dataframe_axes(getattr(loaded, attr, None))
+    for maps in getattr(loaded, "maps", []):
+        _normalize_dataframe_axes(getattr(maps, "data", None))
+        special_points = getattr(maps, "special_points", None)
+        _normalize_dataframe_axes(getattr(special_points, "_data", None))
+        contactspace = getattr(maps, "contactspace", None)
+        _normalize_dataframe_axes(getattr(contactspace, "data", None))
 
 
 def _coerce_layer_values(layer: int | Sequence[int]) -> list[int]:
@@ -508,12 +598,27 @@ class MultiMaps:
     @classmethod
     def load(cls, filename: str | Path) -> "MultiMaps":
         path = Path(filename).expanduser().resolve()
+        errors: list[Exception] = []
         with path.open("rb") as handle:
-            try:
-                loaded = dill.load(handle)
-            except Exception:
+            for loader, use_compatibility in (
+                (dill.load, False),
+                (dill.load, True),
+                (pickle.load, False),
+                (pickle.load, True),
+            ):
                 handle.seek(0)
-                loaded = pickle.load(handle)
+                try:
+                    if use_compatibility:
+                        with _pandas_pickle_compatibility():
+                            loaded = loader(handle)
+                        _normalize_loaded_pandas_axes(loaded)
+                    else:
+                        loaded = loader(handle)
+                    break
+                except Exception as exc:
+                    errors.append(exc)
+            else:
+                raise errors[-1]
         if not isinstance(loaded, cls):
             raise TypeError(
                 f"Pickle at {path} contains {type(loaded).__name__}, expected {cls.__name__}."
@@ -1342,6 +1447,163 @@ class MultiMaps:
             cbar = fig.colorbar(scatter_artist, ax=axslist[:nmaps].tolist())
             cbar.set_label(resolved_feature)
             cbar.solids.set_alpha(1.0)
+        if return_projection:
+            return fig, axs, projection
+        return fig, axs
+
+    def plot_min_projection(
+        self,
+        feature: str | None = None,
+        index: int | None = None,
+        *,
+        minimize: str | None = None,
+        plane: tuple[str, str] = ("x", "y"),
+        region: int | None = 0,
+        layer: int | Sequence[int] | None = None,
+        map_indexes: npt.ArrayLike | None = None,
+        coordinate_decimals: int | None = None,
+        smooth_sigma: float | tuple[float, float] | None = None,
+        smooth_mode: str = "nearest",
+        levels: int | Sequence[float] = 40,
+        contour: bool = True,
+        contour_levels: int | Sequence[float] | None = None,
+        contour_color: str = "k",
+        contour_linewidths: float = 0.3,
+        contour_alpha: float = 0.4,
+        ncols: int | None = None,
+        figsize: tuple[float, float] | None = None,
+        panel_size: tuple[float, float] = (4.5, 4.0),
+        cmap: str | mpl.colors.Colormap = "viridis",
+        colorbar: bool = True,
+        sharex: bool = False,
+        sharey: bool = False,
+        set_aspect: str = "scaled",
+        return_projection: bool = False,
+        **kwargs: Any,
+    ) -> (
+        tuple[Figure, npt.NDArray[np.object_]]
+        | tuple[Figure, npt.NDArray[np.object_], pd.DataFrame]
+    ):
+        """Contour minimum-value plane projections for multiple maps."""
+        if set_aspect not in ["on", "off", "equal", "scaled"]:
+            raise ValueError("set_aspect must be one of ['on','off','equal','scaled']")
+        if feature is not None:
+            resolved_feature = feature
+        elif index is not None:
+            if index >= len(self.features) or index < 0:
+                raise ValueError(f"Index {index} out of bounds.")
+            resolved_feature = self.features[index]
+        else:
+            raise ValueError("Either feature or index must be provided.")
+
+        projection = self.min_projection(
+            feature=feature,
+            index=index,
+            minimize=minimize,
+            plane=plane,
+            region=region,
+            layer=layer,
+            map_indexes=map_indexes,
+            coordinate_decimals=coordinate_decimals,
+        )
+        if projection.empty:
+            raise ValueError("No points available after applying the projection filters.")
+
+        if map_indexes is None:
+            selected_maps = np.arange(len(self.maps), dtype=np.int64)
+        else:
+            selected_maps = np.asarray(map_indexes, dtype=np.int64).reshape(-1)
+        nmaps = int(selected_maps.size)
+        if ncols is None:
+            ncols = min(4, int(np.ceil(np.sqrt(nmaps))))
+        ncols = max(1, min(int(ncols), nmaps))
+        nrows = int(np.ceil(nmaps / ncols))
+        if figsize is None:
+            extra_width = 0.8 if colorbar else 0.0
+            figsize = (panel_size[0] * ncols + extra_width, panel_size[1] * nrows)
+
+        grids: dict[
+            int,
+            tuple[
+                npt.NDArray[np.float64],
+                npt.NDArray[np.float64],
+                npt.NDArray[np.float64],
+            ],
+        ] = {}
+        finite_values: list[npt.NDArray[np.float64]] = []
+        for map_index in selected_maps:
+            map_projection = projection.loc[
+                projection["map_index"].to_numpy(dtype=np.int64) == int(map_index)
+            ]
+            if map_projection.empty:
+                continue
+            X, Y, Z = _projection_grid(
+                map_projection,
+                plane=plane,
+                feature=resolved_feature,
+            )
+            Z_plot = _nan_gaussian_filter(Z, sigma=smooth_sigma, mode=smooth_mode)
+            grids[int(map_index)] = (X, Y, Z_plot)
+            finite = Z_plot[np.isfinite(Z_plot)]
+            if finite.size:
+                finite_values.append(finite)
+        if not finite_values:
+            raise ValueError("No finite projected values available to contour.")
+
+        all_values = np.concatenate(finite_values)
+        contourf_levels = _resolve_contour_levels(all_values, levels)
+        line_levels = (
+            contourf_levels
+            if contour_levels is None
+            else _resolve_contour_levels(all_values, contour_levels)
+        )
+
+        fig, axs = plt.subplots(
+            nrows,
+            ncols,
+            figsize=figsize,
+            sharex=sharex,
+            sharey=sharey,
+            squeeze=False,
+        )
+        axslist = axs.reshape(-1)
+
+        filled_artist = None
+        for ax, map_index in zip(axslist, selected_maps, strict=False):
+            ax.set_title(self._map_name(int(map_index)))
+            ax.set_xlabel(plane[0])
+            ax.set_ylabel(plane[1])
+            if int(map_index) in grids:
+                X, Y, Z_plot = grids[int(map_index)]
+                filled_artist = ax.contourf(
+                    X,
+                    Y,
+                    np.ma.masked_invalid(Z_plot),
+                    levels=contourf_levels,
+                    cmap=cmap,
+                    **kwargs,
+                )
+                if contour:
+                    ax.contour(
+                        X,
+                        Y,
+                        np.ma.masked_invalid(Z_plot),
+                        levels=line_levels,
+                        colors=contour_color,
+                        linewidths=contour_linewidths,
+                        alpha=contour_alpha,
+                    )
+            ax.axis(set_aspect)
+
+        for ax in axslist[nmaps:]:
+            ax.axis("off")
+
+        minimized_column = minimize or resolved_feature
+        fig.suptitle(f"Minimum {minimized_column} projection on {plane[0]}-{plane[1]}")
+        fig.tight_layout()
+        if colorbar and filled_artist is not None:
+            cbar = fig.colorbar(filled_artist, ax=axslist[:nmaps].tolist())
+            cbar.set_label(resolved_feature)
         if return_projection:
             return fig, axs, projection
         return fig, axs

@@ -637,6 +637,50 @@ def test_maps_scatter_min_projection_returns_selected_energy_projection() -> Non
     plt.close(fig)
 
 
+def test_maps_plot_min_projection_returns_smoothed_contour_projection() -> None:
+    positions = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [1.0, 1.0, 0.0],
+        ]
+    )
+    probabilities = np.ones(len(positions), dtype=np.float64)
+    neighbors = [np.full(6, -1, dtype=np.int64) for _ in range(len(positions))]
+    maps = Maps(
+        _build_system(),
+        [],
+        StubContactSpace(positions, probabilities, neighbors),
+    )
+    maps.data = pd.DataFrame(
+        {
+            "x": positions[:, 0],
+            "y": positions[:, 1],
+            "z": positions[:, 2],
+            "energy": [0.4, 0.1, 0.2, 0.3, 0.5],
+        }
+    )
+    maps.features = ["energy"]
+
+    fig, ax, projected = maps.plot_min_projection(
+        feature="energy",
+        plane=("x", "y"),
+        region=None,
+        smooth_sigma=0.5,
+        levels=5,
+        return_projection=True,
+    )
+
+    assert ax.get_xlabel() == "x"
+    assert ax.get_ylabel() == "y"
+    assert projected.shape[0] == 4
+    selected = projected.sort_values(["x", "y"]).reset_index(drop=True)
+    np.testing.assert_allclose(selected["energy"], np.array([0.1, 0.3, 0.2, 0.5]))
+    plt.close(fig)
+
+
 def test_maps_propagate_archetypes_marks_ambiguous_regions() -> None:
     maps = _build_maps()
     selection = maps.select_archetypes(

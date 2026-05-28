@@ -3,7 +3,7 @@ import pickle
 from collections.abc import Callable, Sequence
 from copy import deepcopy
 from pathlib import Path
-from typing import Any, TypeAlias
+from typing import Any, TypeAlias, cast
 
 import dill
 import matplotlib.pyplot as plt
@@ -102,6 +102,73 @@ def _coerce_layer_values(layer: int | Sequence[int]) -> list[int]:
     if isinstance(layer, (int, np.integer)):
         return [int(layer)]
     return [int(value) for value in layer]
+
+
+def _projection_grid(
+    projected: pd.DataFrame,
+    *,
+    plane: tuple[str, str],
+    feature: str,
+) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64], npt.NDArray[np.float64]]:
+    grid = projected.pivot(index=plane[1], columns=plane[0], values=feature)
+    grid = grid.sort_index().sort_index(axis=1)
+    x = grid.columns.to_numpy(dtype=np.float64)
+    y = grid.index.to_numpy(dtype=np.float64)
+    X, Y = np.meshgrid(x, y)
+    Z = grid.to_numpy(dtype=np.float64)
+    return X, Y, Z
+
+
+def _nan_gaussian_filter(
+    values: npt.NDArray[np.float64],
+    *,
+    sigma: float | tuple[float, float] | None,
+    mode: str = "nearest",
+) -> npt.NDArray[np.float64]:
+    if sigma is None:
+        return values
+    if isinstance(sigma, tuple):
+        if len(sigma) != 2:
+            raise ValueError("smooth_sigma tuple must have two entries.")
+        if all(float(value) <= 0.0 for value in sigma):
+            return values
+    elif float(sigma) <= 0.0:
+        return values
+
+    from scipy.ndimage import gaussian_filter
+
+    valid = np.isfinite(values)
+    if not np.any(valid):
+        return values
+    zeroed = np.where(valid, values, 0.0)
+    smoothed = gaussian_filter(zeroed, sigma=sigma, mode=mode)
+    weights = gaussian_filter(valid.astype(np.float64), sigma=sigma, mode=mode)
+    return np.divide(
+        smoothed,
+        weights,
+        out=np.full_like(smoothed, np.nan, dtype=np.float64),
+        where=weights > 0.0,
+    )
+
+
+def _resolve_contour_levels(
+    values: npt.NDArray[np.float64],
+    levels: int | Sequence[float],
+) -> int | npt.NDArray[np.float64]:
+    if not np.isscalar(levels):
+        return np.asarray(levels, dtype=np.float64)
+
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
+        raise ValueError("No finite projected values available to contour.")
+    count = max(2, int(cast(int, levels)))
+    vmin = float(np.nanmin(finite))
+    vmax = float(np.nanmax(finite))
+    if np.isclose(vmin, vmax):
+        pad = 0.5 if np.isclose(vmin, 0.0) else abs(vmin) * 0.05
+        vmin -= pad
+        vmax += pad
+    return np.linspace(vmin, vmax, count)
 
 
 class SpecialPointRegistry:
@@ -1035,6 +1102,84 @@ class Maps:
         colorbar = fig.colorbar(scatter, ax=ax)
         colorbar.set_label(feature)
         colorbar.solids.set_alpha(1.0)
+        ax.axis(set_aspect)
+        if return_projection:
+            return fig, ax, projected
+        return fig, ax
+
+    def plot_min_projection(
+        self,
+        feature: str | None = None,
+        index: int | None = None,
+        *,
+        minimize: str | None = None,
+        plane: tuple[str, str] = ("x", "y"),
+        region: int | None = 0,
+        layer: int | Sequence[int] | None = None,
+        coordinate_decimals: int | None = None,
+        smooth_sigma: float | tuple[float, float] | None = None,
+        smooth_mode: str = "nearest",
+        levels: int | Sequence[float] = 40,
+        contour: bool = True,
+        contour_levels: int | Sequence[float] | None = None,
+        contour_color: str = "k",
+        contour_linewidths: float = 0.3,
+        contour_alpha: float = 0.4,
+        cmap: str = "viridis",
+        colorbar: bool = True,
+        set_aspect: str = "scaled",
+        return_projection: bool = False,
+        **kwargs: Any,
+    ) -> tuple[Figure, Axes] | tuple[Figure, Axes, pd.DataFrame]:
+        """Contour a plane projection selected by the minimum feature value."""
+        if set_aspect not in ["on", "off", "equal", "scaled"]:
+            raise ValueError("set_aspect must be one of ['on','off','equal','scaled']")
+
+        projected = self.min_projection(
+            feature=feature,
+            index=index,
+            minimize=minimize,
+            plane=plane,
+            region=region,
+            layer=layer,
+            coordinate_decimals=coordinate_decimals,
+        )
+        if feature is None:
+            if index is None:
+                raise ValueError("Either feature or index must be provided.")
+            feature = self.features[index]
+        minimize_column = minimize or feature
+
+        X, Y, Z = _projection_grid(projected, plane=plane, feature=feature)
+        Z_plot = _nan_gaussian_filter(Z, sigma=smooth_sigma, mode=smooth_mode)
+        contourf_levels = _resolve_contour_levels(Z_plot, levels)
+
+        fig, ax = plt.subplots(1, 1, figsize=(8, 4))
+        ax.set_title(f"Minimum {minimize_column} projection on {plane[0]}-{plane[1]}")
+        ax.set_xlabel(plane[0])
+        ax.set_ylabel(plane[1])
+        filled = ax.contourf(
+            X,
+            Y,
+            np.ma.masked_invalid(Z_plot),
+            levels=contourf_levels,
+            cmap=cmap,
+            **kwargs,
+        )
+        if contour:
+            line_levels = contour_levels if contour_levels is not None else contourf_levels
+            ax.contour(
+                X,
+                Y,
+                np.ma.masked_invalid(Z_plot),
+                levels=line_levels,
+                colors=contour_color,
+                linewidths=contour_linewidths,
+                alpha=contour_alpha,
+            )
+        if colorbar:
+            cbar = fig.colorbar(filled, ax=ax)
+            cbar.set_label(feature)
         ax.axis(set_aspect)
         if return_projection:
             return fig, ax, projected
