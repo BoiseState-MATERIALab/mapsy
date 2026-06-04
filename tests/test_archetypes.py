@@ -681,6 +681,154 @@ def test_maps_plot_min_projection_returns_smoothed_contour_projection() -> None:
     plt.close(fig)
 
 
+def test_maps_plot_uses_units_for_cartesian_axes() -> None:
+    positions = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [1.0, 0.0, 1.0],
+            [0.0, 1.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 1.0],
+            [1.0, 1.0, 1.0],
+        ]
+    )
+    probabilities = np.ones(len(positions), dtype=np.float64)
+    neighbors = [np.full(6, -1, dtype=np.int64) for _ in range(len(positions))]
+    maps = Maps(_build_system(), [], StubContactSpace(positions, probabilities, neighbors))
+    maps.data = pd.DataFrame(
+        {
+            "x": positions[:, 0],
+            "y": positions[:, 1],
+            "z": positions[:, 2],
+            "energy": np.linspace(0.1, 1.4, len(positions)),
+        }
+    )
+    maps.features = ["energy"]
+
+    fig, axs = maps.plot(feature="energy", axes=["x", "z"], splitby="y", levels=5)
+
+    assert axs[0].get_title().startswith("Map of energy for y (Å) =")
+    assert axs[0].get_xlabel() == "x (Å)"
+    assert axs[0].get_ylabel() == "z (Å)"
+    plt.close(fig)
+
+
+def test_maps_scatter_uses_units_for_cartesian_axes() -> None:
+    positions = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [1.0, 0.0, 1.0],
+            [0.0, 1.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 1.0],
+            [1.0, 1.0, 1.0],
+        ]
+    )
+    probabilities = np.ones(len(positions), dtype=np.float64)
+    neighbors = [np.full(6, -1, dtype=np.int64) for _ in range(len(positions))]
+    maps = Maps(_build_system(), [], StubContactSpace(positions, probabilities, neighbors))
+    maps.data = pd.DataFrame(
+        {
+            "x": positions[:, 0],
+            "y": positions[:, 1],
+            "z": positions[:, 2],
+            "energy": np.linspace(0.1, 1.4, len(positions)),
+        }
+    )
+    maps.features = ["energy"]
+
+    fig, axs = maps.scatter(feature="energy", axes=["x", "z"], splitby="y", s=10)
+
+    assert axs[0].get_title().startswith("Map of energy for y (Å) =")
+    assert axs[0].get_xlabel() == "x (Å)"
+    assert axs[0].get_ylabel() == "z (Å)"
+    plt.close(fig)
+
+
+def test_maps_multiplot_plots_multiple_features_and_split_layers() -> None:
+    positions = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [1.0, 0.0, 1.0],
+            [0.0, 1.0, 1.0],
+            [1.0, 1.0, 1.0],
+        ]
+    )
+    probabilities = np.ones(len(positions), dtype=np.float64)
+    neighbors = [np.full(6, -1, dtype=np.int64) for _ in range(len(positions))]
+    maps = Maps(_build_system(), [], StubContactSpace(positions, probabilities, neighbors))
+    maps.data = pd.DataFrame(
+        {
+            "x": positions[:, 0],
+            "y": positions[:, 1],
+            "z": positions[:, 2],
+            "energy": np.linspace(0.1, 0.8, len(positions)),
+            "barrier": np.linspace(1.0, 1.7, len(positions)),
+        }
+    )
+    maps.features = ["energy", "barrier"]
+
+    fig, axs = maps.multiplot(
+        features=["energy", "barrier"],
+        levels=5,
+        ncols=2,
+    )
+
+    assert axs.shape == (2, 2)
+    assert axs[0, 0].get_title().startswith("energy\nz (Å) =")
+    assert axs[1, 1].get_title().startswith("barrier\nz (Å) =")
+    assert axs[0, 0].get_xlabel() == "x (Å)"
+    assert axs[0, 0].get_ylabel() == "y (Å)"
+    colorbar_axes = [ax for ax in fig.axes if ax not in axs.flat]
+    assert len(colorbar_axes) == 2
+    assert all(ax.get_ylabel() == "" for ax in colorbar_axes)
+    plt.close(fig)
+
+
+def test_maps_multiplot_accepts_indexes_and_wraps_panels() -> None:
+    positions = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [1.0, 1.0, 0.0],
+        ]
+    )
+    probabilities = np.ones(len(positions), dtype=np.float64)
+    neighbors = [np.full(6, -1, dtype=np.int64) for _ in range(len(positions))]
+    maps = Maps(_build_system(), [], StubContactSpace(positions, probabilities, neighbors))
+    maps.data = pd.DataFrame(
+        {
+            "x": positions[:, 0],
+            "y": positions[:, 1],
+            "z": positions[:, 2],
+            "f1": [0.1, 0.2, 0.3, 0.4],
+            "f2": [1.1, 1.2, 1.3, 1.4],
+            "f3": [2.1, 2.2, 2.3, 2.4],
+        }
+    )
+    maps.features = ["f1", "f2", "f3"]
+
+    fig, axs = maps.multiplot(indexes=[2, 0, 1], splitby=None, ncols=2, colorbar=False)
+
+    assert axs.shape == (2, 2)
+    assert axs[0, 0].get_title() == "Map of f3"
+    assert axs[0, 1].get_title() == "Map of f1"
+    assert axs[1, 0].get_title() == "Map of f2"
+    assert axs[0, 0].get_xlabel() == "x (Å)"
+    assert axs[0, 0].get_ylabel() == "y (Å)"
+    assert not axs[1, 1].axison
+    plt.close(fig)
+
+
 def test_maps_propagate_archetypes_marks_ambiguous_regions() -> None:
     maps = _build_maps()
     selection = maps.select_archetypes(

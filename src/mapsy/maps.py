@@ -2,6 +2,7 @@ import logging
 import pickle
 from collections.abc import Callable, Sequence
 from copy import deepcopy
+from numbers import Real
 from pathlib import Path
 from typing import Any, TypeAlias, cast
 
@@ -169,6 +170,18 @@ def _resolve_contour_levels(
         vmin -= pad
         vmax += pad
     return np.linspace(vmin, vmax, count)
+
+
+def _format_split_value(value: Any) -> str:
+    if isinstance(value, Real):
+        return f"{float(value):6.2f}"
+    return str(value)
+
+
+def _coordinate_axis_label(axis: str) -> str:
+    if axis in {"x", "y", "z"}:
+        return f"{axis} (Å)"
+    return axis
 
 
 class SpecialPointRegistry:
@@ -790,18 +803,163 @@ class Maps:
         # Generate 2D plots for each unique value of the split variable
         for i, ax in enumerate(axslist):
             sval = np.unique(s)[i]
-            ax.set_title(f"Map of {feature} for {splitby} = {sval:6.2f}")
+            split_label = _coordinate_axis_label(splitby)
+            ax.set_title(f"Map of {feature} for {split_label} = {_format_split_value(sval)}")
             mask = filterdata[splitby] == sval
             im = ax.tricontourf(x1[mask], x2[mask], f[mask], levels=flevels, **kwargs)
             ax.axis(set_aspect)
-            ax.set_xlabel(f"{axes[0]}")
-            ax.set_ylabel(f"{axes[1]}")
+            ax.set_xlabel(_coordinate_axis_label(axes[0]))
+            ax.set_ylabel(_coordinate_axis_label(axes[1]))
         # Add colorbar
         if nsplit == 1:
             fig.colorbar(im, ax=axs)
         else:
             fig.colorbar(im, ax=axs.ravel().tolist())
         return fig, axs
+
+    def multiplot(
+        self,
+        features: str | Sequence[str] | None = None,
+        indexes: int | Sequence[int] | None = None,
+        axes: Sequence[str] | None = None,
+        region: int | None = 0,
+        splitby: str | None = "z",
+        set_aspect: str = "on",
+        levels: int | Sequence[float] = 10,
+        ncols: int | None = None,
+        figsize: tuple[float, float] | None = None,
+        panel_size: tuple[float, float] = (4.0, 3.5),
+        colorbar: bool = True,
+        sharex: bool = False,
+        sharey: bool = False,
+        **kwargs: Any,
+    ) -> tuple[Figure, npt.NDArray[np.object_]]:
+        """Plot several feature columns as contour-map panels."""
+        if self.contactspace is None:
+            raise RuntimeError("Trying to use maps.multiplot() without contact space")
+        if self.data is None:
+            raise RuntimeError("No contact space data available.")
+        if features is None and indexes is None:
+            raise ValueError("Either features or indexes must be provided.")
+        if set_aspect not in ["on", "off", "equal", "scaled"]:
+            raise ValueError("set_aspect must be one of ['on','off','equal','scaled']")
+
+        frame = self.data.copy()
+        contactspace_data = self.contactspace.data
+        plot_axes = ["x", "y"] if axes is None else list(axes)
+        if len(plot_axes) != 2:
+            raise ValueError("axes must contain exactly two columns.")
+
+        resolved_features: list[str] = []
+        if features is not None:
+            resolved_features.extend([features] if isinstance(features, str) else list(features))
+        if indexes is not None:
+            index_values = (
+                [int(indexes)]
+                if isinstance(indexes, (int, np.integer))
+                else [int(value) for value in indexes]
+            )
+            for index_value in index_values:
+                if index_value >= len(self.features) or index_value < 0:
+                    raise ValueError(f"Index {index_value} out of bounds.")
+                resolved_features.append(self.features[index_value])
+        if len(resolved_features) == 0:
+            raise ValueError("At least one feature or index must be provided.")
+
+        required_columns = set(plot_axes) | set(resolved_features)
+        if splitby is not None:
+            required_columns.add(splitby)
+        if region is not None:
+            required_columns.add("region")
+        for column in required_columns:
+            if column in frame.columns:
+                continue
+            if column in contactspace_data.columns:
+                frame.loc[:, column] = contactspace_data[column].to_numpy()
+            else:
+                raise ValueError(f"Column {column!r} not found in maps data or contactspace data.")
+
+        mask = np.ones(len(frame), dtype=bool)
+        if region is not None:
+            mask &= frame["region"].to_numpy(dtype=np.int64) == int(region)
+        filterdata = frame.loc[mask]
+        if filterdata.empty:
+            raise ValueError("No points available after applying the region filter.")
+
+        if splitby is None:
+            split_values = np.asarray([None], dtype=object)
+            split_masks = [np.ones(len(filterdata), dtype=bool)]
+        else:
+            split_values = np.unique(filterdata[splitby].to_numpy())
+            split_masks = [
+                filterdata[splitby].to_numpy() == split_value for split_value in split_values
+            ]
+
+        nfeatures = len(resolved_features)
+        nsplit = len(split_values)
+        if ncols is None:
+            ncols = nfeatures
+        ncols = min(max(1, int(ncols)), nfeatures)
+        feature_rows = int(np.ceil(nfeatures / ncols))
+        nrows = feature_rows * nsplit
+        if figsize is None:
+            figsize = (panel_size[0] * ncols, panel_size[1] * nrows)
+
+        fig, axs = plt.subplots(
+            nrows,
+            ncols,
+            figsize=figsize,
+            squeeze=False,
+            sharex=sharex,
+            sharey=sharey,
+        )
+        fig.subplots_adjust(hspace=0.45, wspace=0.35)
+
+        x1 = filterdata[plot_axes[0]].to_numpy(dtype=np.float64)
+        x2 = filterdata[plot_axes[1]].to_numpy(dtype=np.float64)
+        used_axes: set[tuple[int, int]] = set()
+        for feature_index, feature_name in enumerate(resolved_features):
+            feature_values = pd.to_numeric(filterdata[feature_name], errors="raise").to_numpy(
+                dtype=np.float64
+            )
+            contour_levels = _resolve_contour_levels(feature_values, levels)
+            feature_row = feature_index // ncols
+            feature_col = feature_index % ncols
+            feature_axes = []
+            filled = None
+
+            for split_index, split_value in enumerate(split_values):
+                row = feature_row * nsplit + split_index
+                ax = axs[row, feature_col]
+                used_axes.add((row, feature_col))
+                feature_axes.append(ax)
+                split_mask = split_masks[split_index]
+                filled = ax.tricontourf(
+                    x1[split_mask],
+                    x2[split_mask],
+                    feature_values[split_mask],
+                    levels=contour_levels,
+                    **kwargs,
+                )
+                if splitby is None:
+                    ax.set_title(f"Map of {feature_name}")
+                else:
+                    split_label = _coordinate_axis_label(splitby)
+                    ax.set_title(
+                        f"{feature_name}\n{split_label} = {_format_split_value(split_value)}"
+                    )
+                ax.set_xlabel(_coordinate_axis_label(plot_axes[0]))
+                ax.set_ylabel(_coordinate_axis_label(plot_axes[1]))
+                ax.axis(set_aspect)
+
+            if colorbar and filled is not None:
+                fig.colorbar(filled, ax=feature_axes)
+
+        for row in range(nrows):
+            for col in range(ncols):
+                if (row, col) not in used_axes:
+                    axs[row, col].axis("off")
+        return fig, axs.astype(object)
 
     def scatter(
         self,
@@ -884,7 +1042,8 @@ class Maps:
         for i, ax in enumerate(axslist):
             if splitby is not None:
                 sval = np.unique(s)[i]
-                ax.set_title(f"Map of {feature} for {splitby} = {sval:6.2f}")
+                split_label = _coordinate_axis_label(splitby)
+                ax.set_title(f"Map of {feature} for {split_label} = {_format_split_value(sval)}")
                 mask = filterdata[splitby] == sval
                 x1m = x1[mask]
                 x2m = x2[mask]
@@ -894,8 +1053,8 @@ class Maps:
                 x1m = x1
                 x2m = x2
                 fm = f
-            ax.set_xlabel(f"{axes[0]}")
-            ax.set_ylabel(f"{axes[1]}")
+            ax.set_xlabel(_coordinate_axis_label(axes[0]))
+            ax.set_ylabel(_coordinate_axis_label(axes[1]))
             if not categorical:
                 if f is None:
                     scatter = ax.scatter(x1m, x2m, **kwargs)
