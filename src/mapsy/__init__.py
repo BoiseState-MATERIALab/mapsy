@@ -39,6 +39,7 @@ __all__ = [
     "GraphResult",
     "CalculationWorkflow",
     "WorkflowReferenceSpec",
+    "compare_stationary_points",
     "AdaptiveWorkflow",
     "ModelSuite",
     "ModelTrainingSpec",
@@ -59,7 +60,11 @@ __all__ = [
     "SlurmTemplate",
     "SupervisedDataset",
     "WarmStartProfile",
+    "loo_error_table",
+    "parity_metrics",
     "plot_cluster_screening",
+    "plot_loo_parity",
+    "plot_parity",
     "plot_pca_scree",
 ]
 
@@ -112,6 +117,10 @@ def __getattr__(name: str) -> Any:
             "WorkflowReferenceSpec": WorkflowReferenceSpec,
         }
         return exports[name]
+    if name == "compare_stationary_points":
+        from .metrics import compare_stationary_points
+
+        return compare_stationary_points
     if name in {
         "AdaptiveWorkflow",
         "ModelTrainingSpec",
@@ -196,11 +205,27 @@ def __getattr__(name: str) -> Any:
 
         return SlurmTemplate
     if name == "plot_cluster_screening":
-        from .plotting import plot_cluster_screening, plot_pca_scree
+        from .plotting import plot_cluster_screening
 
         return plot_cluster_screening
+    if name == "plot_parity":
+        from .plotting import plot_parity
+
+        return plot_parity
+    if name == "plot_loo_parity":
+        from .plotting import plot_loo_parity
+
+        return plot_loo_parity
+    if name == "loo_error_table":
+        from .plotting import loo_error_table
+
+        return loo_error_table
+    if name == "parity_metrics":
+        from .plotting import parity_metrics
+
+        return parity_metrics
     if name == "plot_pca_scree":
-        from .plotting import plot_cluster_screening, plot_pca_scree
+        from .plotting import plot_pca_scree
 
         return plot_pca_scree
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

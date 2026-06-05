@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 from ase import Atoms
+from matplotlib import pyplot as plt
 
 from mapsy import Maps
 from mapsy.data import Grid, System
@@ -279,3 +280,131 @@ def test_select_points_can_target_minima_and_first_order_transition_states() -> 
     )
 
     assert set(selected.index.tolist()) == {1, 2}
+
+
+def test_maps_analyze_stationary_points_2d_refines_periodic_surface() -> None:
+    nx = 8
+    ny = 8
+    x_axis = np.arange(nx, dtype=np.float64)
+    y_axis = np.arange(ny, dtype=np.float64)
+    X, Y = np.meshgrid(x_axis, y_axis)
+    values = 2.0 - np.cos(2.0 * np.pi * X / nx) - np.cos(2.0 * np.pi * Y / ny)
+    frame = pd.DataFrame(
+        {
+            "x": X.reshape(-1),
+            "y": Y.reshape(-1),
+            "z": np.zeros(nx * ny, dtype=np.float64),
+            "energy": values.reshape(-1),
+        }
+    )
+    maps = _build_maps(frame)
+
+    stationary, derivatives = maps.analyze_stationary_points_2d(
+        feature="energy",
+        region=None,
+        grad_tol=1.0e-10,
+        curvature_tol=1.0e-6,
+    )
+
+    assert derivatives["candidate_mask"].shape == (ny, nx)
+    assert stationary["type"].value_counts().to_dict() == {
+        "minimum": 1,
+        "maximum": 1,
+        "saddle_1": 2,
+    }
+    minimum = stationary.loc[stationary["type"] == "minimum"].iloc[0]
+    maximum = stationary.loc[stationary["type"] == "maximum"].iloc[0]
+    saddles = stationary.loc[stationary["type"] == "saddle_1"].sort_values(["x", "y"])
+
+    np.testing.assert_allclose([minimum["x"], minimum["y"]], [0.0, 0.0], atol=1.0e-8)
+    np.testing.assert_allclose([maximum["x"], maximum["y"]], [4.0, 4.0], atol=1.0e-8)
+    np.testing.assert_allclose(
+        saddles[["x", "y"]].to_numpy(dtype=np.float64),
+        np.array([[0.0, 4.0], [4.0, 0.0]], dtype=np.float64),
+        atol=1.0e-8,
+    )
+
+
+def test_maps_analyze_stationary_points_2d_uses_value_extrema_candidates() -> None:
+    nx = 7
+    ny = 7
+    x_axis = np.arange(nx, dtype=np.float64)
+    y_axis = np.arange(ny, dtype=np.float64)
+    X, Y = np.meshgrid(x_axis, y_axis)
+    values = -((X - 3.3) ** 2 + (Y - 2.7) ** 2)
+    frame = pd.DataFrame(
+        {
+            "x": X.reshape(-1),
+            "y": Y.reshape(-1),
+            "z": np.zeros(nx * ny, dtype=np.float64),
+            "energy": values.reshape(-1),
+        }
+    )
+    maps = _build_maps(frame)
+
+    gradient_only, _ = maps.analyze_stationary_points_2d(
+        feature="energy",
+        region=None,
+        grad_tol=0.0,
+        curvature_tol=1.0e-8,
+        periodic_x=False,
+        periodic_y=False,
+        include_value_extrema=False,
+    )
+    stationary, derivatives = maps.analyze_stationary_points_2d(
+        feature="energy",
+        region=None,
+        grad_tol=0.0,
+        curvature_tol=1.0e-8,
+        periodic_x=False,
+        periodic_y=False,
+    )
+
+    assert gradient_only.empty
+    assert np.count_nonzero(derivatives["value_max_candidate_mask"]) == 1
+    maximum = stationary.loc[stationary["type"] == "maximum"].iloc[0]
+    np.testing.assert_allclose([maximum["x"], maximum["y"]], [3.3, 2.7], atol=1.0e-8)
+
+
+def test_maps_plot_stationary_points_2d_overlays_classified_points() -> None:
+    nx = 8
+    ny = 8
+    x_axis = np.arange(nx, dtype=np.float64)
+    y_axis = np.arange(ny, dtype=np.float64)
+    X, Y = np.meshgrid(x_axis, y_axis)
+    values = 2.0 - np.cos(2.0 * np.pi * X / nx) - np.cos(2.0 * np.pi * Y / ny)
+    frame = pd.DataFrame(
+        {
+            "x": X.reshape(-1),
+            "y": Y.reshape(-1),
+            "z": np.zeros(nx * ny, dtype=np.float64),
+            "energy": values.reshape(-1),
+        }
+    )
+    maps = _build_maps(frame)
+
+    fig, ax, stationary = maps.plot_stationary_points_2d(
+        feature="energy",
+        region=None,
+        grad_tol=1.0e-10,
+        curvature_tol=1.0e-6,
+        levels=8,
+        colorbar=False,
+    )
+
+    assert ax.get_title() == "Stationary points of energy"
+    assert ax.get_xlabel() == "x (Å)"
+    assert ax.get_ylabel() == "y (Å)"
+    assert stationary["type"].value_counts().to_dict() == {
+        "minimum": 1,
+        "maximum": 1,
+        "saddle_1": 2,
+    }
+    legend = ax.get_legend()
+    assert legend is not None
+    assert {text.get_text() for text in legend.get_texts()} == {
+        "minimum",
+        "maximum",
+        "saddle_1",
+    }
+    plt.close(fig)

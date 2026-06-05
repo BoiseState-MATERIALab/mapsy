@@ -21,6 +21,7 @@ from mapsy import (
 )
 from mapsy.data import Grid, System
 from mapsy.io.parser import resolve_file_model, resolve_file_records
+from mapsy.multimaps import _pandas_pickle_compatibility
 
 
 class FakeMaps:
@@ -171,6 +172,20 @@ def test_multimaps_save_and_load_roundtrip_preserves_cached_data(tmp_path: Path)
     assert loaded.names == ["a", "b"]
     assert loaded.maps[0].data is not None
     assert loaded.maps[1].data is not None
+
+
+def test_pandas_pickle_compatibility_accepts_legacy_string_array_state() -> None:
+    import pandas._libs.arrays as pd_arrays
+
+    dtype = pd.StringDtype(storage="python", na_value=np.nan)
+    state = (dtype, np.array(["x", "y"], dtype=object))
+
+    with _pandas_pickle_compatibility():
+        array = pd_arrays.__pyx_unpickle_NDArrayBacked(pd.arrays.StringArray, 82904607, None)
+        array.__setstate__(state)
+
+    assert list(array) == ["x", "y"]
+    assert isinstance(array.dtype, pd.StringDtype)
 
 
 def test_multimaps_requires_shared_features() -> None:
@@ -506,6 +521,46 @@ def test_multimaps_scatter_core_projection_selects_center_per_map() -> None:
     plt.close(fig)
 
 
+def test_multimaps_plot_min_projection_returns_smoothed_contour_panels() -> None:
+    map_a = _build_selection_maps(
+        pd.DataFrame(
+            {
+                "x": [0.0, 0.0, 1.0, 0.0, 1.0],
+                "y": [0.0, 0.0, 0.0, 1.0, 1.0],
+                "z": [0.0, 1.0, 0.0, 0.0, 0.0],
+                "energy": [0.4, 0.1, 0.2, 0.3, 0.5],
+            }
+        )
+    )
+    map_b = _build_selection_maps(
+        pd.DataFrame(
+            {
+                "x": [0.0, 0.0, 1.0, 0.0, 1.0],
+                "y": [0.0, 0.0, 0.0, 1.0, 1.0],
+                "z": [0.0, 1.0, 0.0, 0.0, 0.0],
+                "energy": [1.4, 1.1, 1.2, 1.3, 1.5],
+            }
+        )
+    )
+    multimaps = MultiMaps([map_a, map_b], names=["a", "b"])
+
+    fig, axs, projection = multimaps.plot_min_projection(
+        feature="energy",
+        plane=("x", "y"),
+        region=None,
+        smooth_sigma=0.5,
+        levels=5,
+        ncols=2,
+        return_projection=True,
+    )
+
+    assert axs.shape == (1, 2)
+    assert projection.groupby("map_index").size().tolist() == [4, 4]
+    assert axs[0, 0].get_title() == "a"
+    assert axs[0, 1].get_title() == "b"
+    plt.close(fig)
+
+
 def test_multimaps_sites_can_select_one_site_per_cluster_and_layer() -> None:
     map_a = FakeMaps(
         pd.DataFrame(
@@ -602,6 +657,50 @@ def test_multimaps_sites_can_use_global_pivoted_qr_selection() -> None:
     assert selected["selection_method"].tolist() == ["pivoted_qr", "pivoted_qr"]
     assert map_a.get_special_points(kind="site")["point_index"].tolist() == [0]
     assert map_b.get_special_points(kind="site")["point_index"].tolist() == [0]
+
+
+def test_multimaps_select_special_points_greedy_balances_cached_distances() -> None:
+    map_a = _build_selection_maps(
+        pd.DataFrame(
+            {
+                "x": [0.0, 1.0, 2.0],
+                "y": [0.0, 0.0, 0.0],
+                "z": [0.0, 0.0, 0.0],
+                "region": [0, 0, 0],
+                "f1": [0.0, 1.0, 10.0],
+            }
+        )
+    )
+    map_b = _build_selection_maps(
+        pd.DataFrame(
+            {
+                "x": [10.0, 11.0],
+                "y": [0.0, 0.0],
+                "z": [0.0, 0.0],
+                "region": [0, 0],
+                "f1": [2.0, 11.0],
+            }
+        )
+    )
+
+    multimaps = MultiMaps([map_a, map_b], names=["a", "b"])
+    multimaps.atcontactspace(recompute=False)
+    selected = multimaps.select_special_points(
+        2,
+        scope="global",
+        kind="simulation",
+        region=0,
+        feature_columns=["f1"],
+        feature_space_weight=1.0,
+        real_space_weight=0.05,
+        special_point_indexes=np.array([0], dtype=np.int64),
+        scale_features=False,
+        replace_kind=True,
+    )
+
+    assert selected["global_point_index"].tolist() == [4, 3]
+    assert selected["selection_method"].tolist() == ["greedy", "greedy"]
+    assert map_b.get_special_points(kind="simulation")["point_index"].tolist() == [1, 0]
 
 
 def test_multimaps_cluster_screening_tracks_method() -> None:

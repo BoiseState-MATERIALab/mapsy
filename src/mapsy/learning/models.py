@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import os
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from dataclasses import dataclass, field
+from itertools import repeat
 from typing import Any
 
 import numpy as np
@@ -108,6 +112,8 @@ class RobustGaussianProcessSurrogate:
     noise_level_bounds: tuple[float, float] = (1.0e-3, 1.0e0)
     initial_noise_level: float = 1.0e-3
     normalize_y: bool = True
+    n_jobs: int | None = None
+    threadpool_threads: int | None = None
 
     model_: Pipeline | None = None
     fit_records_: list[GaussianProcessFitRecord] = field(default_factory=list)
@@ -122,22 +128,13 @@ class RobustGaussianProcessSurrogate:
             seed=self.seed,
         )
 
-        records: list[GaussianProcessFitRecord] = []
-        for init_lengthscales in starts:
-            model = self._make_pipeline(init_lengthscales)
-            mean_rmse, std_rmse = self._cv_rmse(model, X, y)
-            model.fit(X, y)
-            gpr = model.named_steps["gaussianprocessregressor"]
-            records.append(
-                GaussianProcessFitRecord(
-                    init_lengthscales=np.array(init_lengthscales, dtype=float),
-                    cv_rmse_mean=mean_rmse,
-                    cv_rmse_std=std_rmse,
-                    model=model,
-                    kernel=gpr.kernel_,
-                    log_marginal_likelihood=gpr.log_marginal_likelihood(gpr.kernel_.theta),
-                )
-            )
+        n_jobs = self._effective_n_jobs(len(starts))
+        with self._threadpool_context(n_jobs):
+            if n_jobs == 1:
+                records = [self._fit_start(init_lengthscales, X, y) for init_lengthscales in starts]
+            else:
+                with ThreadPoolExecutor(max_workers=n_jobs) as executor:
+                    records = list(executor.map(self._fit_start, starts, repeat(X), repeat(y)))
 
         records.sort(key=lambda record: (record.cv_rmse_mean, record.cv_rmse_std))
         self.fit_records_ = records
@@ -274,6 +271,25 @@ class RobustGaussianProcessSurrogate:
             ),
         )
 
+    def _fit_start(
+        self,
+        init_lengthscales: np.ndarray,
+        X: np.ndarray,
+        y: np.ndarray,
+    ) -> GaussianProcessFitRecord:
+        model = self._make_pipeline(init_lengthscales)
+        mean_rmse, std_rmse = self._cv_rmse(model, X, y)
+        model.fit(X, y)
+        gpr = model.named_steps["gaussianprocessregressor"]
+        return GaussianProcessFitRecord(
+            init_lengthscales=np.array(init_lengthscales, dtype=float),
+            cv_rmse_mean=mean_rmse,
+            cv_rmse_std=std_rmse,
+            model=model,
+            kernel=gpr.kernel_,
+            log_marginal_likelihood=gpr.log_marginal_likelihood(gpr.kernel_.theta),
+        )
+
     def _cv_rmse(self, model: Pipeline, X: np.ndarray, y: np.ndarray) -> tuple[float, float]:
         cv = KFold(n_splits=self.n_cv_splits, shuffle=True, random_state=self.seed)
         rmses = []
@@ -283,6 +299,29 @@ class RobustGaussianProcessSurrogate:
             prediction = fitted.predict(X[valid])
             rmses.append(float(np.sqrt(mean_squared_error(y[valid], prediction))))
         return float(np.mean(rmses)), float(np.std(rmses))
+
+    def _effective_n_jobs(self, n_tasks: int) -> int:
+        if n_tasks <= 0:
+            return 1
+        if self.n_jobs is None:
+            return 1
+        requested = int(self.n_jobs)
+        if requested == 0:
+            raise ValueError("n_jobs must be non-zero.")
+        if requested < 0:
+            requested = max(1, (os.cpu_count() or 1) + 1 + requested)
+        return max(1, min(requested, int(n_tasks)))
+
+    def _threadpool_context(self, n_jobs: int) -> Any:
+        threadpool_threads = self.threadpool_threads
+        if threadpool_threads is None and n_jobs > 1:
+            threadpool_threads = 1
+        if threadpool_threads is None or threadpool_threads <= 0:
+            return nullcontext()
+
+        from threadpoolctl import threadpool_limits
+
+        return threadpool_limits(limits=int(threadpool_threads))
 
 
 @dataclass

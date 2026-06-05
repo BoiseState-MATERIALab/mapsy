@@ -1,9 +1,10 @@
 import logging
 import pickle
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from copy import deepcopy
+from numbers import Real
 from pathlib import Path
-from typing import Any, TypeAlias
+from typing import Any, TypeAlias, cast
 
 import dill
 import matplotlib.pyplot as plt
@@ -15,6 +16,7 @@ from ase.geometry import get_distances
 from matplotlib.axes import Axes
 from matplotlib.figure import Figure
 from matplotlib.gridspec import GridSpec
+from matplotlib.lines import Line2D
 from matplotlib.ticker import MultipleLocator
 from pathos.multiprocessing import ProcessingPool
 from sklearn.preprocessing import StandardScaler
@@ -102,6 +104,213 @@ def _coerce_layer_values(layer: int | Sequence[int]) -> list[int]:
     if isinstance(layer, (int, np.integer)):
         return [int(layer)]
     return [int(value) for value in layer]
+
+
+def _projection_grid(
+    projected: pd.DataFrame,
+    *,
+    plane: tuple[str, str],
+    feature: str,
+) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64], npt.NDArray[np.float64]]:
+    grid = projected.pivot(index=plane[1], columns=plane[0], values=feature)
+    grid = grid.sort_index().sort_index(axis=1)
+    x = grid.columns.to_numpy(dtype=np.float64)
+    y = grid.index.to_numpy(dtype=np.float64)
+    X, Y = np.meshgrid(x, y)
+    Z = grid.to_numpy(dtype=np.float64)
+    return X, Y, Z
+
+
+def _nan_gaussian_filter(
+    values: npt.NDArray[np.float64],
+    *,
+    sigma: float | tuple[float, float] | None,
+    mode: str = "nearest",
+) -> npt.NDArray[np.float64]:
+    if sigma is None:
+        return values
+    if isinstance(sigma, tuple):
+        if len(sigma) != 2:
+            raise ValueError("smooth_sigma tuple must have two entries.")
+        if all(float(value) <= 0.0 for value in sigma):
+            return values
+    elif float(sigma) <= 0.0:
+        return values
+
+    from scipy.ndimage import gaussian_filter
+
+    valid = np.isfinite(values)
+    if not np.any(valid):
+        return values
+    zeroed = np.where(valid, values, 0.0)
+    smoothed = gaussian_filter(zeroed, sigma=sigma, mode=mode)
+    weights = gaussian_filter(valid.astype(np.float64), sigma=sigma, mode=mode)
+    return np.divide(
+        smoothed,
+        weights,
+        out=np.full_like(smoothed, np.nan, dtype=np.float64),
+        where=weights > 0.0,
+    )
+
+
+def _resolve_contour_levels(
+    values: npt.NDArray[np.float64],
+    levels: int | Sequence[float],
+) -> int | npt.NDArray[np.float64]:
+    if not np.isscalar(levels):
+        return np.asarray(levels, dtype=np.float64)
+
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
+        raise ValueError("No finite projected values available to contour.")
+    count = max(2, int(cast(int, levels)))
+    vmin = float(np.nanmin(finite))
+    vmax = float(np.nanmax(finite))
+    if np.isclose(vmin, vmax):
+        pad = 0.5 if np.isclose(vmin, 0.0) else abs(vmin) * 0.05
+        vmin -= pad
+        vmax += pad
+    return np.linspace(vmin, vmax, count)
+
+
+def _format_split_value(value: Any) -> str:
+    if isinstance(value, Real):
+        return f"{float(value):6.2f}"
+    return str(value)
+
+
+def _coordinate_axis_label(axis: str) -> str:
+    if axis in {"x", "y", "z"}:
+        return f"{axis} (Å)"
+    return axis
+
+
+def _comparison_contour_levels(
+    reference_values: npt.NDArray[np.float64],
+    predicted_values: npt.NDArray[np.float64],
+    levels: int | Sequence[float],
+    *,
+    shared_color_scale: bool,
+) -> int | npt.NDArray[np.float64]:
+    if not shared_color_scale:
+        return levels
+    if not np.isscalar(levels):
+        return np.asarray(levels, dtype=np.float64)
+
+    finite = np.concatenate(
+        [
+            reference_values[np.isfinite(reference_values)],
+            predicted_values[np.isfinite(predicted_values)],
+        ]
+    )
+    if finite.size == 0:
+        raise ValueError("No finite values available for stationary-point comparison plotting.")
+    count = max(2, int(cast(int, levels)))
+    vmin = float(np.nanmin(finite))
+    vmax = float(np.nanmax(finite))
+    if np.isclose(vmin, vmax):
+        pad = 0.5 if np.isclose(vmin, 0.0) else abs(vmin) * 0.05
+        vmin -= pad
+        vmax += pad
+    return np.linspace(vmin, vmax, count)
+
+
+def _periodic_contour_grid(
+    X: npt.NDArray[np.float64],
+    Y: npt.NDArray[np.float64],
+    F: npt.NDArray[np.float64],
+    *,
+    periodic_x: bool,
+    periodic_y: bool,
+) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64], npt.NDArray[np.float64]]:
+    plot_X = np.asarray(X, dtype=np.float64)
+    plot_Y = np.asarray(Y, dtype=np.float64)
+    plot_F = np.asarray(F, dtype=np.float64)
+
+    if periodic_x and plot_X.shape[1] > 1:
+        dx = float(np.mean(np.diff(plot_X[0, :])))
+        plot_X = np.concatenate([plot_X, plot_X[:, -1:] + dx], axis=1)
+        plot_Y = np.concatenate([plot_Y, plot_Y[:, -1:]], axis=1)
+        plot_F = np.concatenate([plot_F, plot_F[:, :1]], axis=1)
+
+    if periodic_y and plot_Y.shape[0] > 1:
+        dy = float(np.mean(np.diff(plot_Y[:, 0])))
+        plot_X = np.concatenate([plot_X, plot_X[-1:, :]], axis=0)
+        plot_Y = np.concatenate([plot_Y, plot_Y[-1:, :] + dy], axis=0)
+        plot_F = np.concatenate([plot_F, plot_F[:1, :]], axis=0)
+
+    return plot_X, plot_Y, plot_F
+
+
+def _wrap_coordinate_to_cell(value: float, lower: float, upper: float) -> float:
+    period = upper - lower
+    if period <= 0.0:
+        return value
+    wrapped = float(((value - lower) % period) + lower)
+    return lower if np.isclose(wrapped, upper) else wrapped
+
+
+def _comparison_status_color(status: str) -> str:
+    colors = {
+        "matched": "tab:green",
+        "missed": "tab:red",
+        "outside_tolerance": "tab:orange",
+        "extra": "tab:purple",
+    }
+    return colors.get(status, "black")
+
+
+def _stationary_type_style(point_type: Any) -> dict[str, Any]:
+    styles: dict[str, dict[str, Any]] = {
+        "minimum": {"marker": "o", "facecolor": "red", "s": 80},
+        "maximum": {"marker": "^", "facecolor": "white", "s": 90},
+        "saddle_1": {"marker": "s", "facecolor": "cyan", "s": 80},
+    }
+    return dict(styles.get(str(point_type), {"marker": "D", "facecolor": "tab:gray", "s": 80}))
+
+
+def _add_stationary_comparison_labels(matches: pd.DataFrame) -> pd.DataFrame:
+    out = matches.copy()
+    labels: list[str] = []
+    reference_count = 0
+    extra_count = 0
+    for _, row in out.iterrows():
+        if pd.notna(row["reference_index"]):
+            reference_count += 1
+            labels.append(str(reference_count))
+        else:
+            extra_count += 1
+            labels.append(f"E{extra_count}")
+    out.loc[:, "plot_label"] = labels
+    return out
+
+
+def _annotate_comparison_point(
+    ax: Axes,
+    x: float,
+    y: float,
+    label: str,
+    *,
+    color: str,
+) -> None:
+    ax.annotate(
+        label,
+        (x, y),
+        xytext=(5.0, 5.0),
+        textcoords="offset points",
+        fontsize=8,
+        ha="left",
+        va="bottom",
+        color="black",
+        bbox={
+            "boxstyle": "round,pad=0.18",
+            "facecolor": "white",
+            "edgecolor": color,
+            "linewidth": 0.8,
+            "alpha": 0.9,
+        },
+        zorder=6,
+    )
 
 
 class SpecialPointRegistry:
@@ -723,18 +932,1041 @@ class Maps:
         # Generate 2D plots for each unique value of the split variable
         for i, ax in enumerate(axslist):
             sval = np.unique(s)[i]
-            ax.set_title(f"Map of {feature} for {splitby} = {sval:6.2f}")
+            split_label = _coordinate_axis_label(splitby)
+            ax.set_title(f"Map of {feature} for {split_label} = {_format_split_value(sval)}")
             mask = filterdata[splitby] == sval
             im = ax.tricontourf(x1[mask], x2[mask], f[mask], levels=flevels, **kwargs)
             ax.axis(set_aspect)
-            ax.set_xlabel(f"{axes[0]}")
-            ax.set_ylabel(f"{axes[1]}")
+            ax.set_xlabel(_coordinate_axis_label(axes[0]))
+            ax.set_ylabel(_coordinate_axis_label(axes[1]))
         # Add colorbar
         if nsplit == 1:
             fig.colorbar(im, ax=axs)
         else:
             fig.colorbar(im, ax=axs.ravel().tolist())
         return fig, axs
+
+    def multiplot(
+        self,
+        features: str | Sequence[str] | None = None,
+        indexes: int | Sequence[int] | None = None,
+        axes: Sequence[str] | None = None,
+        region: int | None = 0,
+        splitby: str | None = "z",
+        set_aspect: str = "on",
+        levels: int | Sequence[float] = 10,
+        ncols: int | None = None,
+        figsize: tuple[float, float] | None = None,
+        panel_size: tuple[float, float] = (4.0, 3.5),
+        colorbar: bool = True,
+        sharex: bool = False,
+        sharey: bool = False,
+        **kwargs: Any,
+    ) -> tuple[Figure, npt.NDArray[np.object_]]:
+        """Plot several feature columns as contour-map panels."""
+        if self.contactspace is None:
+            raise RuntimeError("Trying to use maps.multiplot() without contact space")
+        if self.data is None:
+            raise RuntimeError("No contact space data available.")
+        if features is None and indexes is None:
+            raise ValueError("Either features or indexes must be provided.")
+        if set_aspect not in ["on", "off", "equal", "scaled"]:
+            raise ValueError("set_aspect must be one of ['on','off','equal','scaled']")
+
+        frame = self.data.copy()
+        contactspace_data = self.contactspace.data
+        plot_axes = ["x", "y"] if axes is None else list(axes)
+        if len(plot_axes) != 2:
+            raise ValueError("axes must contain exactly two columns.")
+
+        resolved_features: list[str] = []
+        if features is not None:
+            resolved_features.extend([features] if isinstance(features, str) else list(features))
+        if indexes is not None:
+            index_values = (
+                [int(indexes)]
+                if isinstance(indexes, (int, np.integer))
+                else [int(value) for value in indexes]
+            )
+            for index_value in index_values:
+                if index_value >= len(self.features) or index_value < 0:
+                    raise ValueError(f"Index {index_value} out of bounds.")
+                resolved_features.append(self.features[index_value])
+        if len(resolved_features) == 0:
+            raise ValueError("At least one feature or index must be provided.")
+
+        required_columns = set(plot_axes) | set(resolved_features)
+        if splitby is not None:
+            required_columns.add(splitby)
+        if region is not None:
+            required_columns.add("region")
+        for column in required_columns:
+            if column in frame.columns:
+                continue
+            if column in contactspace_data.columns:
+                frame.loc[:, column] = contactspace_data[column].to_numpy()
+            else:
+                raise ValueError(f"Column {column!r} not found in maps data or contactspace data.")
+
+        mask = np.ones(len(frame), dtype=bool)
+        if region is not None:
+            mask &= frame["region"].to_numpy(dtype=np.int64) == int(region)
+        filterdata = frame.loc[mask]
+        if filterdata.empty:
+            raise ValueError("No points available after applying the region filter.")
+
+        if splitby is None:
+            split_values = np.asarray([None], dtype=object)
+            split_masks = [np.ones(len(filterdata), dtype=bool)]
+        else:
+            split_values = np.unique(filterdata[splitby].to_numpy())
+            split_masks = [
+                filterdata[splitby].to_numpy() == split_value for split_value in split_values
+            ]
+
+        nfeatures = len(resolved_features)
+        nsplit = len(split_values)
+        if ncols is None:
+            ncols = nfeatures
+        ncols = min(max(1, int(ncols)), nfeatures)
+        feature_rows = int(np.ceil(nfeatures / ncols))
+        nrows = feature_rows * nsplit
+        if figsize is None:
+            figsize = (panel_size[0] * ncols, panel_size[1] * nrows)
+
+        fig, axs = plt.subplots(
+            nrows,
+            ncols,
+            figsize=figsize,
+            squeeze=False,
+            sharex=sharex,
+            sharey=sharey,
+        )
+        fig.subplots_adjust(hspace=0.45, wspace=0.35)
+
+        x1 = filterdata[plot_axes[0]].to_numpy(dtype=np.float64)
+        x2 = filterdata[plot_axes[1]].to_numpy(dtype=np.float64)
+        used_axes: set[tuple[int, int]] = set()
+        for feature_index, feature_name in enumerate(resolved_features):
+            feature_values = pd.to_numeric(filterdata[feature_name], errors="raise").to_numpy(
+                dtype=np.float64
+            )
+            contour_levels = _resolve_contour_levels(feature_values, levels)
+            feature_row = feature_index // ncols
+            feature_col = feature_index % ncols
+            feature_axes = []
+            filled = None
+
+            for split_index, split_value in enumerate(split_values):
+                row = feature_row * nsplit + split_index
+                ax = axs[row, feature_col]
+                used_axes.add((row, feature_col))
+                feature_axes.append(ax)
+                split_mask = split_masks[split_index]
+                filled = ax.tricontourf(
+                    x1[split_mask],
+                    x2[split_mask],
+                    feature_values[split_mask],
+                    levels=contour_levels,
+                    **kwargs,
+                )
+                if splitby is None:
+                    ax.set_title(f"Map of {feature_name}")
+                else:
+                    split_label = _coordinate_axis_label(splitby)
+                    ax.set_title(
+                        f"{feature_name}\n{split_label} = {_format_split_value(split_value)}"
+                    )
+                ax.set_xlabel(_coordinate_axis_label(plot_axes[0]))
+                ax.set_ylabel(_coordinate_axis_label(plot_axes[1]))
+                ax.axis(set_aspect)
+
+            if colorbar and filled is not None:
+                fig.colorbar(filled, ax=feature_axes)
+
+        for row in range(nrows):
+            for col in range(ncols):
+                if (row, col) not in used_axes:
+                    axs[row, col].axis("off")
+        return fig, axs.astype(object)
+
+    def plot_parity(
+        self,
+        reference_column: str,
+        predicted_column: str,
+        *,
+        title: str | None = None,
+        reference_label: str | None = None,
+        predicted_label: str | None = None,
+        units: str | None = None,
+        ax: Axes | None = None,
+        figsize: tuple[float, float] = (5.5, 5.5),
+        point_kwargs: Mapping[str, Any] | None = None,
+        ideal_kwargs: Mapping[str, Any] | None = None,
+        summary_box: bool = True,
+        summary_loc: tuple[float, float] = (0.05, 0.95),
+        summary_precision: int = 4,
+        grid: bool = True,
+        drop_nonfinite: bool = True,
+    ) -> tuple[Figure, Axes, dict[str, Any]]:
+        """Plot a parity comparison between two columns in maps data."""
+        if self.data is None:
+            raise RuntimeError("No contact space data available.")
+        missing = [
+            column for column in (reference_column, predicted_column) if column not in self.data
+        ]
+        if missing:
+            raise ValueError(f"Column(s) not found in maps data: {missing}.")
+
+        from mapsy.plotting import plot_parity
+
+        return plot_parity(
+            self.data[reference_column].to_numpy(dtype=np.float64),
+            self.data[predicted_column].to_numpy(dtype=np.float64),
+            title=title or f"{predicted_column} vs {reference_column}",
+            reference_label=reference_label or reference_column,
+            predicted_label=predicted_label or predicted_column,
+            units=units,
+            ax=ax,
+            figsize=figsize,
+            point_kwargs=point_kwargs,
+            ideal_kwargs=ideal_kwargs,
+            summary_box=summary_box,
+            summary_loc=summary_loc,
+            summary_precision=summary_precision,
+            grid=grid,
+            drop_nonfinite=drop_nonfinite,
+        )
+
+    def analyze_stationary_points_2d(
+        self,
+        feature: str | None = None,
+        index: int | None = None,
+        *,
+        axes: tuple[str, str] = ("x", "y"),
+        region: int | None = 0,
+        layer: int | Sequence[int] | None = None,
+        nx: int | None = None,
+        ny: int | None = None,
+        patch_radius: int = 1,
+        grad_tol: float | None = None,
+        curvature_tol: float | None = None,
+        merge_tol: float | None = None,
+        periodic_x: bool = True,
+        periodic_y: bool = True,
+        include_value_extrema: bool = True,
+    ) -> tuple[pd.DataFrame, dict[str, Any]]:
+        """Find and refine stationary points on a regular 2D map."""
+        if self.data is None:
+            raise RuntimeError("No contact space data available.")
+        if len(axes) != 2 or axes[0] == axes[1]:
+            raise ValueError(f"axes must contain two distinct columns, got {axes!r}.")
+        if patch_radius < 1:
+            raise ValueError("patch_radius must be at least 1.")
+
+        frame = self.data.copy()
+        if "point_index" not in frame.columns:
+            frame.insert(0, "point_index", frame.index.to_numpy(dtype=np.int64))
+
+        if feature is not None:
+            resolved_feature = feature
+        elif index is not None:
+            if index >= len(self.features) or index < 0:
+                raise ValueError(f"Index {index} out of bounds.")
+            resolved_feature = self.features[index]
+        else:
+            raise ValueError("Either feature or index must be provided.")
+
+        required_columns: set[str] = {axes[0], axes[1], resolved_feature}
+        if region is not None:
+            required_columns.add("region")
+        if layer is not None:
+            required_columns.add("layer")
+
+        contactspace_data = getattr(getattr(self, "contactspace", None), "data", None)
+        for column in required_columns:
+            if column in frame.columns:
+                continue
+            if contactspace_data is not None and column in contactspace_data.columns:
+                frame.loc[:, column] = contactspace_data[column].to_numpy()
+            else:
+                raise ValueError(f"Column {column!r} not found in maps data or contactspace data.")
+
+        mask = np.ones(len(frame), dtype=bool)
+        if region is not None:
+            mask &= frame["region"].to_numpy(dtype=np.int64) == int(region)
+        if layer is not None:
+            mask &= np.isin(frame["layer"].to_numpy(dtype=np.int64), _coerce_layer_values(layer))
+        frame = frame.loc[mask, ["point_index", axes[0], axes[1], resolved_feature]].copy()
+        if frame.empty:
+            raise ValueError("No points available after applying the stationary-point filters.")
+
+        x = frame[axes[0]].to_numpy(dtype=np.float64)
+        y = frame[axes[1]].to_numpy(dtype=np.float64)
+        values = frame[resolved_feature].to_numpy(dtype=np.float64)
+        if not (np.all(np.isfinite(x)) and np.all(np.isfinite(y)) and np.all(np.isfinite(values))):
+            raise ValueError("Stationary-point analysis requires finite coordinates and values.")
+
+        ux = np.unique(x)
+        uy = np.unique(y)
+        nx = int(nx if nx is not None else ux.size)
+        ny = int(ny if ny is not None else uy.size)
+        if nx < 2 * patch_radius + 1 or ny < 2 * patch_radius + 1:
+            raise ValueError("Grid is too small for the requested patch_radius.")
+        if nx * ny != len(frame):
+            raise ValueError(
+                f"nx * ny ({nx * ny}) does not match the number of selected points ({len(frame)})."
+            )
+
+        order = np.lexsort((x, y))
+        sorted_frame = frame.iloc[order].reset_index(drop=True)
+        X = sorted_frame[axes[0]].to_numpy(dtype=np.float64).reshape(ny, nx)
+        Y = sorted_frame[axes[1]].to_numpy(dtype=np.float64).reshape(ny, nx)
+        F = sorted_frame[resolved_feature].to_numpy(dtype=np.float64).reshape(ny, nx)
+        point_index_grid = sorted_frame["point_index"].to_numpy(dtype=np.int64).reshape(ny, nx)
+
+        x_axis = X[0, :]
+        y_axis = Y[:, 0]
+        if not np.allclose(X, x_axis[np.newaxis, :]):
+            raise ValueError(f"Selected points do not form a regular grid along {axes[0]!r}.")
+        if not np.allclose(Y, y_axis[:, np.newaxis]):
+            raise ValueError(f"Selected points do not form a regular grid along {axes[1]!r}.")
+        dx_values = np.diff(x_axis)
+        dy_values = np.diff(y_axis)
+        if dx_values.size == 0 or dy_values.size == 0:
+            raise ValueError(
+                "Stationary-point analysis requires at least two grid points per axis."
+            )
+        dx = float(np.mean(dx_values))
+        dy = float(np.mean(dy_values))
+        if np.isclose(dx, 0.0) or np.isclose(dy, 0.0):
+            raise ValueError("Grid spacing must be non-zero.")
+        if not np.allclose(dx_values, dx) or not np.allclose(dy_values, dy):
+            raise ValueError("Stationary-point analysis requires uniform 2D grid spacing.")
+
+        lx = float(nx * dx)
+        ly = float(ny * dy)
+
+        def shift(values_2d: NDArrayF, *, sy: int = 0, sx: int = 0) -> NDArrayF:
+            return np.roll(np.roll(values_2d, sy, axis=0), sx, axis=1)
+
+        def wrap_delta(delta: NDArrayF, period: float, periodic: bool) -> NDArrayF:
+            if not periodic:
+                return delta
+            return (delta + 0.5 * period) % period - 0.5 * period
+
+        def wrap_scalar_delta(delta: float, period: float, periodic: bool) -> float:
+            if not periodic:
+                return delta
+            return float((delta + 0.5 * period) % period - 0.5 * period)
+
+        def wrap_to_bounds(value: float, lower: float, upper: float) -> float:
+            width = upper - lower
+            if width <= 0.0:
+                return value
+            wrapped = float(((value - lower) % width) + lower)
+            return lower if np.isclose(wrapped, upper) else wrapped
+
+        def periodic_distance(row_a: pd.Series, row_b: pd.Series) -> float:
+            dxm = wrap_scalar_delta(
+                float(row_a[axes[0]]) - float(row_b[axes[0]]),
+                lx,
+                periodic_x,
+            )
+            dym = wrap_scalar_delta(
+                float(row_a[axes[1]]) - float(row_b[axes[1]]),
+                ly,
+                periodic_y,
+            )
+            return float(np.hypot(dxm, dym))
+
+        gx = (shift(F, sx=-1) - shift(F, sx=1)) / (2.0 * dx)
+        gy = (shift(F, sy=-1) - shift(F, sy=1)) / (2.0 * dy)
+        hxx = (shift(F, sx=-1) - 2.0 * F + shift(F, sx=1)) / (dx * dx)
+        hyy = (shift(F, sy=-1) - 2.0 * F + shift(F, sy=1)) / (dy * dy)
+        hxy = (
+            shift(F, sy=-1, sx=-1)
+            - shift(F, sy=-1, sx=1)
+            - shift(F, sy=1, sx=-1)
+            + shift(F, sy=1, sx=1)
+        ) / (4.0 * dx * dy)
+        gnorm = np.sqrt(gx**2 + gy**2)
+
+        if grad_tol is None:
+            grad_tol = float(np.quantile(gnorm, 0.10))
+        if curvature_tol is None:
+            field_scale = max(float(np.nanmax(F) - np.nanmin(F)), 1.0e-12)
+            curvature_tol = 1.0e-3 * field_scale / max(dx * dx, dy * dy, 1.0e-12)
+        if merge_tol is None:
+            merge_tol = 0.75 * max(abs(dx), abs(dy))
+
+        from scipy import ndimage
+
+        min_mode = (
+            "wrap" if periodic_y else "nearest",
+            "wrap" if periodic_x else "nearest",
+        )
+        local_grad_min = gnorm == ndimage.minimum_filter(gnorm, size=3, mode=min_mode)
+        gradient_candidates = local_grad_min & (gnorm <= grad_tol)
+        if include_value_extrema:
+            value_min_candidates = ndimage.minimum_filter(F, size=3, mode=min_mode) == F
+            value_max_candidates = ndimage.maximum_filter(F, size=3, mode=min_mode) == F
+        else:
+            value_min_candidates = np.zeros_like(F, dtype=bool)
+            value_max_candidates = np.zeros_like(F, dtype=bool)
+        candidates = gradient_candidates | value_min_candidates | value_max_candidates
+
+        rows: list[dict[str, Any]] = []
+        x_lower = float(np.min(x_axis))
+        x_upper = float(np.max(x_axis) + dx)
+        y_lower = float(np.min(y_axis))
+        y_upper = float(np.max(y_axis) + dy)
+
+        for iy_raw, ix_raw in np.argwhere(candidates):
+            iy = int(iy_raw)
+            ix = int(ix_raw)
+            if (not periodic_y and (iy - patch_radius < 0 or iy + patch_radius >= ny)) or (
+                not periodic_x and (ix - patch_radius < 0 or ix + patch_radius >= nx)
+            ):
+                continue
+
+            iy_idx = (iy + np.arange(-patch_radius, patch_radius + 1)) % ny
+            ix_idx = (ix + np.arange(-patch_radius, patch_radius + 1)) % nx
+            Xp = X[np.ix_(iy_idx, ix_idx)]
+            Yp = Y[np.ix_(iy_idx, ix_idx)]
+            Fp = F[np.ix_(iy_idx, ix_idx)]
+
+            x0 = float(X[iy, ix])
+            y0 = float(Y[iy, ix])
+            dxp = wrap_delta(Xp - x0, lx, periodic_x).reshape(-1)
+            dyp = wrap_delta(Yp - y0, ly, periodic_y).reshape(-1)
+            zp = Fp.reshape(-1)
+
+            design = np.column_stack(
+                [
+                    np.ones_like(dxp),
+                    dxp,
+                    dyp,
+                    dxp**2,
+                    dxp * dyp,
+                    dyp**2,
+                ]
+            )
+            coeffs, *_ = np.linalg.lstsq(design, zp, rcond=None)
+            c0, c1, c2, c3, c4, c5 = coeffs
+
+            hessian = np.array([[2.0 * c3, c4], [c4, 2.0 * c5]], dtype=np.float64)
+            gradient = np.array([c1, c2], dtype=np.float64)
+            determinant = float(np.linalg.det(hessian))
+            if abs(determinant) < 1.0e-14:
+                continue
+
+            sx, sy = -np.linalg.solve(hessian, gradient)
+            if abs(float(sx)) > patch_radius * abs(dx) or abs(float(sy)) > patch_radius * abs(dy):
+                continue
+
+            refined_x = x0 + float(sx)
+            refined_y = y0 + float(sy)
+            if periodic_x:
+                refined_x = wrap_to_bounds(refined_x, x_lower, x_upper)
+            if periodic_y:
+                refined_y = wrap_to_bounds(refined_y, y_lower, y_upper)
+
+            refined_value = float(c0 + c1 * sx + c2 * sy + c3 * sx**2 + c4 * sx * sy + c5 * sy**2)
+            eig1, eig2 = np.linalg.eigvalsh(hessian)
+            eig1 = float(eig1)
+            eig2 = float(eig2)
+            if eig1 > curvature_tol and eig2 > curvature_tol:
+                stationary_type = "minimum"
+                stationary_order = 0
+            elif eig1 < -curvature_tol and eig2 < -curvature_tol:
+                stationary_type = "maximum"
+                stationary_order = 2
+            elif eig1 < -curvature_tol and eig2 > curvature_tol:
+                stationary_type = "saddle_1"
+                stationary_order = 1
+            else:
+                continue
+
+            rows.append(
+                {
+                    "type": stationary_type,
+                    "stationary_order": stationary_order,
+                    axes[0]: refined_x,
+                    axes[1]: refined_y,
+                    "value": refined_value,
+                    f"{axes[0]}_grid": x0,
+                    f"{axes[1]}_grid": y0,
+                    "point_index_grid": int(point_index_grid[iy, ix]),
+                    "ix": ix,
+                    "iy": iy,
+                    "grad_norm_grid": float(gnorm[iy, ix]),
+                    "hxx": float(hessian[0, 0]),
+                    "hxy": float(hessian[0, 1]),
+                    "hyy": float(hessian[1, 1]),
+                    "eig1": eig1,
+                    "eig2": eig2,
+                    "feature": resolved_feature,
+                }
+            )
+
+        derivatives: dict[str, Any] = {
+            "X": X,
+            "Y": Y,
+            "F": F,
+            "gx": gx,
+            "gy": gy,
+            "gnorm": gnorm,
+            "hxx": hxx,
+            "hxy": hxy,
+            "hyy": hyy,
+            "gradient_candidate_mask": gradient_candidates,
+            "value_min_candidate_mask": value_min_candidates,
+            "value_max_candidate_mask": value_max_candidates,
+            "candidate_mask": candidates,
+            "point_index_grid": point_index_grid,
+            "axes": axes,
+            "feature": resolved_feature,
+            "grad_tol": grad_tol,
+            "curvature_tol": curvature_tol,
+            "merge_tol": merge_tol,
+            "periodic_x": periodic_x,
+            "periodic_y": periodic_y,
+            "include_value_extrema": include_value_extrema,
+        }
+        if not rows:
+            return pd.DataFrame(), derivatives
+
+        stationary = (
+            pd.DataFrame(rows).sort_values(["type", "grad_norm_grid"]).reset_index(drop=True)
+        )
+        kept: list[pd.Series] = []
+        for _, row in stationary.iterrows():
+            duplicate = False
+            for previous in kept:
+                if row["type"] != previous["type"]:
+                    continue
+                if periodic_distance(row, previous) < merge_tol:
+                    duplicate = True
+                    break
+            if not duplicate:
+                kept.append(row)
+
+        out = pd.DataFrame(kept).sort_values(["type", "value"]).reset_index(drop=True)
+        return out, derivatives
+
+    def plot_stationary_points_2d(
+        self,
+        feature: str | None = None,
+        index: int | None = None,
+        *,
+        axes: tuple[str, str] = ("x", "y"),
+        region: int | None = 0,
+        layer: int | Sequence[int] | None = None,
+        nx: int | None = None,
+        ny: int | None = None,
+        patch_radius: int = 1,
+        grad_tol: float | None = None,
+        curvature_tol: float | None = None,
+        merge_tol: float | None = None,
+        periodic_x: bool = True,
+        periodic_y: bool = True,
+        include_value_extrema: bool = True,
+        stationary_points: pd.DataFrame | None = None,
+        derivatives: dict[str, Any] | None = None,
+        levels: int | Sequence[float] = 30,
+        cmap: str = "Spectral",
+        stationary_styles: dict[str, dict[str, Any]] | None = None,
+        colorbar: bool = True,
+        legend: bool = True,
+        set_aspect: str = "equal",
+        figsize: tuple[float, float] = (6.0, 5.0),
+        ax: Axes | None = None,
+        return_derivatives: bool = False,
+        **kwargs: Any,
+    ) -> tuple[Figure, Axes, pd.DataFrame] | tuple[Figure, Axes, pd.DataFrame, dict[str, Any]]:
+        """Plot a 2D map with refined stationary points overlaid."""
+        if stationary_points is None or derivatives is None:
+            stationary_points, derivatives = self.analyze_stationary_points_2d(
+                feature=feature,
+                index=index,
+                axes=axes,
+                region=region,
+                layer=layer,
+                nx=nx,
+                ny=ny,
+                patch_radius=patch_radius,
+                grad_tol=grad_tol,
+                curvature_tol=curvature_tol,
+                merge_tol=merge_tol,
+                periodic_x=periodic_x,
+                periodic_y=periodic_y,
+                include_value_extrema=include_value_extrema,
+            )
+        else:
+            stationary_points = stationary_points.copy()
+
+        plot_axes = cast(tuple[str, str], tuple(derivatives.get("axes", axes)))
+        if ax is None:
+            fig, ax = plt.subplots(figsize=figsize)
+        else:
+            fig = ax.figure
+
+        plot_periodic_x = bool(derivatives.get("periodic_x", periodic_x))
+        plot_periodic_y = bool(derivatives.get("periodic_y", periodic_y))
+        plot_X, plot_Y, plot_F = _periodic_contour_grid(
+            derivatives["X"],
+            derivatives["Y"],
+            derivatives["F"],
+            periodic_x=plot_periodic_x,
+            periodic_y=plot_periodic_y,
+        )
+        x_lower = float(np.nanmin(plot_X))
+        x_upper = float(np.nanmax(plot_X))
+        y_lower = float(np.nanmin(plot_Y))
+        y_upper = float(np.nanmax(plot_Y))
+
+        contour = ax.contourf(
+            plot_X,
+            plot_Y,
+            plot_F,
+            levels=levels,
+            cmap=cmap,
+            **kwargs,
+        )
+        if colorbar:
+            fig.colorbar(contour, ax=ax)
+
+        styles = {
+            "minimum": {
+                "marker": "o",
+                "c": "red",
+                "s": 80,
+                "edgecolors": "black",
+                "linewidths": 0.8,
+            },
+            "maximum": {
+                "marker": "^",
+                "c": "white",
+                "s": 90,
+                "edgecolors": "black",
+                "linewidths": 0.8,
+            },
+            "saddle_1": {
+                "marker": "s",
+                "c": "cyan",
+                "s": 80,
+                "edgecolors": "black",
+                "linewidths": 0.8,
+            },
+        }
+        if stationary_styles is not None:
+            for point_type, style in stationary_styles.items():
+                styles[point_type] = {**styles.get(point_type, {}), **style}
+
+        for point_type, style in styles.items():
+            if stationary_points.empty or point_type not in stationary_points["type"].to_numpy():
+                continue
+            subset = stationary_points.loc[stationary_points["type"] == point_type]
+            x_values = subset[plot_axes[0]].to_numpy(dtype=np.float64)
+            y_values = subset[plot_axes[1]].to_numpy(dtype=np.float64)
+            if plot_periodic_x:
+                x_values = np.array(
+                    [
+                        _wrap_coordinate_to_cell(float(value), x_lower, x_upper)
+                        for value in x_values
+                    ],
+                    dtype=np.float64,
+                )
+            if plot_periodic_y:
+                y_values = np.array(
+                    [
+                        _wrap_coordinate_to_cell(float(value), y_lower, y_upper)
+                        for value in y_values
+                    ],
+                    dtype=np.float64,
+                )
+            ax.scatter(
+                x_values,
+                y_values,
+                label=point_type,
+                **style,
+            )
+
+        if legend and not stationary_points.empty:
+            ax.legend()
+        ax.set_xlabel(_coordinate_axis_label(plot_axes[0]))
+        ax.set_ylabel(_coordinate_axis_label(plot_axes[1]))
+        ax.set_aspect(set_aspect)
+        feature_label = derivatives.get("feature", feature)
+        if feature_label is not None:
+            ax.set_title(f"Stationary points of {feature_label}")
+
+        if return_derivatives:
+            return fig, ax, stationary_points, derivatives
+        return fig, ax, stationary_points
+
+    def compare_stationary_points_2d(
+        self,
+        reference_feature: str | None = None,
+        predicted_feature: str | None = None,
+        *,
+        reference_index: int | None = None,
+        predicted_index: int | None = None,
+        axes: tuple[str, str] = ("x", "y"),
+        region: int | None = 0,
+        layer: int | Sequence[int] | None = None,
+        nx: int | None = None,
+        ny: int | None = None,
+        patch_radius: int = 1,
+        grad_tol: float | None = None,
+        curvature_tol: float | None = None,
+        merge_tol: float | None = None,
+        periodic_x: bool = True,
+        periodic_y: bool = True,
+        include_value_extrema: bool = True,
+        types: str | Sequence[str] | None = ("minimum", "saddle_1"),
+        xy_scale: float | None = None,
+        energy_scale: float = 0.05,
+        energy_weight_scale: float | None = 0.10,
+        max_xy_error: float | None = None,
+        max_energy_error: float | None = 0.25,
+        beta: float = 1.0,
+        type_weights: Mapping[str, float] | None = None,
+        return_stationary: bool = False,
+    ) -> (
+        tuple[dict[str, Any], pd.DataFrame]
+        | tuple[dict[str, Any], pd.DataFrame, pd.DataFrame, pd.DataFrame]
+    ):
+        """Compare stationary points from two 2D feature maps."""
+        from mapsy.metrics import compare_stationary_points
+
+        reference_stationary, reference_derivatives = self.analyze_stationary_points_2d(
+            feature=reference_feature,
+            index=reference_index,
+            axes=axes,
+            region=region,
+            layer=layer,
+            nx=nx,
+            ny=ny,
+            patch_radius=patch_radius,
+            grad_tol=grad_tol,
+            curvature_tol=curvature_tol,
+            merge_tol=merge_tol,
+            periodic_x=periodic_x,
+            periodic_y=periodic_y,
+            include_value_extrema=include_value_extrema,
+        )
+        predicted_stationary, predicted_derivatives = self.analyze_stationary_points_2d(
+            feature=predicted_feature,
+            index=predicted_index,
+            axes=axes,
+            region=region,
+            layer=layer,
+            nx=nx,
+            ny=ny,
+            patch_radius=patch_radius,
+            grad_tol=grad_tol,
+            curvature_tol=curvature_tol,
+            merge_tol=merge_tol,
+            periodic_x=periodic_x,
+            periodic_y=periodic_y,
+            include_value_extrema=include_value_extrema,
+        )
+
+        x_axis = np.asarray(reference_derivatives["X"][0, :], dtype=np.float64)
+        y_axis = np.asarray(reference_derivatives["Y"][:, 0], dtype=np.float64)
+        dx = float(np.mean(np.diff(x_axis))) if x_axis.size > 1 else 1.0
+        dy = float(np.mean(np.diff(y_axis))) if y_axis.size > 1 else 1.0
+        inferred_xy_scale = max(abs(dx), abs(dy), 1.0e-12)
+        comparison_xy_scale = inferred_xy_scale if xy_scale is None else float(xy_scale)
+        periods = (
+            float(reference_derivatives["X"].shape[1] * abs(dx)) if periodic_x else None,
+            float(reference_derivatives["Y"].shape[0] * abs(dy)) if periodic_y else None,
+        )
+
+        summary, matches = compare_stationary_points(
+            reference_stationary,
+            predicted_stationary,
+            types=types,
+            axes=axes,
+            periods=periods,
+            xy_scale=comparison_xy_scale,
+            energy_scale=energy_scale,
+            energy_weight_scale=energy_weight_scale,
+            max_xy_error=max_xy_error,
+            max_energy_error=max_energy_error,
+            beta=beta,
+            type_weights=type_weights,
+        )
+        summary["reference_feature"] = reference_derivatives.get("feature", reference_feature)
+        summary["predicted_feature"] = predicted_derivatives.get("feature", predicted_feature)
+
+        if return_stationary:
+            return summary, matches, reference_stationary, predicted_stationary
+        return summary, matches
+
+    def plot_stationary_point_comparison_2d(
+        self,
+        reference_feature: str | None = None,
+        predicted_feature: str | None = None,
+        *,
+        reference_index: int | None = None,
+        predicted_index: int | None = None,
+        axes: tuple[str, str] = ("x", "y"),
+        region: int | None = 0,
+        layer: int | Sequence[int] | None = None,
+        nx: int | None = None,
+        ny: int | None = None,
+        patch_radius: int = 1,
+        grad_tol: float | None = None,
+        curvature_tol: float | None = None,
+        merge_tol: float | None = None,
+        periodic_x: bool = True,
+        periodic_y: bool = True,
+        include_value_extrema: bool = True,
+        types: str | Sequence[str] | None = ("minimum", "saddle_1"),
+        xy_scale: float | None = None,
+        energy_scale: float = 0.05,
+        energy_weight_scale: float | None = 0.10,
+        max_xy_error: float | None = None,
+        max_energy_error: float | None = 0.25,
+        beta: float = 1.0,
+        type_weights: Mapping[str, float] | None = None,
+        levels: int | Sequence[float] = 30,
+        cmap: str = "Spectral",
+        shared_color_scale: bool = True,
+        colorbar: bool = True,
+        legend: bool = True,
+        label_points: bool = True,
+        summary_title: bool = True,
+        set_aspect: str = "equal",
+        figsize: tuple[float, float] = (12.0, 5.0),
+        axs: Sequence[Axes] | npt.NDArray[np.object_] | None = None,
+        **kwargs: Any,
+    ) -> tuple[Figure, npt.NDArray[np.object_], dict[str, Any], pd.DataFrame]:
+        """Plot reference and predicted 2D maps with numbered stationary-point matches."""
+        from mapsy.metrics import compare_stationary_points
+
+        reference_stationary, reference_derivatives = self.analyze_stationary_points_2d(
+            feature=reference_feature,
+            index=reference_index,
+            axes=axes,
+            region=region,
+            layer=layer,
+            nx=nx,
+            ny=ny,
+            patch_radius=patch_radius,
+            grad_tol=grad_tol,
+            curvature_tol=curvature_tol,
+            merge_tol=merge_tol,
+            periodic_x=periodic_x,
+            periodic_y=periodic_y,
+            include_value_extrema=include_value_extrema,
+        )
+        predicted_stationary, predicted_derivatives = self.analyze_stationary_points_2d(
+            feature=predicted_feature,
+            index=predicted_index,
+            axes=axes,
+            region=region,
+            layer=layer,
+            nx=nx,
+            ny=ny,
+            patch_radius=patch_radius,
+            grad_tol=grad_tol,
+            curvature_tol=curvature_tol,
+            merge_tol=merge_tol,
+            periodic_x=periodic_x,
+            periodic_y=periodic_y,
+            include_value_extrema=include_value_extrema,
+        )
+
+        x_axis = np.asarray(reference_derivatives["X"][0, :], dtype=np.float64)
+        y_axis = np.asarray(reference_derivatives["Y"][:, 0], dtype=np.float64)
+        dx = float(np.mean(np.diff(x_axis))) if x_axis.size > 1 else 1.0
+        dy = float(np.mean(np.diff(y_axis))) if y_axis.size > 1 else 1.0
+        inferred_xy_scale = max(abs(dx), abs(dy), 1.0e-12)
+        comparison_xy_scale = inferred_xy_scale if xy_scale is None else float(xy_scale)
+        periods = (
+            float(reference_derivatives["X"].shape[1] * abs(dx)) if periodic_x else None,
+            float(reference_derivatives["Y"].shape[0] * abs(dy)) if periodic_y else None,
+        )
+
+        summary, matches = compare_stationary_points(
+            reference_stationary,
+            predicted_stationary,
+            types=types,
+            axes=axes,
+            periods=periods,
+            xy_scale=comparison_xy_scale,
+            energy_scale=energy_scale,
+            energy_weight_scale=energy_weight_scale,
+            max_xy_error=max_xy_error,
+            max_energy_error=max_energy_error,
+            beta=beta,
+            type_weights=type_weights,
+        )
+        summary["reference_feature"] = reference_derivatives.get("feature", reference_feature)
+        summary["predicted_feature"] = predicted_derivatives.get("feature", predicted_feature)
+        plot_matches = _add_stationary_comparison_labels(matches)
+
+        if axs is None:
+            fig, created_axes = plt.subplots(1, 2, figsize=figsize, constrained_layout=True)
+            plot_axes_array = np.asarray(created_axes, dtype=object).reshape(-1)
+        else:
+            plot_axes_array = np.asarray(axs, dtype=object).reshape(-1)
+            if plot_axes_array.size != 2:
+                raise ValueError("axs must contain exactly two matplotlib axes.")
+            fig = cast(Axes, plot_axes_array[0]).figure
+
+        reference_ax = cast(Axes, plot_axes_array[0])
+        predicted_ax = cast(Axes, plot_axes_array[1])
+        reference_X, reference_Y, reference_F = _periodic_contour_grid(
+            reference_derivatives["X"],
+            reference_derivatives["Y"],
+            reference_derivatives["F"],
+            periodic_x=periodic_x,
+            periodic_y=periodic_y,
+        )
+        predicted_X, predicted_Y, predicted_F = _periodic_contour_grid(
+            predicted_derivatives["X"],
+            predicted_derivatives["Y"],
+            predicted_derivatives["F"],
+            periodic_x=periodic_x,
+            periodic_y=periodic_y,
+        )
+
+        contour_levels = _comparison_contour_levels(
+            reference_F,
+            predicted_F,
+            levels,
+            shared_color_scale=shared_color_scale,
+        )
+
+        reference_contour = reference_ax.contourf(
+            reference_X,
+            reference_Y,
+            reference_F,
+            levels=contour_levels,
+            cmap=cmap,
+            **kwargs,
+        )
+        predicted_contour = predicted_ax.contourf(
+            predicted_X,
+            predicted_Y,
+            predicted_F,
+            levels=contour_levels,
+            cmap=cmap,
+            **kwargs,
+        )
+
+        def overlay_points(
+            ax: Axes,
+            prefix: str,
+            plot_X: npt.NDArray[np.float64],
+            plot_Y: npt.NDArray[np.float64],
+        ) -> None:
+            x_column = f"{prefix}_{axes[0]}"
+            y_column = f"{prefix}_{axes[1]}"
+            available = plot_matches[x_column].notna() & plot_matches[y_column].notna()
+            x_lower = float(np.nanmin(plot_X))
+            x_upper = float(np.nanmax(plot_X))
+            y_lower = float(np.nanmin(plot_Y))
+            y_upper = float(np.nanmax(plot_Y))
+            for _, row in plot_matches.loc[available].iterrows():
+                style = _stationary_type_style(row["type"])
+                status = str(row["status"])
+                color = _comparison_status_color(status)
+                x_value = float(row[x_column])
+                y_value = float(row[y_column])
+                if periodic_x:
+                    x_value = _wrap_coordinate_to_cell(x_value, x_lower, x_upper)
+                if periodic_y:
+                    y_value = _wrap_coordinate_to_cell(y_value, y_lower, y_upper)
+                ax.scatter(
+                    [x_value],
+                    [y_value],
+                    marker=style["marker"],
+                    s=style["s"],
+                    facecolors=style["facecolor"],
+                    edgecolors=color,
+                    linewidths=1.4,
+                    zorder=4,
+                )
+                if status == "missed":
+                    ax.scatter(
+                        [x_value],
+                        [y_value],
+                        marker="x",
+                        s=style["s"] * 0.9,
+                        c=color,
+                        linewidths=1.8,
+                        zorder=5,
+                    )
+                if label_points:
+                    _annotate_comparison_point(
+                        ax,
+                        x_value,
+                        y_value,
+                        str(row["plot_label"]),
+                        color=color,
+                    )
+
+        overlay_points(reference_ax, "ref", reference_X, reference_Y)
+        overlay_points(predicted_ax, "pred", predicted_X, predicted_Y)
+
+        reference_label = reference_derivatives.get("feature", reference_feature)
+        predicted_label = predicted_derivatives.get("feature", predicted_feature)
+        reference_ax.set_title(f"Reference: {reference_label}")
+        predicted_ax.set_title(f"Predicted: {predicted_label}")
+        for ax in (reference_ax, predicted_ax):
+            ax.set_xlabel(_coordinate_axis_label(axes[0]))
+            ax.set_ylabel(_coordinate_axis_label(axes[1]))
+            ax.set_aspect(set_aspect)
+
+        if colorbar:
+            if shared_color_scale:
+                fig.colorbar(predicted_contour, ax=[reference_ax, predicted_ax])
+            else:
+                fig.colorbar(reference_contour, ax=reference_ax)
+                fig.colorbar(predicted_contour, ax=predicted_ax)
+
+        if legend:
+            status_labels = {
+                "matched": "matched",
+                "missed": "missed",
+                "outside_tolerance": "outside tolerance",
+                "extra": "extra predicted",
+            }
+            present_statuses = [
+                status for status in status_labels if status in set(plot_matches["status"])
+            ]
+            handles = [
+                Line2D(
+                    [0],
+                    [0],
+                    marker="o",
+                    linestyle="None",
+                    markerfacecolor="white",
+                    markeredgecolor=_comparison_status_color(status),
+                    markeredgewidth=1.4,
+                    label=status_labels[status],
+                )
+                for status in present_statuses
+            ]
+            if handles:
+                reference_ax.legend(handles=handles, loc="best")
+
+        if summary_title:
+            fig.suptitle(
+                "weighted recall={:.3f}, matched dxy={:.3g} Å, matched dE={:.3g}".format(
+                    summary["weighted_recall"],
+                    summary["matched_position_mae"],
+                    summary["matched_energy_mae"],
+                )
+            )
+
+        return fig, plot_axes_array, summary, plot_matches
 
     def scatter(
         self,
@@ -817,7 +2049,8 @@ class Maps:
         for i, ax in enumerate(axslist):
             if splitby is not None:
                 sval = np.unique(s)[i]
-                ax.set_title(f"Map of {feature} for {splitby} = {sval:6.2f}")
+                split_label = _coordinate_axis_label(splitby)
+                ax.set_title(f"Map of {feature} for {split_label} = {_format_split_value(sval)}")
                 mask = filterdata[splitby] == sval
                 x1m = x1[mask]
                 x2m = x2[mask]
@@ -827,8 +2060,8 @@ class Maps:
                 x1m = x1
                 x2m = x2
                 fm = f
-            ax.set_xlabel(f"{axes[0]}")
-            ax.set_ylabel(f"{axes[1]}")
+            ax.set_xlabel(_coordinate_axis_label(axes[0]))
+            ax.set_ylabel(_coordinate_axis_label(axes[1]))
             if not categorical:
                 if f is None:
                     scatter = ax.scatter(x1m, x2m, **kwargs)
@@ -1035,6 +2268,84 @@ class Maps:
         colorbar = fig.colorbar(scatter, ax=ax)
         colorbar.set_label(feature)
         colorbar.solids.set_alpha(1.0)
+        ax.axis(set_aspect)
+        if return_projection:
+            return fig, ax, projected
+        return fig, ax
+
+    def plot_min_projection(
+        self,
+        feature: str | None = None,
+        index: int | None = None,
+        *,
+        minimize: str | None = None,
+        plane: tuple[str, str] = ("x", "y"),
+        region: int | None = 0,
+        layer: int | Sequence[int] | None = None,
+        coordinate_decimals: int | None = None,
+        smooth_sigma: float | tuple[float, float] | None = None,
+        smooth_mode: str = "nearest",
+        levels: int | Sequence[float] = 40,
+        contour: bool = True,
+        contour_levels: int | Sequence[float] | None = None,
+        contour_color: str = "k",
+        contour_linewidths: float = 0.3,
+        contour_alpha: float = 0.4,
+        cmap: str = "viridis",
+        colorbar: bool = True,
+        set_aspect: str = "scaled",
+        return_projection: bool = False,
+        **kwargs: Any,
+    ) -> tuple[Figure, Axes] | tuple[Figure, Axes, pd.DataFrame]:
+        """Contour a plane projection selected by the minimum feature value."""
+        if set_aspect not in ["on", "off", "equal", "scaled"]:
+            raise ValueError("set_aspect must be one of ['on','off','equal','scaled']")
+
+        projected = self.min_projection(
+            feature=feature,
+            index=index,
+            minimize=minimize,
+            plane=plane,
+            region=region,
+            layer=layer,
+            coordinate_decimals=coordinate_decimals,
+        )
+        if feature is None:
+            if index is None:
+                raise ValueError("Either feature or index must be provided.")
+            feature = self.features[index]
+        minimize_column = minimize or feature
+
+        X, Y, Z = _projection_grid(projected, plane=plane, feature=feature)
+        Z_plot = _nan_gaussian_filter(Z, sigma=smooth_sigma, mode=smooth_mode)
+        contourf_levels = _resolve_contour_levels(Z_plot, levels)
+
+        fig, ax = plt.subplots(1, 1, figsize=(8, 4))
+        ax.set_title(f"Minimum {minimize_column} projection on {plane[0]}-{plane[1]}")
+        ax.set_xlabel(plane[0])
+        ax.set_ylabel(plane[1])
+        filled = ax.contourf(
+            X,
+            Y,
+            np.ma.masked_invalid(Z_plot),
+            levels=contourf_levels,
+            cmap=cmap,
+            **kwargs,
+        )
+        if contour:
+            line_levels = contour_levels if contour_levels is not None else contourf_levels
+            ax.contour(
+                X,
+                Y,
+                np.ma.masked_invalid(Z_plot),
+                levels=line_levels,
+                colors=contour_color,
+                linewidths=contour_linewidths,
+                alpha=contour_alpha,
+            )
+        if colorbar:
+            cbar = fig.colorbar(filled, ax=ax)
+            cbar.set_label(feature)
         ax.axis(set_aspect)
         if return_projection:
             return fig, ax, projected
